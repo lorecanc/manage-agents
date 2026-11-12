@@ -4,6 +4,7 @@ import path from "node:path"
 import semver from "semver"
 import { installableFiles, MANIFEST_FILE, PACK_NAME_RE, validatePack, type PackValidation, type UnresolvedReference } from "./packs.js"
 import type { PackCandidate } from "./sources.js"
+import { validateVirtualPack, VIRTUAL_PACK_VERSION, virtualManifestHash } from "./virtualPacks.js"
 
 export interface PackRequest {
   name: string
@@ -84,7 +85,12 @@ const hashFileMap = (root: string, files: string[]) => Object.fromEntries(files.
  * executable code plus the structured MCP and command config (the lock's executableHash).
  */
 export function packContent(validation: PackValidation): { fileHashes: Record<string, string>; contentHash: string; executableHash: string } {
-  const fileHashes = hashFileMap(validation.root, installableFiles(validation))
+  const hashEntry = (file: string) => {
+    const virtual = validation.virtualFiles?.[file]
+    if (virtual?.content) return crypto.createHash("sha256").update(virtual.content).digest("hex")
+    return hashFile(path.join(validation.root, ...(virtual?.sourceRel ?? file).split("/")))
+  }
+  const fileHashes = Object.fromEntries(installableFiles(validation).map(file => [file, hashEntry(file)]))
   const { executable } = validation
   const code = Object.fromEntries(Object.entries(fileHashes).filter(([file]) => file.startsWith("plugins/") || executable.toolModules.includes(file) || executable.skillScripts.includes(file)))
   return {
@@ -198,7 +204,10 @@ export function resolvePacks(roots: PackRequest[], candidates: PackCandidate[], 
 
   const resolved = new Map<string, ResolvedPack>()
   for (const [name, candidate] of selected) {
-    const validation = validatePack(candidate.dir, { sourceKind: candidate.sourceKind })
+    const isVirtual = candidate.manifest.version === VIRTUAL_PACK_VERSION && !fs.existsSync(path.join(candidate.dir, MANIFEST_FILE))
+    const validation = isVirtual
+      ? validateVirtualPack(candidate.dir, { name: candidate.manifest.name, sourceKind: candidate.sourceKind })
+      : validatePack(candidate.dir, { sourceKind: candidate.sourceKind })
     const errors = validation.issues.filter(issue => issue.level === "error")
     for (const issue of errors) problems.push(`${candidate.source}/${name}: [${issue.code}]${issue.path ? ` ${issue.path}` : ""}: ${issue.message}`)
     const constraint = constraints.get(name)!
@@ -213,7 +222,7 @@ export function resolvePacks(roots: PackRequest[], candidates: PackCandidate[], 
       dir: candidate.dir,
       relativeDir: candidate.relativeDir,
       revision: candidate.sourceKind === "git" ? options.revisionOf?.(candidate.source) ?? null : null,
-      manifestHash: hashFile(path.join(candidate.dir, MANIFEST_FILE)),
+      manifestHash: isVirtual && validation.manifest ? virtualManifestHash(validation.manifest) : hashFile(path.join(candidate.dir, MANIFEST_FILE)),
       contentHash: hashes.contentHash,
       requires: candidate.manifest.requires,
       root: constraint.root,

@@ -6,6 +6,7 @@ import YAML from "yaml"
 import { isPathInsideWorkspace, isWorkspaceRelativePath } from "./pathValidation.js"
 import { packDir, readManifest, resolvePackClosure } from "./catalog.js"
 import { MANIFEST_FILE } from "./packs.js"
+import { derivePackSlug, isVirtualPackRoot, scanLooseAgentFiles } from "./virtualPacks.js"
 import { detectFrontmatterVersion, translateFrontmatterV1ToV2, translateFrontmatterV2ToV1 } from "./v2Compat.js"
 import { isServerDisabled, readMcpServers } from "./opencodeMcp.js"
 
@@ -111,7 +112,7 @@ export function resolveSourceSubdir(workspaceRoot: string): string {
  * Pack holding a file: the nearest opencode-pack.json between the file and the workspace root. In a catalog the pack
  * is its directory under packs/ (what packDir resolves); a single pack is named by its manifest.
  */
-function packNameOf(filePath: string, workspaceRoot: string): string | null {
+export function packNameOf(filePath: string, workspaceRoot: string): string | null {
   const root = path.resolve(workspaceRoot)
   for (let dir = path.dirname(path.resolve(filePath)); dir.startsWith(root); dir = path.dirname(dir)) {
     const manifest = path.join(dir, MANIFEST_FILE)
@@ -126,6 +127,7 @@ function packNameOf(filePath: string, workspaceRoot: string): string | null {
     }
     if (dir === root) break
   }
+  if (isVirtualPackRoot(root)) return derivePackSlug(path.basename(root))
   return null
 }
 
@@ -385,7 +387,12 @@ export function discoverAgentResources(
 }
 
 /** Rewrites the agent's skill, tool and MCP permissions; the agent file is the only file written. */
-export function updateAgentResources(agent: AgentInfo, catalog: AgentResourceCatalog, changes: AgentResourceChanges): { changedPaths: string[] } {
+export function updateAgentResources(
+  agent: AgentInfo,
+  catalog: AgentResourceCatalog,
+  changes: AgentResourceChanges,
+  writer?: typeof saveAgentFile,
+): { changedPaths: string[] } {
   const hasPermissions = Object.keys(changes.permissions ?? {}).length > 0
   if (!changes.skills && !hasPermissions) return { changedPaths: [] }
 
@@ -403,8 +410,8 @@ export function updateAgentResources(agent: AgentInfo, catalog: AgentResourceCat
   const agentPath = agent.currentPath
   const stat = fs.lstatSync(agentPath)
   if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`Refusing to update non-regular agent file: ${agentPath}`)
-  const originalAgent = fs.readFileSync(agentPath)
-  if (originalAgent.toString("utf8") !== agent.rawContent) throw new Error(`Agent changed on disk before resource update: ${agent.filename}`)
+  const originalAgent = writer ? null : fs.readFileSync(agentPath)
+  if (originalAgent && originalAgent.toString("utf8") !== agent.rawContent) throw new Error(`Agent changed on disk before resource update: ${agent.filename}`)
 
   const existingPerm: Record<string, any> = { ...(agent.frontmatter.permission || {}) }
   if (changes.skills) {
@@ -445,8 +452,9 @@ export function updateAgentResources(agent: AgentInfo, catalog: AgentResourceCat
   const updatedFrontmatter = { ...agent.frontmatter, permission: existingPerm }
   const renderedAgent = renderAgentFile(updatedFrontmatter, agent.body, agent.frontmatterVersion)
   const agentBytes = Buffer.from(renderedAgent, "utf8")
-  if (agentBytes.equals(originalAgent)) return { changedPaths: [] }
-  atomicWriteAgentFile(agentPath, agentBytes)
+  if (originalAgent && agentBytes.equals(originalAgent)) return { changedPaths: [] }
+  if (writer) writer(agentPath, updatedFrontmatter, agent.body, agent.frontmatterVersion)
+  else atomicWriteAgentFile(agentPath, agentBytes)
   agent.frontmatter = updatedFrontmatter
   agent.rawContent = renderedAgent
   return { changedPaths: [agentPath] }
@@ -551,7 +559,11 @@ export function getAgentPermissionSummary(agent: AgentInfo): PermissionSummary {
   return { bash: bashState, edit: editState, read: readState, taskCount, riskLevel }
 }
 
-export function applySafetyPreset(agents: AgentInfo[], presetKey: "readonly_scout" | "safe_builder" | "unrestricted_dev") {
+export function applySafetyPreset(
+  agents: AgentInfo[],
+  presetKey: "readonly_scout" | "safe_builder" | "unrestricted_dev",
+  writer = saveAgentFile,
+) {
   const preset = SAFETY_PRESETS.find(p => p.key === presetKey)
   if (!preset) return
 
@@ -564,14 +576,15 @@ export function applySafetyPreset(agents: AgentInfo[], presetKey: "readonly_scou
         ...preset.permissions
       }
     }
-    saveAgentFile(agent.currentPath, updatedFrontmatter, agent.body, agent.frontmatterVersion)
+    writer(agent.currentPath, updatedFrontmatter, agent.body, agent.frontmatterVersion)
     agent.frontmatter = updatedFrontmatter
   }
 }
 
 export function updateAgentParams(
   agents: AgentInfo[],
-  params: { steps?: number; temperature?: number; mode?: string; hidden?: boolean; variant?: string | null; allowedVariants?: readonly string[] }
+  params: { steps?: number; temperature?: number; mode?: string; hidden?: boolean; variant?: string | null; allowedVariants?: readonly string[] },
+  writer = saveAgentFile,
 ) {
   const variant = params.variant === undefined ? undefined : normalizeAgentVariant(params.variant, params.allowedVariants)
 
@@ -588,7 +601,7 @@ export function updateAgentParams(
     if (variant === null) delete updatedFrontmatter.variant
     else if (variant !== undefined) updatedFrontmatter.variant = variant
 
-    saveAgentFile(agent.currentPath, composeModelVariant({ ...updatedFrontmatter }), agent.body, agent.frontmatterVersion)
+    writer(agent.currentPath, composeModelVariant({ ...updatedFrontmatter }), agent.body, agent.frontmatterVersion)
     agent.frontmatter = updatedFrontmatter
   }
 }
@@ -641,7 +654,7 @@ export function analyzePermissionOrder(agent: AgentInfo): PermissionOrderAnalysi
 /**
  * Reorders permission dictionaries so that wildcard '*' is placed FIRST.
  */
-export function fixPermissionOrder(agent: AgentInfo): boolean {
+export function fixPermissionOrder(agent: AgentInfo, writer = saveAgentFile): boolean {
   const perm = agent.frontmatter.permission
   if (!perm || typeof perm !== "object") return false
 
@@ -668,7 +681,7 @@ export function fixPermissionOrder(agent: AgentInfo): boolean {
 
   if (modified) {
     const updatedFrontmatter = { ...agent.frontmatter, permission: updatedPerm }
-    saveAgentFile(agent.currentPath, updatedFrontmatter, agent.body, agent.frontmatterVersion)
+    writer(agent.currentPath, updatedFrontmatter, agent.body, agent.frontmatterVersion)
     agent.frontmatter = updatedFrontmatter
   }
 
@@ -677,7 +690,8 @@ export function fixPermissionOrder(agent: AgentInfo): boolean {
 
 export function updateAgentDelegations(
   agent: AgentInfo,
-  allowedSubagentNames: string[]
+  allowedSubagentNames: string[],
+  writer = saveAgentFile,
 ) {
   const existingPerm = agent.frontmatter.permission || {}
   
@@ -696,7 +710,7 @@ export function updateAgentDelegations(
     }
   }
 
-  saveAgentFile(agent.currentPath, updatedFrontmatter, agent.body, agent.frontmatterVersion)
+  writer(agent.currentPath, updatedFrontmatter, agent.body, agent.frontmatterVersion)
   agent.frontmatter = updatedFrontmatter
   agent.allowedSubagents = allowedSubagentNames
 }
@@ -1006,7 +1020,11 @@ function countCategoryPrefixes(filenames: string[]): Record<string, number> {
  * Recursively find all agent markdown files in the workspace (under any folder named 'agents').
  * Also discovers agents in V2 'mode' and 'modes' directories (which represent primary agents).
  */
-export function findAgentFiles(workspaceRoot: string, sourceDir?: string): AgentList {
+export function findAgentFiles(
+  workspaceRoot: string,
+  sourceDir?: string,
+  options?: { contentTransform?: (filePath: string, rawContent: string) => string },
+): AgentList {
   const resolvedSourceDir = sourceDir || resolveSourceSubdir(workspaceRoot)
   if (!isWorkspaceRelativePath(resolvedSourceDir)) {
     throw new Error(`sourceDir must stay inside workspace; received '${resolvedSourceDir}'`)
@@ -1046,8 +1064,8 @@ export function findAgentFiles(workspaceRoot: string, sourceDir?: string): Agent
 
     if (stats.isDirectory()) {
       const files = fs.readdirSync(dir)
-      // V2 compatibility: 'agents', 'agent', 'mode', 'modes' are all valid agent directories
-      const agentKind = agentDir ?? (basename === "agents" || basename === "agent" || basename === "mode" || basename === "modes" ? basename : null)
+      // V2 compatibility: 'agents', 'agent', 'mode', 'modes' are all valid agent directories (never the workspace root itself)
+      const agentKind = agentDir ?? (dir !== resolvedRoot && (basename === "agents" || basename === "agent" || basename === "mode" || basename === "modes") ? basename : null)
       const isAgentsDir = agentKind !== null
 
       for (const file of files) {
@@ -1059,7 +1077,8 @@ export function findAgentFiles(workspaceRoot: string, sourceDir?: string): Agent
         }
         if (isAgentsDir && file.endsWith(".md")) {
           try {
-            const agent = parseAgentFile(fullPath, workspaceRoot)
+            const raw = options?.contentTransform ? options.contentTransform(fullPath, fs.readFileSync(fullPath, "utf-8")) : undefined
+            const agent = parseAgentFile(fullPath, workspaceRoot, raw)
             if (agent) {
               // V2: agents in 'mode' or 'modes' directories are primary agents
               if ((agentKind === "mode" || agentKind === "modes") && !agent.frontmatter.mode) {
@@ -1078,6 +1097,31 @@ export function findAgentFiles(workspaceRoot: string, sourceDir?: string): Agent
   }
 
   walk(sourceRoot)
+  if (!sourceDir && isVirtualPackRoot(resolvedRoot)) {
+    const seenPaths = new Set(agents.map(agent => path.resolve(agent.currentPath)))
+    const { agents: looseAgents, skippedLinks: looseSkipped } = scanLooseAgentFiles(resolvedRoot)
+    for (const link of looseSkipped) {
+      const fullLink = path.join(resolvedRoot, ...link.split("/"))
+      if (!skippedLinks.includes(fullLink)) skippedLinks.push(fullLink)
+    }
+    for (const loose of looseAgents) {
+      const fullPath = path.join(resolvedRoot, ...loose.sourceRel.split("/"))
+      if (seenPaths.has(path.resolve(fullPath))) continue
+      try {
+        const raw = options?.contentTransform ? options.contentTransform(fullPath, fs.readFileSync(fullPath, "utf-8")) : undefined
+        const agent = parseAgentFile(fullPath, workspaceRoot, raw)
+        if (agent) {
+          if ((loose.containerKind === "mode" || loose.containerKind === "modes") && !agent.frontmatter.mode) {
+            agent.frontmatter.mode = "primary"
+          }
+          agents.push(agent)
+          seenPaths.add(path.resolve(fullPath))
+        }
+      } catch (e) {
+        console.error(`Error parsing agent file ${loose.sourceRel}:`, e)
+      }
+    }
+  }
   const warnings = [
     ...(agents.length === 0 ? [`No agents found under sourceDir '${resolvedSourceDir}' (${sourceRoot})`] : []),
     ...skippedLinks.map(link => `Skipped symlink ${path.relative(workspaceRoot, link)}: agents are never read or edited through links`),
@@ -1094,10 +1138,10 @@ export function findAgentFiles(workspaceRoot: string, sourceDir?: string): Agent
 /**
  * Parse an agent markdown file to extract frontmatter and content.
  */
-export function parseAgentFile(filePath: string, workspaceRoot: string): AgentInfo | null {
+export function parseAgentFile(filePath: string, workspaceRoot: string, contentOverride?: string): AgentInfo | null {
   if (!fs.existsSync(filePath)) return null
 
-  const content = fs.readFileSync(filePath, "utf-8")
+  const content = contentOverride ?? fs.readFileSync(filePath, "utf-8")
   const filename = path.basename(filePath)
 
   let frontmatter: Record<string, any> = {}
@@ -1404,10 +1448,10 @@ export function repairAgentModels(agents: AgentInfo[], mappings: ModelRepairMapp
 /**
  * Batch update the color of multiple agents.
  */
-export function updateAgentsColor(agents: AgentInfo[], color: string) {
+export function updateAgentsColor(agents: AgentInfo[], color: string, writer = saveAgentFile) {
   for (const agent of agents) {
     const updatedFrontmatter = { ...agent.frontmatter, color }
-    saveAgentFile(agent.currentPath, updatedFrontmatter, agent.body, agent.frontmatterVersion)
+    writer(agent.currentPath, updatedFrontmatter, agent.body, agent.frontmatterVersion)
     agent.frontmatter = updatedFrontmatter
   }
 }

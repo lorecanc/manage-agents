@@ -3,8 +3,8 @@ import fs from "node:fs"
 import path from "node:path"
 import test from "node:test"
 import { tempDir, writePack } from "../../test/helpers.js"
-import { callersLabel, describeArchetype, isRoutableArchetype, setArchetypeConfig } from "./archetypes.js"
-import { MANIFEST_FILE } from "./packs.js"
+import { callersLabel, describeArchetype, describePackFlows, exportFlowsToPackManifest, isConfigurablePack, isRoutableArchetype, setArchetypeConfig } from "./archetypes.js"
+import { hasErrors, MANIFEST_FILE, validatePack } from "./packs.js"
 
 const agent = (frontmatter: string) => `---\ndescription: agent\n${frontmatter}---\n\nBody.\n`
 
@@ -158,4 +158,44 @@ test("isRoutableArchetype is true only for an archetype pack of the catalog", (t
   assert.equal(isRoutableArchetype(root, "../flow"), false)
   assert.equal(isRoutableArchetype(root, undefined), false)
   assert.equal(isRoutableArchetype(root, null), false)
+})
+
+test("describePackFlows works on packs without archetype and exportFlowsToPackManifest writes valid contract 1.1 flowDefaults", (t) => {
+  const root = tempDir(t, "flows-slides-")
+  const slidesDir = writePack(
+    path.join(root, "packs", "slides"),
+    {
+      "agents/slides-agent.md": agent('mode: primary\npermissions:\n  - action: shell\n    resource: "*"\n    effect: deny\n'),
+      "agents/slides-writer.md": agent("mode: subagent\n"),
+      "tools/slides/slide_render.ts": "export default {}\n",
+    },
+    { name: "slides" },
+  )
+
+  assert.equal(isRoutableArchetype(root, "slides"), false)
+  assert.equal(isConfigurablePack(root, "slides"), true)
+
+  const view = describePackFlows(root, "slides", {
+    routeLayers: [{ anthropic: { "slides-writer": "google/gemini-4#high" } }],
+    userRules: [
+      {
+        triggers: ["mistral", "openai/gpt-5.4"],
+        then: { models: { "slides-writer": "openai/gpt-5-mini" }, tools: { slide_render: "allow" }, delegations: { "slides-writer": "allow" } },
+      },
+    ],
+  })!
+
+  assert.equal(view.callerSource, "inferred")
+  assert.deepEqual(view.callers.map(c => c.name), ["slides-agent"])
+  assert.ok(view.staticDeniedTools.has("bash"))
+  assert.equal(view.flows.length, 2)
+
+  const exportedFile = exportFlowsToPackManifest(root, view)
+  assert.equal(exportedFile, path.join(slidesDir, MANIFEST_FILE))
+  const exported = JSON.parse(fs.readFileSync(exportedFile, "utf8"))
+  assert.equal(exported.contract, "1.1")
+  assert.deepEqual(exported.archetype, { callers: ["slides-agent"], reference: "slides-agent" })
+  assert.deepEqual(exported.routingDefaults, { anthropic: { "slides-writer": "google/gemini-4#high" } })
+  assert.equal(exported.flowDefaults.length, 1)
+  assert.equal(hasErrors(validatePack(slidesDir)), false)
 })

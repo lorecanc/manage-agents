@@ -4,7 +4,7 @@ import fs from "node:fs"
 import path from "node:path"
 import test from "node:test"
 import { tempDir, writePack } from "../../test/helpers.js"
-import { addSource, discoverPacks, loadSources, pullSource, removeSource, saveSources, sourceRevision, type SourceRegistry } from "./sources.js"
+import { addSource, deriveSourceName, discoverPacks, ghCredentialArgs, loadSources, pullSource, removeSource, saveSources, sourceRevision, type SourceRegistry } from "./sources.js"
 
 const emptyRegistry = (): SourceRegistry => ({ schemaVersion: 1, sources: [], prefer: {} })
 const envFor = (t: test.TestContext) => {
@@ -46,6 +46,7 @@ test("registry: rejects bad names, duplicates, unsupported URLs, file: URLs and 
   assert.throws(() => addSource(registry, "missing", path.join(dir, "nope")), /not a directory/)
   assert.throws(() => addSource(registry, "token", "https://user:secret@example.com/x.git"), /credentials in source URLs/)
   assert.throws(() => addSource(registry, "token2", "https://ghp_token@example.com/x.git"), /credentials in source URLs/)
+  assert.throws(() => addSource(registry, "querytoken", "https://github.com/org/x.git?access_token=secret"), /credentials in source URLs/)
   assert.doesNotThrow(() => addSource(registry, "ssh", "ssh://git@example.com/x.git"))
 })
 
@@ -125,4 +126,87 @@ test("git sources: clone, follow a moving branch, pin a tag, reject unknown refs
   const readded = addSource(registry, "branch", `file://${other}`, { ref: "main" }, { allowFileUrls: true })
   assert.equal(pullSource(readded, env, { allowFileUrls: true }), gitIn(other, "rev-parse", "HEAD"))
   assert.deepEqual(discoverPacks(readded, env).candidates.map(candidate => candidate.manifest.name), ["other"])
+})
+
+test("GitHub shorthand, derived source names, active source persistence and gh credential helper args", (t) => {
+  const env = envFor(t)
+  const registry = emptyRegistry()
+
+  const firstName = deriveSourceName("lorecanc/agents", registry)
+  assert.equal(firstName, "agents")
+  const ghSource = addSource(registry, firstName, "lorecanc/agents#main")
+  assert.deepEqual(ghSource, {
+    name: "agents",
+    kind: "git",
+    url: "https://github.com/lorecanc/agents.git",
+    ref: "main",
+    trusted: false,
+  })
+
+  const secondName = deriveSourceName("github:other-org/agents.git", registry)
+  assert.equal(secondName, "agents-2")
+  const second = addSource(registry, secondName, "github:other-org/agents.git")
+  assert.equal(second.kind === "git" && second.url, "https://github.com/other-org/agents.git")
+
+  assert.throws(() => addSource(registry, "conflict", "lorecanc/agents#v1", { ref: "v2" }), /conflicting git refs/)
+  assert.throws(() => addSource(registry, "badgh", "github:../escape"), /invalid GitHub repository/)
+
+  registry.active = "agents-2"
+  saveSources(registry, env)
+  const loaded = loadSources(env)
+  assert.equal(loaded.active, "agents-2")
+
+  removeSource(loaded, "agents-2")
+  assert.equal(loaded.active, "agents")
+  removeSource(loaded, "agents")
+  assert.equal(loaded.active, undefined)
+
+  const authedGh = {
+    run: () => ({
+      status: 0,
+      stdout: JSON.stringify({ hosts: { "github.com": [{ login: "lorecanc", active: true, state: "success" }] } }),
+      stderr: "",
+    }),
+  }
+  const unauthedGh = {
+    run: () => ({ status: 1, stdout: "{}", stderr: "not logged in" }),
+  }
+  assert.deepEqual(ghCredentialArgs("https://github.com/lorecanc/agents.git", env, { ghRunner: authedGh }), [
+    "-c",
+    "credential.https://github.com.helper=",
+    "-c",
+    "credential.https://github.com.helper=!gh auth git-credential",
+  ])
+  assert.deepEqual(ghCredentialArgs("https://github.com/lorecanc/agents.git", env, { ghRunner: unauthedGh }), [])
+  assert.deepEqual(ghCredentialArgs("ssh://git@github.com/lorecanc/agents.git", env, { ghRunner: authedGh }), [])
+})
+
+test("CLI source add <owner/repo> auto-names source and source auth --json reports gh status", { skip: process.platform === "win32" }, (t) => {
+  const env = envFor(t)
+  const binDir = path.join(tempDir(t), "bin")
+  fs.mkdirSync(binDir, { recursive: true })
+  fs.writeFileSync(
+    path.join(binDir, "gh"),
+    `#!/bin/sh\necho '{"hosts":{"github.com":[{"login":"lorecanc","active":true,"state":"success"}]}}'\n`,
+    { mode: 0o755 },
+  )
+  const cliEnv = { ...process.env, ...env, PATH: `${binDir}:${process.env.PATH}` }
+  const launcher = path.resolve("manage-agents.mjs")
+
+  const addRes = spawnSync(process.execPath, [launcher, "source", "add", "lorecanc/agents#main"], {
+    encoding: "utf8",
+    env: cliEnv,
+  })
+  assert.equal(addRes.status, 0, addRes.stderr)
+  assert.match(addRes.stdout, /Added git source agents/)
+
+  const listRes = spawnSync(process.execPath, [launcher, "source", "list"], { encoding: "utf8", env: cliEnv })
+  assert.equal(listRes.status, 0, listRes.stderr)
+  assert.match(listRes.stdout, /\* agents\s+git\s+untrusted\s+https:\/\/github\.com\/lorecanc\/agents\.git#main/)
+
+  const authRes = spawnSync(process.execPath, [launcher, "source", "auth", "--json"], { encoding: "utf8", env: cliEnv })
+  assert.equal(authRes.status, 0, authRes.stderr)
+  const authJson = JSON.parse(authRes.stdout)
+  assert.equal(authJson.authenticated, true)
+  assert.equal(authJson.login, "lorecanc")
 })

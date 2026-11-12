@@ -83,3 +83,13 @@ test("packDir refuses a pack directory that is a symlink", { skip: process.platf
 
   assert.equal(packDir(root, "linked"), null)
 })
+
+test("packDir discovers non-symlink packs nested up to DISCOVERY_DEPTH when not under packs/", { skip: process.platform === "win32" }, (t) => {
+  const root = tempDir(t, "catalog-nested-")
+  const nested = writePack(path.join(root, "catalog", "team", "alpha"), {}, { name: "alpha" })
+  const outside = writePack(tempDir(t, "catalog-outside-"), {}, { name: "escaped" })
+  fs.symlinkSync(outside, path.join(root, "catalog", "escaped"))
+
+  assert.equal(packDir(root, "alpha"), nested)
+  assert.equal(packDir(root, "escaped"), null)
+})

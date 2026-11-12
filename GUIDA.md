@@ -39,8 +39,10 @@ Altri programmi, a seconda di cosa fai:
 - `opencode` nel `PATH` per il catalogo dei modelli (`opencode models`), usato dal selettore modelli e da `create`;
 - `claude` nel `PATH` per validare e registrare i bridge Claude Code.
 
-Senza comando si apre la TUI sul workspace. Ogni comando ha il suo `--help`, per esempio
-`manage-agents install --help` o `manage-agents bridge --help`.
+Senza comando parte la TUI. Dentro un catalogo locale apre quel workspace, mentre altrove carica l'ultima sorgente
+registrata in `sources.json` oppure apre la schermata «Data Sources» per collegare un repository GitHub (anche tramite
+login `gh`) o una cartella locale, lasciando invariato il supporto a `--help` su ogni sottocomando come
+`manage-agents install --help`.
 
 ## Concetti
 
@@ -90,19 +92,23 @@ Una directory locale:
 manage-agents source add catalog ~/dev/agents
 ```
 
-Un repository git (`https:`, `ssh:` o `git@host:path`; gli URL con credenziali vengono rifiutati):
+Collega direttamente GitHub. Puoi passare la forma breve `owner/repo` o `github:owner/repo#ref`, oppure un URL `https:`,
+`ssh:` o `git@host:path` (gli URL con credenziali o query string vengono rifiutati e il nome della sorgente viene
+ricavato in automatico quando lo ometti):
 
 ```bash
-manage-agents source add catalog https://github.com/lorecanc/agents.git --ref main
-manage-agents source pull catalog
+manage-agents source login
+manage-agents source add lorecanc/agents#main --pull
 ```
 
-`source pull` clona o aggiorna le sorgenti git e fa il checkout in detached HEAD sul ref indicato. Senza `--ref` usa
-la HEAD del remoto. Senza nomi aggiorna tutte le sorgenti git.
+`source pull` aggiorna la cache. Il comando clona o scarica le sorgenti git facendo checkout in detached HEAD sul ref
+scelto (o sulla HEAD remota quando ometti `--ref`), e se `gh` è autenticato sull'host HTTPS passa automaticamente
+`gh auth git-credential` a Git per accedere anche ai repository privati senza salvare alcun token in `sources.json`.
 
 Gli altri sottocomandi di `source`:
 
-- `source list [--json]` elenca le sorgenti, con il tipo e lo stato di fiducia;
+- `source list [--json]` elenca le sorgenti, con la sorgente attiva, il tipo e lo stato di fiducia;
+- `source login [--hostname <host>]` e `source auth [--hostname <host>] [--json]` gestiscono il login via `gh`;
 - `source remove <nome>` la toglie dal registro;
 - `source trust <nome>` e `source untrust <nome>` cambiano la fiducia (si può dare anche con `--trust` in `add`);
 - `source prefer <pack> <sorgente>` sceglie la sorgente quando più sorgenti offrono lo stesso pack, e
@@ -206,33 +212,26 @@ Gli altri file che avevi creato a mano restano conflitti come sempre: decidi cas
 
 Ci sono tre livelli, ciascuno con il suo strumento.
 
-### Routing degli archetipi
+### Flussi condizionali e routing
 
-Quando un chiamante di un pack archetipo gira su un certo provider o modello (il *trigger*), il router assegna un
-modello a ciascun subagent. I livelli si sommano agente per agente: prima i `routingDefaults` del pack, poi le tue
-impostazioni globali, infine quelle del target. Per un trigger `provider/model` la corrispondenza esatta vince su
-quella per provider. `inherit` lascia al subagent il modello del chiamante.
+Ogni pack può avere flussi condizionali. Quando uno dei chiamanti del pack (in `OR` tra loro) gira su un provider, su un modello esatto oppure sul jolly `*`, il plugin `manage-agents-router` assegna i modelli ai subagent, filtra i tool dal contesto e applica regole `allow`, `ask` o `deny` su tool, permessi e deleghe, anche qualora il pack non dichiari `archetype` in `opencode-pack.json` (in quel caso il motore usa gli agenti primari come chiamanti predefiniti finché non li personalizzi). I livelli si sommano in ordine: prima i `routingDefaults` e `flowDefaults` del pack, poi l'ambito globale, infine l'ambito del target, dove `provider/model` prevale sul provider e il provider prevale su `*`.
 
 ```bash
 manage-agents models show
-manage-agents models set flow mistral flow-explore=mistral/deepseek-v4-1-flash-1017#high flow-review=inherit
-manage-agents models unset flow mistral flow-explore
+manage-agents models callers slides slides-agent
+manage-agents models set slides anthropic,openai/gpt-5.4 slides-html-writer=google/gemini-4#high
+manage-agents models rule-set slides mistral --tool bash=deny --delegate slides-template-writer=deny
+manage-agents models rule-unset slides 0
 ```
 
-Un subagent con un modello fisso (nel frontmatter o in un override) è *pinned* e il routing lo salta:
+Un subagent con modello fisso resta *pinned*. Il router salta i subagent *pinned* durante l'assegnazione del modello, a meno che tu non rimuova il vincolo con `unpin`, mentre in OpenCode V2 un `deny` statico scritto nel frontmatter dell'agente resta sempre invalicabile (lascia `allow` o `ask` nel chiamante se vuoi restringere l'accesso tramite flusso condizionale):
 
 ```bash
 manage-agents models pin flow/flow-eye openai/gpt-5.6-sol
 manage-agents models unpin flow/flow-eye
 ```
 
-`pin` scrive l'override `model`. `unpin` lo imposta a `null`, così il subagent segue il routing anche se è il pack a
-fissarne il modello. `models set` non tocca mai il frontmatter.
-
-**Ambito.** Senza opzioni la modifica vale solo per il target (quello di default o quello di `--target`), che vince
-sulle impostazioni globali. Con `--global` vale per tutti i target: gli altri la applicano al loro prossimo
-`reconcile` e intanto `status` la segnala come in sospeso. Ogni modifica riconcilia subito il target, salvo
-`--no-reconcile`; `--yes` accetta le conferme che il reconcile dovesse chiedere.
+**Ambito.** Senza opzioni la modifica vale per il solo target corrente. Con `--global` la regola entra nelle impostazioni condivise e gli altri target la ricevono al successivo `reconcile`, mentre `status` segnala le modifiche ancora da applicare; ogni comando riconcilia subito il target salvo `--no-reconcile`.
 
 ### Override del frontmatter
 
@@ -250,32 +249,33 @@ I valori sono YAML e `null` rimuove il campo. Per gli agenti sono ammessi `descr
 `permissions`, `hidden`, `color`, `steps`, `disabled`, `request`, `temperature` e `top_p`. Per i comandi (con
 `--command`) `description`, `agent`, `model` e `subagent`. Ambito e reconcile funzionano come per `models`.
 
-### Default del pack
+### Esportazione nel manifesto e pacchetti di soli `.md`
 
-I `routingDefaults` sono ciò che il pack distribuisce, e si cambiano nel catalogo. Nella TUI porta il cursore sulla
-cartella di un pack archetipo e, senza agenti selezionati, premi `m`: compare una riga per trigger. Ogni modifica
-scrive `routingDefaults` in `opencode-pack.json` e valida il pack. Se il file non rispetta più il contratto, la TUI lo
-ripristina. Serve il catalogo dei modelli di OpenCode.
+Il gestore funziona anche senza manifesto. Se colleghi una cartella locale o un repository GitHub che contiene semplici file `.md` con frontmatter agente (anche fuori da `agents/`), `manage-agents` sintetizza automaticamente un pack virtuale `0.0.0-virtual` così che tu possa ispezionarlo, configurarne i flussi condizionali in `routing.json` e installarlo subito in OpenCode con `e` o `manage-agents install`. Nella TUI premi `m` su qualsiasi cartella di pack per modificare chiamanti (`c`), trigger multipli in `OR` (`Space` o `Tab`), tool (`u`) e deleghe (`g`) nelle tue impostazioni utente; sui pack locali premi `w` (oppure esegui `manage-agents models export-pack <pack>`) per esportare `archetype`, `routingDefaults` e `flowDefaults` dentro `opencode-pack.json`, oppure premi `i` (`manage-agents pack init`) per generare e validare il manifesto partendo da una cartella di soli `.md`.
 
 ## Lavorare su un catalogo
 
 ### La TUI
 
 ```bash
-cd ~/dev/agents && manage-agents
+manage-agents
+manage-agents --source agents
 manage-agents --workspace ~/dev/agents
 ```
 
-La lista degli agenti è un albero con una cartella per pack, tutte chiuse all'avvio. `→`/`l` apre la cartella sotto
-il cursore e `←`/`h` la chiude. La ricerca (`/`) filtra per nome file, nasconde le cartelle senza corrispondenze e
-mostra aperte le altre. Quando la svuoti, ogni cartella torna com'era.
+Ogni pack ha una cartella. Con `o` apri la finestra «Data Sources» per autenticarti con `gh` (`G`), sfogliare i tuoi
+repository GitHub, digitare `owner/repo` (`A` o `/`), sincronizzare con `P` o cambiare sorgente attiva, mentre sulle
+sorgenti GitHub ogni modifica nella TUI aggiorna `overrides.json` e `routing.json` riconciliando il target senza
+alterare mai la cache git.
 
 | Tasto | Azione |
 |---|---|
+| `o` | apre «Data Sources» (repository GitHub, login `gh`, pull, sorgenti locali) |
 | frecce, `j`/`k` | spostano il cursore; nelle schede 3–5 dell'inspector scorrono la scheda |
 | `/` | cerca per nome file (`Enter` mantiene il filtro, `Esc` lo cancella) |
 | `Space`, `a`, `s` | selezionano l'agente, tutto il pack, gli agenti del pack con lo stesso modello |
-| `m` | modello; sulla cartella di un archetipo, senza selezione, i suoi default di routing |
+| `m` | modello; su qualunque cartella pack, senza selezione, i flussi condizionali `IF / OR` |
+| `i` | inizializza `opencode-pack.json` su una cartella locale di soli file `.md` |
 | `v` | ripara i modelli non validi |
 | `t`, `Shift-T` | parametri (selezione, cartella o agente), tier di traduzione |
 | `c`, `p`, `g` | colore, preset di permessi, deleghe |

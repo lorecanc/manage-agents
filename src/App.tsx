@@ -3,7 +3,7 @@ import fs from "node:fs"
 import path from "node:path"
 import os from "node:os"
 import { isDeepStrictEqual } from "node:util"
-import { useKeyboard, useTerminalDimensions } from "@opentui/react"
+import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react"
 import {
   findAgentFiles,
   AgentInfo,
@@ -31,12 +31,38 @@ import {
   buildTuningUpdateParams,
   sanitizeFilename,
   getCategoryPrefixes,
+  type saveAgentFile,
 } from "./utils/agents.js"
 import { loadModelCatalog, suggestModels, collectInvalidModelGroups, modelDisplayValue, getModelVariants, type ModelCatalog } from "./utils/models.js"
-import { callersLabel, describeArchetype, INHERIT, isRoutableArchetype, setArchetypeConfig, type ArchetypeAgent, type RoleModels } from "./utils/archetypes.js"
+import {
+  callersLabel,
+  exportFlowsToPackManifest,
+  INHERIT,
+  isConfigurablePack,
+  type ArchetypeAgent,
+  type RoleModels,
+  type UnifiedFlowItem,
+} from "./utils/archetypes.js"
 import { packDir, readManifest } from "./utils/catalog.js"
 import { changeTarget, installChange } from "./utils/installer.js"
-import { addSource, engineConfigDir, loadSources, removeSource, saveSources } from "./utils/sources.js"
+import { addSource, deriveSourceName, engineConfigDir, findSource, loadSources, pullSource, removeSource, saveSources, sourceRevision, sourceRoot, type Source } from "./utils/sources.js"
+import { inspectGhAuthAsync, listGhReposAsync, runGhWebLogin, type GhAuthStatus, type GhRepoSummary } from "./utils/github.js"
+import {
+  describeConfiguredPackFlows,
+  formatReconcileLines,
+  loadSourceAgents,
+  overrideAgentsModel,
+  overrideRepairAgentModels,
+  reconcileTargetIfInstalled,
+  runWithOverrideWriter,
+  saveUserPackCallers,
+  saveUserPackFlow,
+  sourceBridgeOutputDir,
+  sourceTranslationConfigLocation,
+  type FlowDraftInput,
+} from "./utils/sourceCustomization.js"
+import { WILDCARD_TRIGGER, type DelegationEffect, type PolicyEffect } from "./utils/values.js"
+import { derivePackSlug, initPackManifest, isVirtualPackRoot } from "./utils/virtualPacks.js"
 import { bridgePack } from "./utils/bridgeWorkspace.js"
 import { describeChangeResult } from "./utils/changeReport.js"
 import { defaultTarget, serializeLock } from "./utils/lock.js"
@@ -49,15 +75,27 @@ import { loadUiConfig, saveUiConfig } from "./utils/uiConfig.js"
 import { displayWidth, middleEllipsis, terminalSafeText } from "./utils/terminalText.js"
 
 interface AppProps {
-  workspaceRoot: string
+  workspaceRoot?: string
+  initialSource?: Source
+  startupNotice?: string
   listShare?: number
   uiConfigWarning?: string
   configReadOnly?: boolean
   uiConfigRevision?: string
 }
 
+type ActiveDataSource =
+  | { kind: "workspace"; root: string }
+  | { kind: "source"; source: Source; root: string }
+
+type SourceModalRow =
+  | { id: string; kind: "connect-input"; spec: string }
+  | { id: string; kind: "registered"; source: Source; revision: string | null; isActive: boolean }
+  | { id: string; kind: "gh-repo"; repo: GhRepoSummary }
+
 type ViewMode =
   | "main"
+  | "sources"
   | "model-selector"
   | "repair-selector"
   | "repair-confirm"
@@ -74,6 +112,11 @@ type ViewMode =
   | "layout"
   | "routing-configs"
   | "routing-editor"
+  | "routing-callers"
+  | "routing-tools"
+  | "routing-permissions"
+  | "routing-delegations"
+  | "pack-init"
 
 interface ActiveItem {
   type: "file" | "folder"
@@ -168,7 +211,19 @@ interface ColorTreeItem {
   value: string
 }
 
-export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configReadOnly = false, uiConfigRevision = "missing" }: AppProps) {
+export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNotice, listShare = 2 / 3, uiConfigWarning, configReadOnly = false, uiConfigRevision = "missing" }: AppProps) {
+  const renderer = useRenderer()
+  const [activeDataSource, setActiveDataSource] = useState<ActiveDataSource | null>(() => {
+    if (workspaceRootProp) return { kind: "workspace", root: workspaceRootProp }
+    if (initialSource) return { kind: "source", source: initialSource, root: sourceRoot(initialSource) }
+    return null
+  })
+  const workspaceRoot = activeDataSource?.root ?? ""
+  const isReadOnlyGitSource = activeDataSource?.kind === "source" && activeDataSource.source.kind === "git"
+  const [activeRevision, setActiveRevision] = useState<string | null>(() =>
+    initialSource ? sourceRevision(initialSource) : null
+  )
+
   const mutate = <T,>(paths: string[], operation: keyof typeof AUTO_COMMIT_MESSAGES, fn: () => T) =>
     repositoryTransaction(workspaceRoot, paths, AUTO_COMMIT_MESSAGES[operation], fn)
   // Data State
@@ -190,7 +245,17 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
   const [scrollOffset, setScrollOffset] = useState(0)
 
   // Modal / Action State
-  const [viewMode, setViewMode] = useState<ViewMode>("main")
+  const [viewMode, setViewMode] = useState<ViewMode>(() => (workspaceRootProp || initialSource ? "main" : "sources"))
+  const [registeredSources, setRegisteredSources] = useState<Source[]>([])
+  const [sourceRevisions, setSourceRevisions] = useState<Record<string, string | null>>({})
+  const [activeSourceName, setActiveSourceName] = useState<string | undefined>(initialSource?.name)
+  const [ghAuth, setGhAuth] = useState<GhAuthStatus | null>(null)
+  const [ghRepos, setGhRepos] = useState<GhRepoSummary[]>([])
+  const [sourcesQuery, setSourcesQuery] = useState("")
+  const [sourcesInputFocused, setSourcesInputFocused] = useState(false)
+  const [sourcesFocusIndex, setSourcesFocusIndex] = useState(0)
+  const [sourcesScrollOffset, setSourcesScrollOffset] = useState(0)
+  const [sourcesStatus, setSourcesStatus] = useState(startupNotice ?? "")
   const [appliedShare, setAppliedShare] = useState(() => listShare)
   const [layoutDraft, setLayoutDraft] = useState(() => listShare)
   const [layoutSnapshot, setLayoutSnapshot] = useState(() => listShare)
@@ -205,17 +270,30 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
   const [expandedProviders, setExpandedProviders] = useState<Set<string>>(new Set())
   // Typing in the model selector filters the catalog (every word must match "provider/model").
   const [modelFilter, setModelFilter] = useState("")
-  // Model configurations of an archetype (M on its folder): list -> editor -> model selector.
+  // Conditional IF/OR flows of a pack (M on any pack folder): list -> editor -> callers/triggers/models/tools/delegations.
   const [routingArchetype, setRoutingArchetype] = useState<string | null>(null)
   const [routingFocus, setRoutingFocus] = useState(0)
   const [routingEditorFocus, setRoutingEditorFocus] = useState(0)
-  const [routingDraft, setRoutingDraft] = useState<{ previousTrigger?: string; trigger: string; roles: RoleModels } | null>(null)
+  type RoutingDraftState = FlowDraftInput & { previousKey?: string }
+  const [routingDraft, setRoutingDraft] = useState<RoutingDraftState | null>(null)
   type RoutingPick = { kind: "trigger" } | { kind: "roles"; roles: string[] }
   const [routingPick, setRoutingPick] = useState<RoutingPick | null>(null)
+  const [pendingTriggers, setPendingTriggers] = useState<Set<string>>(new Set())
   const [routingSelected, setRoutingSelected] = useState<Set<string>>(new Set())
   const [routingConfirmDelete, setRoutingConfirmDelete] = useState(false)
   const [routingStatus, setRoutingStatus] = useState("")
   const [routingRevision, setRoutingRevision] = useState(0)
+  const [callerDraftSet, setCallerDraftSet] = useState<Set<string>>(new Set())
+  const [callerFocus, setCallerFocus] = useState(0)
+  const [flowSubFocus, setFlowSubFocus] = useState(0)
+  const [flowSubScroll, setFlowSubScroll] = useState(0)
+
+  // Guided opencode-pack.json initializer for virtual .md folders ([I] key)
+  const [initPackName, setInitPackName] = useState("")
+  const [initPackVersion, setInitPackVersion] = useState("0.1.0")
+  const [initPackDesc, setInitPackDesc] = useState("")
+  const [initPackOrganize, setInitPackOrganize] = useState(true)
+  const [initPackField, setInitPackField] = useState<"name" | "version" | "desc" | "organize">("name")
 
   const [actionResultTitle, setRawActionResultTitle] = useState("")
   const [actionResultLines, setRawActionResultLines] = useState<string[]>([])
@@ -242,13 +320,20 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
   const [bridgeTarget, setBridgeTarget] = useState<"claude" | "codex">("claude")
   const [bridgeModelTarget, setBridgeModelTarget] = useState("")
   const [bridgeFocusedField, setBridgeFocusedField] = useState<"name" | "prefix" | "model">("name")
-  const [translationConfig, setTranslationConfig] = useState<TranslationConfig | null>(() => {
+  const loadTranslationFor = (ds: ActiveDataSource | null): TranslationConfig | null => {
+    if (!ds) return null
     try {
-      return loadTranslationConfig(workspaceRoot, undefined, { persistMigration: false })
+      if (ds.kind === "source" && ds.source.kind === "git") {
+        const loc = sourceTranslationConfigLocation(ds.source.name, ds.root)
+        const baseRoot = fs.existsSync(loc.configPath) ? loc.configRoot : ds.root
+        return loadTranslationConfig(baseRoot, loc.readPath, { persistMigration: false })
+      }
+      return loadTranslationConfig(ds.root, undefined, { persistMigration: false })
     } catch {
       return null
     }
-  })
+  }
+  const [translationConfig, setTranslationConfig] = useState<TranslationConfig | null>(() => loadTranslationFor(activeDataSource))
 
   // Color Selector State
   const [focusedColorIndex, setFocusedColorIndex] = useState(0)
@@ -318,12 +403,49 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
     setBridgeSuggestionScrollOffset(offset => Math.min(offset, Math.max(0, filteredBridgePrefixSuggestions.length - 5)))
   }, [filteredBridgePrefixSuggestions.length])
 
+  const refreshSourcesView = (preserveStatus = false) => {
+    try {
+      const registry = loadSources()
+      setRegisteredSources(registry.sources)
+      setSourceRevisions(Object.fromEntries(registry.sources.map(source => [source.name, sourceRevision(source)])))
+      setActiveSourceName(registry.active)
+    } catch (error: any) {
+      setRegisteredSources([])
+      setSourceRevisions({})
+      if (!preserveStatus) setSourcesStatus(terminalSafeText(error?.message || error))
+    }
+    void (async () => {
+      try {
+        const auth = await inspectGhAuthAsync()
+        setGhAuth(auth)
+        if (auth.authenticated) {
+          try {
+            setGhRepos(await listGhReposAsync({ limit: 100 }))
+          } catch (error: any) {
+            setGhRepos([])
+            if (!preserveStatus) setSourcesStatus(terminalSafeText(error?.message || error))
+          }
+        } else {
+          setGhRepos([])
+        }
+      } catch (error: any) {
+        setGhAuth({ available: false, authenticated: false, host: "github.com", message: terminalSafeText(error?.message || error) })
+        setGhRepos([])
+      }
+      renderer.requestRender()
+    })()
+  }
+
   // Load agents and models on startup
   useEffect(() => {
-    try { refreshData() } catch (e) {
-      setActionResultTitle("Error Refreshing Agents")
-      setActionResultLines([`An error occurred:`, `  ${(e as any)?.message || e}`])
-      setViewMode("action-result")
+    if (activeDataSource) {
+      try { refreshData(activeDataSource) } catch (e) {
+        setActionResultTitle("Error Refreshing Agents")
+        setActionResultLines([`An error occurred:`, `  ${(e as any)?.message || e}`])
+        setViewMode("action-result")
+      }
+    } else {
+      refreshSourcesView(Boolean(startupNotice))
     }
     try {
        const catalog = loadModelCatalog(true)
@@ -332,6 +454,7 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
     } catch (e) {
       // Ignore
     }
+    renderer.requestRender()
   }, [])
 
   const invalidModelGroups = useMemo(() => collectInvalidModelGroups(agents, modelCatalog), [agents, modelCatalog])
@@ -356,12 +479,17 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
   const columnWidth = (index: number) => listColumns.widths[index] || 0
   const gutter = (key: string) => <text key={key} width={listColumns.gutters[0] || 0}> </text>
   const headerTitle = "★ OPENCODE AGENT MANAGER"
-  const displayWorkspace = workspaceRoot === os.homedir() || workspaceRoot.startsWith(`${os.homedir()}${path.sep}`)
-    ? `~${workspaceRoot.slice(os.homedir().length)}`
-    : workspaceRoot
-  const fullCommitLabel = `Commit: ${autoCommitEnabled() ? "ON" : "OFF"}`
-  const compactCommitLabel = `C:${autoCommitEnabled() ? "ON" : "OFF"}`
-  const workspaceLabel = `Workspace: ${displayWorkspace}`
+  const formatDisplayPath = (p: string) =>
+    p === os.homedir() || p.startsWith(`${os.homedir()}${path.sep}`) ? `~${p.slice(os.homedir().length)}` : p
+  const fullCommitLabel = isReadOnlyGitSource ? "Mode: OVERRIDES" : `Commit: ${autoCommitEnabled() ? "ON" : "OFF"}`
+  const compactCommitLabel = isReadOnlyGitSource ? "OVR" : `C:${autoCommitEnabled() ? "ON" : "OFF"}`
+  const workspaceLabel = !activeDataSource
+    ? "Source: none ([O] connect)"
+    : activeDataSource.kind === "workspace"
+      ? `Workspace: ${formatDisplayPath(activeDataSource.root)}`
+      : activeDataSource.source.kind === "git"
+        ? `GitHub: ${activeDataSource.source.url.replace(/^https?:\/\/github\.com\//i, "").replace(/\.git$/i, "")}${activeDataSource.source.ref ? `#${activeDataSource.source.ref}` : ""}${activeRevision ? `@${activeRevision.slice(0, 7)}` : ""}`
+        : `Source: ${activeDataSource.source.name} (${formatDisplayPath(activeDataSource.source.path)})`
   const headerSeparator = " | "
   const statusMessageWidth = Math.max(1, termWidth - 2)
   const headerContentWidth = Math.max(0, termWidth - 2 - 2 - 4)
@@ -413,8 +541,131 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
     setActionResultScrollOffset((offset) => Math.min(offset, maxOffset))
   }, [actionResultLines.length, maxVisibleActionResultLines])
 
-  const refreshData = () => {
-    setAgents(findAgentFiles(workspaceRoot))
+  const refreshData = (ds: ActiveDataSource | null = activeDataSource) => {
+    if (!ds) {
+      setAgents([])
+      return
+    }
+    if (ds.kind === "source" && ds.source.kind === "git") {
+      setAgents(loadSourceAgents(ds.root))
+    } else {
+      setAgents(findAgentFiles(ds.root))
+    }
+  }
+
+  const openSourcesModal = (preserveStatus = false) => {
+    refreshSourcesView(preserveStatus)
+    setSourcesInputFocused(false)
+    setSourcesFocusIndex(0)
+    setSourcesScrollOffset(0)
+    if (!preserveStatus) setSourcesStatus("")
+    setViewMode("sources")
+  }
+
+  const switchToDataSource = (next: ActiveDataSource) => {
+    const loadedAgents = next.kind === "source" && next.source.kind === "git"
+      ? loadSourceAgents(next.root)
+      : findAgentFiles(next.root)
+    const loadedConfig = loadTranslationFor(next)
+    setActiveDataSource(next)
+    setActiveRevision(next.kind === "source" ? sourceRevision(next.source) : null)
+    if (next.kind === "source") setActiveSourceName(next.source.name)
+    setAgents(loadedAgents)
+    setTranslationConfig(loadedConfig)
+    setSelectedAgentPaths(new Set())
+    setExpandedCategories(new Set())
+    setFocusedIndex(0)
+    setScrollOffset(0)
+    setSearchQuery("")
+    setIsSearching(false)
+    setLayoutStatus("")
+    setViewMode("main")
+  }
+
+  const activateRegisteredSource = (source: Source) => {
+    try {
+      if (source.kind === "git" && !fs.existsSync(path.join(sourceRoot(source), ".git"))) {
+        setSourcesStatus(`Pulling ${source.name}...`)
+        pullSource(source)
+      }
+      const registry = loadSources()
+      registry.active = source.name
+      saveSources(registry)
+      switchToDataSource({ kind: "source", source, root: sourceRoot(source) })
+    } catch (error: any) {
+      setSourcesStatus(`Could not open ${source.name}: ${terminalSafeText(error?.message || error)}`)
+    }
+  }
+
+  const attachNewSourceSpec = (spec: string) => {
+    const trimmed = spec.trim()
+    if (!trimmed) return
+    try {
+      const registry = loadSources()
+      const existing = registry.sources.find(candidate =>
+        candidate.kind === "local"
+          ? (() => { try { return candidate.path === fs.realpathSync(path.resolve(trimmed)) } catch { return false } })()
+          : candidate.url.toLowerCase().replace(/\.git$/i, "") === `https://github.com/${trimmed.replace(/^(?:github|gh):/i, "").split("#")[0].replace(/\.git$/i, "").toLowerCase()}`
+      )
+      const source = existing ?? addSource(registry, deriveSourceName(trimmed, registry), trimmed)
+      registry.active = source.name
+      saveSources(registry)
+      if (source.kind === "git" && !fs.existsSync(path.join(sourceRoot(source), ".git"))) {
+        pullSource(source)
+      }
+      setSourcesQuery("")
+      setSourcesInputFocused(false)
+      switchToDataSource({ kind: "source", source, root: sourceRoot(source) })
+    } catch (error: any) {
+      setSourcesStatus(`Attach failed: ${terminalSafeText(error?.message || error)}`)
+    }
+  }
+
+  const runInteractiveGhLogin = () => {
+    try {
+      renderer.suspend()
+      let outcome: { ok: boolean; message: string }
+      try {
+        outcome = runGhWebLogin("github.com")
+      } finally {
+        renderer.resume()
+        renderer.requestRender()
+      }
+      refreshSourcesView(true)
+      setSourcesStatus(terminalSafeText(outcome.message))
+    } catch (error: any) {
+      setSourcesStatus(`GitHub login failed: ${terminalSafeText(error?.message || error)}`)
+    }
+  }
+
+  const applyAgentMutation = (
+    paths: string[],
+    fn: (writer?: typeof saveAgentFile) => void,
+    title: string,
+    lines: string[],
+  ) => {
+    if (!isReadOnlyGitSource) {
+      const tx = mutate(paths, "tune", () => fn(undefined))
+      try { refreshData() } catch (error) { setMutationRefreshFailure(error, tx.warning); setViewMode("action-result"); return }
+      setSelectedAgentPaths(new Set())
+      setMutationSuccess(title, lines, tx.warning)
+      setViewMode("action-result")
+      return
+    }
+    void (async () => {
+      try {
+        runWithOverrideWriter(workspaceRoot, writer => fn(writer))
+        refreshData()
+        setSelectedAgentPaths(new Set())
+        const outcome = await reconcileTargetIfInstalled("override")
+        setActionResultTitle(title)
+        setActionResultLines([...lines, "", ...formatReconcileLines(outcome)])
+      } catch (error: any) {
+        setActionResultTitle(`Error: ${title}`)
+        setActionResultLines([`An error occurred:`, `  ${error?.message || error}`])
+      }
+      setViewMode("action-result")
+    })()
   }
 
   const packDescription = (pack: string) => {
@@ -448,17 +699,18 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
     }
   }
 
-  // Installs a pack of this workspace into the OpenCode config: the workspace is (or becomes) a local source.
+  // Installs a pack of this workspace or active registered source into the OpenCode config.
   const installRequest = (pack: string) => {
     const registry = loadSources()
+    if (activeDataSource?.kind === "source") {
+      const source = findSource(registry, activeDataSource.source.name)
+      return { registry, added: false, request: `${source.name}/${pack}`, sourceName: source.name }
+    }
     const root = fs.realpathSync(workspaceRoot)
     let source = registry.sources.find(candidate => candidate.kind === "local" && candidate.path === root)
     const added = !source
     if (!source) {
-      const base = path.basename(root).toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace"
-      let name = base
-      for (let index = 2; registry.sources.some(candidate => candidate.name === name); index++) name = `${base}-${index}`
-      source = addSource(registry, name, root)
+      source = addSource(registry, deriveSourceName(root, registry), root)
     }
     return { registry, added, request: `${source.name}/${pack}`, sourceName: source.name }
   }
@@ -556,9 +808,9 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
   }, [agents, inferenceIndex, translationConfig])
 
   const generateBridge = () => {
-    if (!bridgePluginName) return
+    if (!bridgePluginName || !activeDataSource) return
     try {
-      const bridgeConfig = loadTranslationConfig(workspaceRoot, undefined, { persistMigration: false })
+      const bridgeConfig = loadTranslationFor(activeDataSource) ?? loadTranslationConfig(workspaceRoot, undefined, { persistMigration: false })
       const modelTarget = bridgeModelTarget.trim()
       const modelMap = bridgeConfig[bridgeTarget].modelMap
       if (modelTarget) {
@@ -578,14 +830,24 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
         return
       }
       const safePluginName = sanitizeFilename(bridgePluginName)
-      const outputDir = path.join(workspaceRoot, "bridges", bridgeTarget === "codex" ? "codex" : "claude-code", safePluginName)
       const config = { ...bridgeConfig, pluginName: bridgePluginName, prefix: bridgePipelinePrefix }
-      const tx = mutate([translationConfigPath(workspaceRoot), outputDir], "bridge", () => {
-        saveTranslationConfig(workspaceRoot, config)
-        return bridgePack({ workspaceRoot, pack, target: bridgeTarget, outputDir, config, pluginName: bridgePluginName, prefix: bridgePipelinePrefix })
-      })
-       const result = tx.value
-       setTranslationConfig(loadTranslationConfig(workspaceRoot, undefined, { persistMigration: false }))
+      let result: ReturnType<typeof bridgePack>
+      let txWarning: TransactionWarning | undefined
+      if (activeDataSource.kind === "source" && activeDataSource.source.kind === "git") {
+        const loc = sourceTranslationConfigLocation(activeDataSource.source.name, workspaceRoot)
+        const outputDir = sourceBridgeOutputDir(activeDataSource.source.name, bridgeTarget, safePluginName)
+        saveTranslationConfig(loc.configRoot, config, loc.configPath)
+        result = bridgePack({ workspaceRoot, pack, target: bridgeTarget, outputDir, config, pluginName: bridgePluginName, prefix: bridgePipelinePrefix })
+      } else {
+        const outputDir = path.join(workspaceRoot, "bridges", bridgeTarget === "codex" ? "codex" : "claude-code", safePluginName)
+        const tx = mutate([translationConfigPath(workspaceRoot), outputDir], "bridge", () => {
+          saveTranslationConfig(workspaceRoot, config)
+          return bridgePack({ workspaceRoot, pack, target: bridgeTarget, outputDir, config, pluginName: bridgePluginName, prefix: bridgePipelinePrefix })
+        })
+        result = tx.value
+        txWarning = tx.warning
+      }
+      setTranslationConfig(loadTranslationFor(activeDataSource))
        setSelectedAgentPaths(new Set())
       setActionResultTitle(`Bridge to ${bridgeTarget === "codex" ? "Codex" : "Claude Code"} Complete`)
       const lines = [`${bridgeTarget === "codex" ? "Translation layer" : "Plugin"} '${safePluginName}' generated successfully!`, `Output directory:`, `  ${result.pluginDir}`, ``, `Generated ${result.files.length} files:`, ...result.files.map((f) => `  * ${f}`)]
@@ -619,8 +881,8 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
           }
         }
       }
-       try { refreshData() } catch (error) { setMutationRefreshFailure(error, tx.warning); setViewMode("action-result"); return }
-       setMutationSuccess(`Bridge to ${bridgeTarget === "codex" ? "Codex" : "Claude Code"} Complete`, lines, tx.warning)
+       try { refreshData() } catch (error) { setMutationRefreshFailure(error, txWarning); setViewMode("action-result"); return }
+       setMutationSuccess(`Bridge to ${bridgeTarget === "codex" ? "Codex" : "Claude Code"} Complete`, lines, txWarning)
       setViewMode("action-result")
     } catch (error: any) {
       setActionResultTitle("Error During Bridge")
@@ -779,6 +1041,12 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
       const suggestions = group ? suggestModels(group.value, modelCatalog) : []
       suggestions.filter(matches).forEach(model => items.push({ type: "model", id: model, label: `★ ${model}`, provider: "suggestions" }))
     }
+    if (viewMode === "model-selector" && routingPick?.kind === "trigger") {
+      if (matches("* any model provider wildcard")) {
+        const mark = pendingTriggers.has(WILDCARD_TRIGGER) ? "[x]" : "[ ]"
+        items.push({ type: "model", id: WILDCARD_TRIGGER, label: `${mark} ★ * (any model / provider)`, provider: "wildcard" })
+      }
+    }
     if (viewMode === "model-selector" && routingPick?.kind === "roles") {
       items.push({ type: "model", id: INHERIT, label: "↺ inherit (use the calling agent's model)", provider: "routing" })
     }
@@ -792,34 +1060,80 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
       })
 
       if (isExpanded) {
-        // A configuration can trigger on a whole provider; the exact model wins at runtime.
+        // A configuration can trigger on one or more providers/models in OR; exact model wins over provider, then *.
         if (viewMode === "model-selector" && routingPick?.kind === "trigger") {
-          items.push({ type: "model", id: prov, label: `  ★ any ${prov} model`, provider: prov })
+          const mark = pendingTriggers.has(prov) ? "[x]" : "[ ]"
+          items.push({ type: "model", id: prov, label: `  ${mark} ★ any ${prov} model`, provider: prov })
         }
         providers[prov].forEach(model => {
+          const prefix = viewMode === "model-selector" && routingPick?.kind === "trigger"
+            ? `${pendingTriggers.has(model) ? "[x]" : "[ ]"} `
+            : ""
           items.push({
             type: "model",
             id: model,
-            label: `  ${model.split("/").slice(1).join("/")}`,
+            label: `  ${prefix}${model.split("/").slice(1).join("/")}`,
             provider: prov
           })
         })
       }
     })
     return items
-  }, [models, expandedProviders, viewMode, repairGroupKey, invalidModelGroups, modelCatalog, routingPick, modelFilter])
+  }, [models, expandedProviders, viewMode, repairGroupKey, invalidModelGroups, modelCatalog, routingPick, pendingTriggers, modelFilter])
   useEffect(() => {
     if (viewMode !== "model-selector" && viewMode !== "repair-selector") setModelFilter("")
   }, [viewMode])
 
-  const routingLoad = useMemo((): { view: ReturnType<typeof describeArchetype>; error: string } => {
-    if (!routingArchetype) return { view: null, error: "" }
+  const sourceModalRows = useMemo<SourceModalRow[]>(() => {
+    const query = sourcesQuery.trim().toLowerCase()
+    const rows: SourceModalRow[] = []
+    const registeredGitUrls = new Set(
+      registeredSources
+        .filter((s): s is Source & { kind: "git" } => s.kind === "git")
+        .map(s => s.url.toLowerCase().replace(/\.git$/i, ""))
+    )
+    for (const source of registeredSources) {
+      const targetText = source.kind === "local" ? source.path : source.url
+      if (query && !source.name.toLowerCase().includes(query) && !targetText.toLowerCase().includes(query)) continue
+      rows.push({
+        id: `reg:${source.name}`,
+        kind: "registered",
+        source,
+        revision: sourceRevisions[source.name] ?? null,
+        isActive: (activeDataSource?.kind === "source" ? activeDataSource.source.name : activeSourceName) === source.name,
+      })
+    }
+    for (const repo of ghRepos) {
+      if (registeredGitUrls.has(repo.url.toLowerCase().replace(/\.git$/i, ""))) continue
+      if (query && !repo.nameWithOwner.toLowerCase().includes(query) && !repo.description.toLowerCase().includes(query)) continue
+      rows.push({ id: `gh:${repo.nameWithOwner}`, kind: "gh-repo", repo })
+    }
+    if (sourcesQuery.trim()) {
+      rows.push({ id: "connect-input", kind: "connect-input", spec: sourcesQuery.trim() })
+    }
+    return rows
+  }, [registeredSources, sourceRevisions, ghRepos, sourcesQuery, activeDataSource, activeSourceName])
+
+  const maxVisibleSourceRows = Math.max(2, Math.floor(termHeight * 0.78) - 11)
+  useEffect(() => {
+    if (sourcesFocusIndex >= sourceModalRows.length) {
+      const next = Math.max(0, sourceModalRows.length - 1)
+      setSourcesFocusIndex(next)
+      setSourcesScrollOffset(offset => Math.min(offset, Math.max(0, sourceModalRows.length - maxVisibleSourceRows)))
+    }
+  }, [sourceModalRows.length, maxVisibleSourceRows])
+
+  const routingLoad = useMemo((): { view: ReturnType<typeof describeConfiguredPackFlows>; error: string } => {
+    if (!routingArchetype || !workspaceRoot) return { view: null, error: "" }
     try {
-      return { view: describeArchetype(workspaceRoot, routingArchetype), error: "" }
+      const view = describeConfiguredPackFlows(workspaceRoot, routingArchetype, {
+        applySourceOverrides: isReadOnlyGitSource,
+      })
+      return { view, error: "" }
     } catch (error: any) {
       return { view: null, error: error?.message || String(error) }
     }
-  }, [workspaceRoot, routingArchetype, routingRevision, agents])
+  }, [workspaceRoot, isReadOnlyGitSource, routingArchetype, routingRevision, agents])
   const routingView = routingLoad.view
   const routingVariantChoices = (model: string) => {
     const variants = getModelVariants(modelCatalog, model)
@@ -829,37 +1143,104 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
     const base = model.split("#")[0]
     return variant && routingVariantChoices(base).includes(variant) ? `${base}#${variant}` : base
   }
-  /** "review, explore → model#high · eye inherits": roles grouped by the model they get. */
-  const summarizeRoutingConfig = (roles: RoleModels, related: ArchetypeAgent[]) => {
-    const groups = new Map<string, string[]>()
-    for (const agent of related) {
-      const model = roles[agent.role] ?? INHERIT
-      groups.set(model, [...(groups.get(model) ?? []), agent.role])
+  const summarizeUnifiedFlow = (flow: Pick<UnifiedFlowItem, "roles" | "tools" | "permissions" | "delegations">, related: ArchetypeAgent[]) => {
+    const parts: string[] = []
+    if (related.length > 0) {
+      const groups = new Map<string, string[]>()
+      for (const agent of related) {
+        const model = flow.roles[agent.role] ?? INHERIT
+        groups.set(model, [...(groups.get(model) ?? []), agent.role])
+      }
+      const modelSummary = [...groups]
+        .map(([model, names]) => model === INHERIT ? `${names.join(", ")} ${names.length === 1 ? "inherits" : "inherit"}` : `${names.join(", ")} → ${model}`)
+        .join(" · ")
+      if (modelSummary) parts.push(modelSummary)
     }
-    return [...groups].map(([model, names]) => model === INHERIT ? `${names.join(", ")} ${names.length === 1 ? "inherits" : "inherit"}` : `${names.join(", ")} → ${model}`).join(" · ")
+    const toolEntries = Object.entries(flow.tools)
+    if (toolEntries.length > 0) parts.push(`tools: ${toolEntries.map(([k, v]) => `${k}=${v}`).join(", ")}`)
+    const permEntries = Object.entries(flow.permissions)
+    if (permEntries.length > 0) parts.push(`perms: ${permEntries.map(([k, v]) => `${k}=${v}`).join(", ")}`)
+    const delEntries = Object.entries(flow.delegations)
+    if (delEntries.length > 0) parts.push(`delegations: ${delEntries.map(([k, v]) => `${k}=${v}`).join(", ")}`)
+    return parts.join("  |  ") || "no overrides"
   }
-  const saveRoutingConfig = (trigger: string, roles: RoleModels | null, previousTrigger?: string) => {
-    if (!routingArchetype) return false
+  const formatTriggerLabel = (triggers: string[]) =>
+    triggers.map(t => t === WILDCARD_TRIGGER ? "* (any model)" : t.includes("/") ? t : `${t} (any model)`).join(" OR ")
+
+  const isWorkspaceVirtualPack = useMemo(
+    () => Boolean(workspaceRoot && !isReadOnlyGitSource && isVirtualPackRoot(workspaceRoot)),
+    [workspaceRoot, isReadOnlyGitSource, agents],
+  )
+  const saveFlowDraft = (draft: FlowDraftInput | null, previousKey?: string): { ok: boolean; savedKey?: string | null } => {
+    if (!routingArchetype) return { ok: false }
     try {
-      const tx = mutate([path.join(packDir(workspaceRoot, routingArchetype)!, "opencode-pack.json")], "routing", () => setArchetypeConfig(workspaceRoot, routingArchetype, trigger, roles, { previousTrigger }))
+      const savedKey = saveUserPackFlow(workspaceRoot, routingArchetype, draft, {
+        previousKey,
+        applySourceOverrides: isReadOnlyGitSource,
+      })
       setRoutingRevision(revision => revision + 1)
-      setRoutingStatus(`${roles ? "Saved" : "Deleted"} configuration '${trigger}'. They are the pack defaults: press E on the folder to install it; \`manage-agents models\` overrides them per target.${tx.warning ? ` ⚠ auto-commit: ${tx.warning.message}` : ""}`)
-      return true
+      const label = draft ? formatTriggerLabel(draft.triggers) : previousKey ?? ""
+      setRoutingStatus(`${draft ? "Saved" : "Removed"} flow '${label}' in routing.json; reconciling target...`)
+      void reconcileTargetIfInstalled("models").then(outcome => {
+        setRoutingStatus(`${draft ? "Saved" : "Removed"} flow '${label}'. ${formatReconcileLines(outcome)[0]}`)
+      }).catch(error => {
+        setRoutingStatus(`Saved in routing.json; reconcile failed: ${terminalSafeText(error?.message || error)}`)
+      })
+      return { ok: true, savedKey }
     } catch (error: any) {
-      setRoutingStatus(`Error: ${error?.message || error}`)
-      return false
+      setRoutingStatus(`Error: ${terminalSafeText(error?.message || error)}`)
+      return { ok: false }
     }
   }
-  /** Save a draft at once (like every edit in the agent list); on success it becomes the new baseline. */
-  const applyRoutingDraft = (next: { previousTrigger?: string; trigger: string; roles: RoleModels }) => {
+  /** Save a draft at once into user settings (routing.json) and refresh the baseline key from the saved key. */
+  const applyRoutingDraft = (next: RoutingDraftState): boolean => {
     const roles: RoleModels = Object.fromEntries(Object.entries<string>(next.roles).filter(([, model]) => model !== INHERIT))
-    if (!saveRoutingConfig(next.trigger, roles, next.previousTrigger)) return false
-    setRoutingDraft({ previousTrigger: next.trigger, trigger: next.trigger, roles })
+    const cleaned: FlowDraftInput = {
+      ...(next.callers?.length ? { callers: next.callers } : {}),
+      triggers: next.triggers,
+      roles,
+      tools: next.tools,
+      permissions: next.permissions,
+      delegations: next.delegations,
+    }
+    const res = saveFlowDraft(cleaned, next.previousKey)
+    if (!res.ok) return false
+    setRoutingDraft({ ...cleaned, previousKey: res.savedKey ?? next.previousKey })
     return true
   }
-  const openRoutingPicker = (pick: RoutingPick, current?: string) => {
-    const provider = current && current !== INHERIT ? current.split("/")[0] : ""
-    if (provider) setExpandedProviders(previous => new Set([...previous, provider]))
+  const exportRoutingToManifest = () => {
+    if (!routingView || isReadOnlyGitSource) return
+    try {
+      const manifestFile = path.join(routingView.dir, "opencode-pack.json")
+      const tx = mutate([manifestFile], "routing", () => exportFlowsToPackManifest(workspaceRoot, routingView))
+      setRoutingRevision(revision => revision + 1)
+      setRoutingStatus(`Exported callers & conditional flows to ${path.relative(workspaceRoot, manifestFile) || "opencode-pack.json"}.${tx.warning ? ` ⚠ auto-commit: ${tx.warning.message}` : ""}`)
+    } catch (error: any) {
+      setRoutingStatus(`Error: ${terminalSafeText(error?.message || error)}`)
+    }
+  }
+  const openInitPackModal = () => {
+    const slug = derivePackSlug(path.basename(path.resolve(workspaceRoot)))
+    setInitPackName(slug)
+    setInitPackVersion("0.1.0")
+    setInitPackDesc(`Agent pack ${slug}`)
+    setInitPackOrganize(true)
+    setInitPackField("name")
+    setViewMode("pack-init")
+  }
+  const openRoutingPicker = (pick: RoutingPick, current?: string | string[]) => {
+    if (modelCatalog.status !== "verified" && !(pick.kind === "trigger" && models.length === 0)) {
+      if (modelCatalog.status !== "verified" && pick.kind === "roles") {
+        setRoutingStatus("Model catalog is unavailable; press CTRL+R in model picker or check OpenCode.")
+        return
+      }
+    }
+    const list = Array.isArray(current) ? current : current ? [current] : []
+    for (const item of list) {
+      const provider = item && item !== INHERIT && item !== WILDCARD_TRIGGER ? item.split("/")[0] : ""
+      if (provider) setExpandedProviders(previous => new Set([...previous, provider]))
+    }
+    if (pick.kind === "trigger") setPendingTriggers(new Set(list))
     setRoutingPick(pick)
     setFocusedModelIndex(0)
     setModelScrollOffset(0)
@@ -940,9 +1321,150 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
       return
     }
 
+    if (viewMode === "sources") {
+      const clampScroll = (nextIndex: number, total: number) => {
+        setSourcesScrollOffset(offset => {
+          if (total <= 0) return 0
+          if (nextIndex < offset) return Math.max(0, nextIndex)
+          if (nextIndex >= offset + maxVisibleSourceRows) return Math.max(0, nextIndex - maxVisibleSourceRows + 1)
+          return Math.min(offset, Math.max(0, total - maxVisibleSourceRows))
+        })
+      }
+      if (key === "g" && e.ctrl) {
+        runInteractiveGhLogin()
+        return
+      }
+      if (sourcesInputFocused) {
+        if (key === "escape") {
+          setSourcesInputFocused(false)
+        } else if (key === "up" || key === "down") {
+          if (!sourceModalRows.length) return
+          const delta = key === "up" ? -1 : 1
+          const next = (sourcesFocusIndex + delta + sourceModalRows.length) % sourceModalRows.length
+          setSourcesFocusIndex(next)
+          clampScroll(next, sourceModalRows.length)
+        } else if (key === "backspace") {
+          setSourcesQuery(q => q.slice(0, -1))
+          setSourcesFocusIndex(0)
+          setSourcesScrollOffset(0)
+        } else if (key === "enter" || key === "return") {
+          const row = sourceModalRows[sourcesFocusIndex]
+          if (row?.kind === "registered") activateRegisteredSource(row.source)
+          else if (row?.kind === "gh-repo") attachNewSourceSpec(`github:${row.repo.nameWithOwner}`)
+          else if (row?.kind === "connect-input") attachNewSourceSpec(row.spec)
+          else if (sourcesQuery.trim()) attachNewSourceSpec(sourcesQuery.trim())
+        } else if (!e.ctrl && !e.meta && /^[\x20-\x7E]$/.test(rawChar)) {
+          setSourcesQuery(q => q + rawChar)
+          setSourcesFocusIndex(0)
+          setSourcesScrollOffset(0)
+        }
+        return
+      }
+
+      if (key === "escape") {
+        if (sourcesQuery) {
+          setSourcesQuery("")
+          setSourcesFocusIndex(0)
+          setSourcesScrollOffset(0)
+        } else if (activeDataSource) {
+          setViewMode("main")
+        } else {
+          setSourcesStatus("Connect a GitHub repository or local folder first (or press Ctrl+C to quit).")
+        }
+      } else if (key === "/" || key === "a") {
+        setSourcesInputFocused(true)
+        setSourcesStatus("")
+      } else if (key === "g") {
+        runInteractiveGhLogin()
+      } else if (key === "up" || key === "k" || key === "down" || key === "j") {
+        if (!sourceModalRows.length) return
+        const delta = key === "up" || key === "k" ? -1 : 1
+        const next = (sourcesFocusIndex + delta + sourceModalRows.length) % sourceModalRows.length
+        setSourcesFocusIndex(next)
+        clampScroll(next, sourceModalRows.length)
+      } else if (key === "pageup" || key === "pagedown") {
+        if (!sourceModalRows.length) return
+        const delta = key === "pageup" ? -maxVisibleSourceRows : maxVisibleSourceRows
+        const next = Math.max(0, Math.min(sourceModalRows.length - 1, sourcesFocusIndex + delta))
+        setSourcesFocusIndex(next)
+        clampScroll(next, sourceModalRows.length)
+      } else if (key === "p" || (key === "r" && e.ctrl)) {
+        const row = sourceModalRows[sourcesFocusIndex]
+        if (row?.kind === "registered" && row.source.kind === "git") {
+          try {
+            const commit = pullSource(row.source)
+            refreshSourcesView(true)
+            if (activeDataSource?.kind === "source" && activeDataSource.source.name === row.source.name) {
+              setActiveRevision(commit)
+              refreshData(activeDataSource)
+            }
+            setSourcesStatus(`Pulled ${row.source.name}: ${commit?.slice(0, 12) ?? "up to date"}.`)
+          } catch (error: any) {
+            setSourcesStatus(`Pull failed: ${terminalSafeText(error?.message || error)}`)
+          }
+        } else {
+          refreshSourcesView(true)
+          setSourcesStatus("Refreshed sources and GitHub repository list.")
+        }
+      } else if (key === "t") {
+        const row = sourceModalRows[sourcesFocusIndex]
+        if (row?.kind === "registered") {
+          try {
+            const registry = loadSources()
+            const target = findSource(registry, row.source.name)
+            target.trusted = !target.trusted
+            saveSources(registry)
+            if (activeDataSource?.kind === "source" && activeDataSource.source.name === target.name) {
+              setActiveDataSource({ ...activeDataSource, source: { ...target } })
+            }
+            refreshSourcesView(true)
+            setSourcesStatus(`Source "${target.name}" is now ${target.trusted ? "trusted" : "untrusted"}.`)
+          } catch (error: any) {
+            setSourcesStatus(terminalSafeText(error?.message || error))
+          }
+        }
+      } else if (key === "x" || key === "delete" || key === "backspace") {
+        const row = sourceModalRows[sourcesFocusIndex]
+        if (row?.kind === "registered") {
+          try {
+            const registry = loadSources()
+            removeSource(registry, row.source.name)
+            saveSources(registry)
+            if (activeDataSource?.kind === "source" && activeDataSource.source.name === row.source.name) {
+              const fallback = registry.sources[0]
+              if (fallback) {
+                try {
+                  switchToDataSource({ kind: "source", source: fallback, root: sourceRoot(fallback) })
+                  openSourcesModal(true)
+                } catch {
+                  setActiveDataSource(null)
+                  setAgents([])
+                }
+              } else {
+                setActiveDataSource(null)
+                setAgents([])
+              }
+            }
+            refreshSourcesView(true)
+            setSourcesStatus(`Removed source "${row.source.name}".`)
+          } catch (error: any) {
+            setSourcesStatus(terminalSafeText(error?.message || error))
+          }
+        }
+      } else if (key === "enter" || key === "return") {
+        const row = sourceModalRows[sourcesFocusIndex]
+        if (row?.kind === "registered") activateRegisteredSource(row.source)
+        else if (row?.kind === "gh-repo") attachNewSourceSpec(`github:${row.repo.nameWithOwner}`)
+        else if (row?.kind === "connect-input") attachNewSourceSpec(row.spec)
+      }
+      return
+    }
+
     // 2. Main view mode
     if (viewMode === "main") {
-      if (key === "l" && isUppercaseL) {
+      if (key === "o") {
+        openSourcesModal()
+      } else if (key === "l" && isUppercaseL) {
         if (!isSearching) { setLayoutSnapshot(appliedShare); setLayoutDraft(appliedShare); setLayoutError(""); setLayoutStatus(""); setViewMode("layout") }
       } else if ((key === "up" || key === "k") && (inspectorTab === "security" || inspectorTab === "delegations") && currentItem?.agent) {
         setGraphScrollOffset((offset) => Math.max(0, offset - 1))
@@ -1054,15 +1576,11 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
         }
       } else if (key === "/") {
         setIsSearching(true)
+      } else if (key === "i" && isWorkspaceVirtualPack) {
+        openInitPackModal()
       } else if (key === "m") {
-        if (modelCatalog.status !== "verified") {
-          setActionResultTitle("Model Catalog Unavailable")
-          setActionResultLines(["Models are not present in the loaded catalog.", "No model writes or suggestions are available.", "Press Y to retry refreshing the model catalog."])
-          setViewMode("action-result")
-          return
-        }
         const focusedFolder = activeItems[focusedIndex]
-        if (selectedAgentPaths.size === 0 && focusedFolder?.type === "folder" && isRoutableArchetype(workspaceRoot, focusedFolder.category)) {
+        if (selectedAgentPaths.size === 0 && focusedFolder?.type === "folder" && isConfigurablePack(workspaceRoot, focusedFolder.category)) {
           setRoutingArchetype(focusedFolder.category)
           setRoutingFocus(0)
           setRoutingConfirmDelete(false)
@@ -1070,11 +1588,17 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
           setViewMode("routing-configs")
           return
         }
+        if (modelCatalog.status !== "verified") {
+          setActionResultTitle("Model Catalog Unavailable")
+          setActionResultLines(["Models are not present in the loaded catalog.", "No model writes or suggestions are available.", "Press Y to retry refreshing the model catalog."])
+          setViewMode("action-result")
+          return
+        }
         if (activeItems.length === 0 || (!activeItems[focusedIndex]?.agent && selectedAgentPaths.size === 0)) {
           setActionResultTitle("No Agent Focused")
            setActionResultLines([
-             "Please select at least one agent (using SPACE)",
-             "before trying to change the model."
+             "Select at least one agent (SPACE) to change its model,",
+             "or focus a pack folder and press M to configure conditional IF/OR flows."
            ])
           setViewMode("action-result")
         } else {
@@ -1103,11 +1627,10 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
           setViewMode("tier-selector")
         }
       } else if (key === "b" && !e.shift) {
-        if (activeItems.length > 0) {
-          // Read disk state so a bridge opened after a concurrent CLI run does not prefill stale values.
+        if (activeItems.length > 0 && activeDataSource) {
           let config = translationConfig
           try {
-            config = loadTranslationConfig(workspaceRoot, undefined, { persistMigration: false })
+            config = loadTranslationFor(activeDataSource)
             setTranslationConfig(config)
           } catch {
             // Keep the in-memory config; generateBridge surfaces the load error on submit.
@@ -1120,11 +1643,10 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
           setViewMode("bridge-prompt")
         }
       } else if (key === "b" && e.shift) {
-        if (activeItems.length > 0) {
-          // Read disk state so a bridge opened after a concurrent CLI run does not prefill stale values.
+        if (activeItems.length > 0 && activeDataSource) {
           let config = translationConfig
           try {
-            config = loadTranslationConfig(workspaceRoot, undefined, { persistMigration: false })
+            config = loadTranslationFor(activeDataSource)
             setTranslationConfig(config)
           } catch {
             // Keep the in-memory config; generateBridge surfaces the load error on submit.
@@ -1154,15 +1676,25 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
         }
       } else if (key === "r") {
         if (activeItems.length > 0) {
-          const item = activeItems[focusedIndex]
-          if (item.type === "file" && item.agent) {
-            const analysis = analyzeAgentName(item.agent.filename, allAgentFilenames)
-            setRenameTargetAgent(item.agent)
-            setRenameFamily(analysis.family || "")
-            setRenameCategory(analysis.category || "")
-            setRenameRole((analysis.role || "").replace(/[\s-]/g, "_"))
-            setRenameFocusedField("role")
-            setViewMode("rename-prompt")
+          if (isReadOnlyGitSource) {
+            setActionResultTitle("Read-Only GitHub Source")
+            setActionResultLines([
+              "Renaming agent files requires a local pack workspace.",
+              "Model, routing, color, permissions, delegations, resources and parameter changes",
+              "on GitHub sources are saved in user settings (overrides.json / routing.json).",
+            ])
+            setViewMode("action-result")
+          } else {
+            const item = activeItems[focusedIndex]
+            if (item.type === "file" && item.agent) {
+              const analysis = analyzeAgentName(item.agent.filename, allAgentFilenames)
+              setRenameTargetAgent(item.agent)
+              setRenameFamily(analysis.family || "")
+              setRenameCategory(analysis.category || "")
+              setRenameRole((analysis.role || "").replace(/[\s-]/g, "_"))
+              setRenameFocusedField("role")
+              setViewMode("rename-prompt")
+            }
           }
         }
       } else if (key === "p") {
@@ -1240,24 +1772,41 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
         const ag = activeItems[focusedIndex].agent!
         if (!analyzePermissionOrder(ag).hasOrderError) return
         try {
-          const tx = mutate([ag.currentPath], "tune", () => fixPermissionOrder(ag))
-          const fixed = tx.value
-          if (fixed) {
-            try { refreshData() } catch (error) { setMutationRefreshFailure(error, tx.warning); return }
-            setMutationSuccess("Permission Order Fixed", [
+          applyAgentMutation(
+            [ag.currentPath],
+            writer => { fixPermissionOrder(ag, writer) },
+            "Permission Order Fixed",
+            [
               `Successfully reordered permissions for:`,
               `  ${ag.filename}`,
               `Placed wildcard "*": "deny" FIRST to comply with OpenCode spec.`
-            ])
-          } else return
+            ]
+          )
         } catch (error: any) {
           setActionResultTitle("Error Fixing Permission Order")
           setActionResultLines([`An error occurred:`, `  ${error.message || error}`])
+          setViewMode("action-result")
         }
-        setViewMode("action-result")
       }
     } else if (viewMode === "model-selector" || viewMode === "repair-selector") {
-      // 3. Model selector mode. Printable keys type into the filter; arrows navigate.
+      // 3. Model selector mode. In trigger mode, TAB (or SPACE with empty search) toggles OR triggers.
+      if (
+        viewMode === "model-selector" &&
+        routingPick?.kind === "trigger" &&
+        (key === "tab" || (key === "space" && !modelFilter)) &&
+        modelTreeItems.length > 0
+      ) {
+        const item = modelTreeItems[focusedModelIndex]
+        if (item?.type === "model") {
+          setPendingTriggers(prev => {
+            const next = new Set(prev)
+            if (next.has(item.id)) next.delete(item.id)
+            else next.add(item.id)
+            return next
+          })
+          return
+        }
+      }
       const typed = !e.ctrl && !e.meta && e.sequence.length === 1 && /^[\x20-\x7E]$/.test(e.sequence)
       if (typed || (key === "backspace" && modelFilter) || (key === "escape" && modelFilter)) {
         setModelFilter(filter => typed ? filter + e.sequence : key === "backspace" ? filter.slice(0, -1) : "")
@@ -1313,7 +1862,7 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
       } else if (key === "enter" || key === "return") {
         if (modelTreeItems.length > 0) {
           const item = modelTreeItems[focusedModelIndex]
-          if (item.type === "provider") {
+          if (item.type === "provider" && !(routingPick?.kind === "trigger" && pendingTriggers.size > 0)) {
             setExpandedProviders((prev) => {
               const next = new Set(prev)
               if (next.has(item.id)) {
@@ -1329,8 +1878,18 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
               const pick = routingPick
               setRoutingPick(null)
               if (pick.kind === "trigger") {
-                const saved = applyRoutingDraft({ ...routingDraft, trigger: selectedModel })
-                setViewMode(saved || routingDraft.previousTrigger ? "routing-editor" : "routing-configs")
+                const chosenTriggers = pendingTriggers.size > 0
+                  ? [...pendingTriggers]
+                  : item.type === "model"
+                    ? [selectedModel]
+                    : []
+                setPendingTriggers(new Set())
+                if (!chosenTriggers.length) {
+                  setViewMode(routingDraft.previousKey ? "routing-editor" : "routing-configs")
+                  return
+                }
+                const saved = applyRoutingDraft({ ...routingDraft, triggers: chosenTriggers })
+                setViewMode(saved || routingDraft.previousKey ? "routing-editor" : "routing-configs")
               } else {
                 const roles = { ...routingDraft.roles }
                 for (const role of pick.roles) roles[role] = selectedModel === INHERIT ? INHERIT : withRoutingVariant(selectedModel, routingDraft.roles[role]?.split("#")[1] ?? "")
@@ -1362,11 +1921,34 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
               const selectedAgents = selectedAgentPaths.size > 0
                 ? agents.filter((a) => selectedAgentPaths.has(a.currentPath))
                 : (activeItems[focusedIndex]?.agent ? [activeItems[focusedIndex].agent!] : [])
-               if (!modelCatalog.models.includes(selectedModel)) throw new Error("Model is not present in refreshed catalog")
-               const tx = mutate(selectedAgents.map(a => a.currentPath), "tune", () => updateAgentsModel(selectedAgents, selectedModel, modelCatalog.models))
-               try { refreshData() } catch (error) { setMutationRefreshFailure(error, tx.warning); return }
-               setSelectedAgentPaths(new Set())
-                setMutationSuccess("Model Updated Successfully", [`Successfully set model:`, `  ${selectedModel}`, `on ${selectedAgents.length} agents.`], tx.warning)
+              if (!modelCatalog.models.includes(selectedModel)) throw new Error("Model is not present in refreshed catalog")
+              if (isReadOnlyGitSource) {
+                void (async () => {
+                  try {
+                    overrideAgentsModel(workspaceRoot, selectedAgents, selectedModel, modelCatalog.models)
+                    refreshData()
+                    setSelectedAgentPaths(new Set())
+                    const outcome = await reconcileTargetIfInstalled("override")
+                    setActionResultTitle("Model Updated Successfully")
+                    setActionResultLines([
+                      `Successfully set model:`,
+                      `  ${selectedModel}`,
+                      `on ${selectedAgents.length} agents.`,
+                      "",
+                      ...formatReconcileLines(outcome),
+                    ])
+                  } catch (error: any) {
+                    setActionResultTitle("Error Updating Model")
+                    setActionResultLines([`An error occurred:`, `  ${error.message || error}`])
+                  }
+                  setViewMode("action-result")
+                })()
+                return
+              }
+              const tx = mutate(selectedAgents.map(a => a.currentPath), "tune", () => updateAgentsModel(selectedAgents, selectedModel, modelCatalog.models))
+              try { refreshData() } catch (error) { setMutationRefreshFailure(error, tx.warning); return }
+              setSelectedAgentPaths(new Set())
+              setMutationSuccess("Model Updated Successfully", [`Successfully set model:`, `  ${selectedModel}`, `on ${selectedAgents.length} agents.`], tx.warning)
             } catch (error: any) {
               setActionResultTitle("Error Updating Model")
               setActionResultLines([`An error occurred:`, `  ${error.message || error}`])
@@ -1376,8 +1958,8 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
         }
       } else if (key === "escape") {
         setRepairGroupKey(null)
-        // Leaving the trigger picker of a configuration not saved yet goes back to the list.
-        setViewMode(!routingPick ? "main" : routingDraft?.previousTrigger ? "routing-editor" : "routing-configs")
+        setPendingTriggers(new Set())
+        setViewMode(!routingPick ? "main" : routingDraft?.previousKey ? "routing-editor" : "routing-configs")
         setRoutingPick(null)
       } else if (key === "r" && e.ctrl) {
         refreshModelCatalog()
@@ -1387,9 +1969,32 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
     } else if (viewMode === "repair-confirm") {
       if (key === "escape" || key === "n") setViewMode("main")
       else if (key === "enter" || key === "return" || key === "y") {
+        const mappings = invalidModelGroups.map((group, index) => ({ oldModel: group.value, newModel: repairMappings[String(index)], agentPaths: group.agents.map(agent => agent.currentPath) }))
+        const verified = modelCatalog.status === "verified" ? modelCatalog.models : []
+        if (isReadOnlyGitSource) {
+          void (async () => {
+            try {
+              const result = overrideRepairAgentModels(workspaceRoot, agents, mappings, verified)
+              refreshData()
+              setSelectedAgentPaths(new Set())
+              const outcome = await reconcileTargetIfInstalled("override")
+              setActionResultTitle("Grouped Model Repair Complete")
+              setActionResultLines([
+                `Repaired ${result.groups} group(s); changed ${result.agentsChanged} agent(s).`,
+                "Writes were validated against the loaded catalog.",
+                "",
+                ...formatReconcileLines(outcome),
+              ])
+            } catch (error: any) {
+              setActionResultTitle("Error During Grouped Repair")
+              setActionResultLines([error.message || String(error)])
+            }
+            setViewMode("action-result")
+          })()
+          return
+        }
         try {
-          const mappings = invalidModelGroups.map((group, index) => ({ oldModel: group.value, newModel: repairMappings[String(index)], agentPaths: group.agents.map(agent => agent.currentPath) }))
-           const tx = mutate(mappings.flatMap(mapping => mapping.agentPaths), "tune", () => repairAgentModels(agents, mappings, modelCatalog.status === "verified" ? modelCatalog.models : []))
+           const tx = mutate(mappings.flatMap(mapping => mapping.agentPaths), "tune", () => repairAgentModels(agents, mappings, verified))
            const result = tx.value
            try { refreshData() } catch (error) { setMutationRefreshFailure(error, tx.warning); return }
           setSelectedAgentPaths(new Set())
@@ -1425,15 +2030,22 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
           const impacted = agents.filter(agent => !targetAgents.some(target => target.currentPath === agent.currentPath) && roles.has(resolveRole(agent, translationConfig)))
           const nextConfig = { ...translationConfig, roles: { ...translationConfig.roles } }
           roles.forEach(role => { nextConfig.roles[role] = chosenTier })
+          let txWarning: TransactionWarning | undefined
+          if (activeDataSource?.kind === "source" && activeDataSource.source.kind === "git") {
+            const loc = sourceTranslationConfigLocation(activeDataSource.source.name, workspaceRoot)
+            saveTranslationConfig(loc.configRoot, nextConfig, loc.configPath)
+          } else {
             const tx = mutate([translationConfigPath(workspaceRoot)], "config", () => saveTranslationConfig(workspaceRoot, nextConfig))
-            setTranslationConfig(loadTranslationConfig(workspaceRoot, undefined, { persistMigration: false }))
-            try { refreshData() } catch (error) { setMutationRefreshFailure(error, tx.warning); return }
+            txWarning = tx.warning
+          }
+          setTranslationConfig(loadTranslationFor(activeDataSource))
+          try { refreshData() } catch (error) { setMutationRefreshFailure(error, txWarning); return }
           setSelectedAgentPaths(new Set())
-            setMutationSuccess("Tier Assigned Successfully", [
+          setMutationSuccess("Tier Assigned Successfully", [
             `Tier: ${chosenTier}`,
             `Roles modified: ${Array.from(roles).join(", ") || "none"}`,
             ...(impacted.length ? [`⚠ Shared-role impact on non-selected agents:`, ...impacted.map(agent => `  ${agent.filename}`)] : ["No non-selected agents share these roles."])
-           ], tx.warning)
+          ], txWarning)
         } catch (error: any) {
           setActionResultTitle("Error Assigning Tier")
           setActionResultLines(["An error occurred:", `  ${error.message || error}`])
@@ -1471,42 +2083,94 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
         setViewMode("main")
       }
     } else if (viewMode === "routing-configs") {
-      // Model configurations of an archetype: one row per trigger, then "new configuration".
-      const triggers = Object.keys(routingView?.configs ?? {})
-      const rows = triggers.length + 1
-      const trigger = triggers[routingFocus]
+      const flows = routingView?.flows ?? []
+      const rows = flows.length + 1
+      const focusedFlow = flows[routingFocus]
       if (key === "escape") {
         setRoutingArchetype(null)
         setViewMode("main")
       } else if (key === "up" || key === "k" || key === "down" || key === "j") {
         setRoutingFocus(focus => (focus + (key === "up" || key === "k" ? -1 : 1) + rows) % rows)
         setRoutingConfirmDelete(false)
+      } else if (key === "c" && routingView) {
+        setCallerDraftSet(new Set(routingView.callers.map(c => c.name)))
+        setCallerFocus(0)
+        setRoutingStatus("")
+        setViewMode("routing-callers")
+      } else if (key === "w" && routingView && !isReadOnlyGitSource && routingView.hasManifest) {
+        exportRoutingToManifest()
+      } else if (key === "i" && routingView && !isReadOnlyGitSource && !routingView.hasManifest) {
+        openInitPackModal()
       } else if ((key === "enter" || key === "return") && routingView) {
-        setRoutingEditorFocus(trigger ? 1 : 0)
+        setRoutingEditorFocus(focusedFlow ? (routingView.related.length > 0 ? 1 : 2) : 0)
         setRoutingSelected(new Set())
         setRoutingStatus("")
-        if (trigger) {
-          setRoutingDraft({ previousTrigger: trigger, trigger, roles: { ...routingView.configs[trigger] } })
+        if (focusedFlow) {
+          setRoutingDraft({
+            previousKey: focusedFlow.key,
+            ...(focusedFlow.callers ? { callers: [...focusedFlow.callers] } : {}),
+            triggers: [...focusedFlow.triggers],
+            roles: { ...focusedFlow.roles },
+            tools: { ...focusedFlow.tools },
+            permissions: { ...focusedFlow.permissions },
+            delegations: { ...focusedFlow.delegations },
+          })
           setViewMode("routing-editor")
         } else {
-          setRoutingDraft({ trigger: "", roles: {} })
+          setRoutingDraft({ triggers: [], roles: {}, tools: {}, permissions: {}, delegations: {} })
           openRoutingPicker({ kind: "trigger" })
         }
-      } else if ((key === "d" || key === "delete") && trigger) {
+      } else if ((key === "d" || key === "delete") && focusedFlow) {
         if (!routingConfirmDelete) {
           setRoutingConfirmDelete(true)
-          setRoutingStatus(`Press D again to delete '${trigger}'.`)
+          setRoutingStatus(`Press D again to delete '${formatTriggerLabel(focusedFlow.triggers)}'.`)
           return
         }
         setRoutingConfirmDelete(false)
-        if (saveRoutingConfig(trigger, null)) setRoutingFocus(focus => Math.max(0, Math.min(focus, triggers.length - 1)))
+        if (saveFlowDraft(null, focusedFlow.key).ok) setRoutingFocus(focus => Math.max(0, Math.min(focus, flows.length - 1)))
+      }
+    } else if (viewMode === "routing-callers") {
+      const candidates = routingView?.callerCandidates ?? []
+      if (key === "escape") {
+        setViewMode("routing-configs")
+      } else if ((key === "up" || key === "k" || key === "down" || key === "j") && candidates.length > 0) {
+        setCallerFocus(f => (f + (key === "up" || key === "k" ? -1 : 1) + candidates.length) % candidates.length)
+      } else if (key === "space" && candidates[callerFocus]) {
+        const name = candidates[callerFocus].name
+        setCallerDraftSet(prev => {
+          const next = new Set(prev)
+          if (next.has(name)) next.delete(name)
+          else next.add(name)
+          return next
+        })
+      } else if (key === "r" && routingArchetype) {
+        try {
+          saveUserPackCallers(workspaceRoot, routingArchetype, null, { applySourceOverrides: isReadOnlyGitSource })
+          setRoutingRevision(r => r + 1)
+          setRoutingStatus("Reset callers to pack / inferred defaults.")
+          void reconcileTargetIfInstalled("models")
+          setViewMode("routing-configs")
+        } catch (err: any) {
+          setRoutingStatus(`Error: ${terminalSafeText(err?.message || err)}`)
+        }
+      } else if ((key === "enter" || key === "return") && routingArchetype) {
+        try {
+          saveUserPackCallers(workspaceRoot, routingArchetype, [...callerDraftSet], { applySourceOverrides: isReadOnlyGitSource })
+          setRoutingRevision(r => r + 1)
+          setRoutingStatus(`Updated callers (OR): ${[...callerDraftSet].join(", ")}.`)
+          void reconcileTargetIfInstalled("models")
+          setViewMode("routing-configs")
+        } catch (err: any) {
+          setRoutingStatus(`Error: ${terminalSafeText(err?.message || err)}`)
+        }
       }
     } else if (viewMode === "routing-editor") {
-      // Rows: the trigger, then one per related subagent. Same keys as the agent list: SPACE/A select,
-      // M or ENTER choose the model for the selection (or the focused row). Every change is saved at once.
       const related = routingView?.related ?? []
-      const rows = related.length + 1
-      const focusedAgent = routingEditorFocus > 0 ? related[routingEditorFocus - 1] : undefined
+      const toolsRowIdx = related.length + 1
+      const permsRowIdx = related.length + 2
+      const delegationsRowIdx = related.length + 3
+      const rows = related.length + 4
+      const focusedAgent = routingEditorFocus > 0 && routingEditorFocus <= related.length ? related[routingEditorFocus - 1] : undefined
       const targets = routingSelected.size > 0 ? related.filter(agent => routingSelected.has(agent.role)).map(agent => agent.role) : focusedAgent ? [focusedAgent.role] : []
       if (!routingDraft) {
         setViewMode("routing-configs")
@@ -1516,6 +2180,18 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
         setViewMode("routing-configs")
       } else if (key === "up" || key === "k" || key === "down" || key === "j") {
         setRoutingEditorFocus(focus => (focus + (key === "up" || key === "k" ? -1 : 1) + rows) % rows)
+      } else if (key === "u") {
+        setFlowSubFocus(0)
+        setFlowSubScroll(0)
+        setViewMode("routing-tools")
+      } else if (key === "p") {
+        setFlowSubFocus(0)
+        setFlowSubScroll(0)
+        setViewMode("routing-permissions")
+      } else if (key === "g") {
+        setFlowSubFocus(0)
+        setFlowSubScroll(0)
+        setViewMode("routing-delegations")
       } else if (key === "space" && focusedAgent) {
         setRoutingSelected(previous => {
           const next = new Set(previous)
@@ -1523,11 +2199,25 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
           else next.add(focusedAgent.role)
           return next
         })
-      } else if (key === "a") {
+      } else if (key === "a" && related.length > 0) {
         setRoutingSelected(previous => previous.size === related.length ? new Set() : new Set(related.map(agent => agent.role)))
       } else if (key === "enter" || key === "return" || key === "m") {
-        if (routingEditorFocus === 0) openRoutingPicker({ kind: "trigger" }, routingDraft.trigger)
-        else if (targets.length > 0) openRoutingPicker({ kind: "roles", roles: targets }, routingDraft.roles[targets[0]])
+        if (routingEditorFocus === 0) openRoutingPicker({ kind: "trigger" }, routingDraft.triggers)
+        else if (routingEditorFocus === toolsRowIdx && key !== "m") {
+          setFlowSubFocus(0)
+          setFlowSubScroll(0)
+          setViewMode("routing-tools")
+        } else if (routingEditorFocus === permsRowIdx && key !== "m") {
+          setFlowSubFocus(0)
+          setFlowSubScroll(0)
+          setViewMode("routing-permissions")
+        } else if (routingEditorFocus === delegationsRowIdx && key !== "m") {
+          setFlowSubFocus(0)
+          setFlowSubScroll(0)
+          setViewMode("routing-delegations")
+        } else if (targets.length > 0) {
+          openRoutingPicker({ kind: "roles", roles: targets }, routingDraft.roles[targets[0]])
+        }
       } else if ((key === "tab" || key === "left" || key === "right") && targets.length > 0) {
         const withModel = targets.filter(role => routingDraft.roles[role] && routingDraft.roles[role] !== INHERIT)
         if (withModel.length === 0) { setRoutingStatus("Choose a model first: variants belong to a model."); return }
@@ -1541,6 +2231,124 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
         const roles = { ...routingDraft.roles }
         for (const role of targets) roles[role] = INHERIT
         if (applyRoutingDraft({ ...routingDraft, roles })) setRoutingSelected(new Set())
+      }
+    } else if (viewMode === "routing-tools") {
+      const toolRows = [{ key: "*", label: "* (All tools fallback)", group: "builtin" as const, staticallyDeniedByCaller: false }, ...(routingView?.availableTools ?? [])]
+      const visibleCount = Math.max(2, Math.floor(termHeight * 0.72) - 8)
+      if (!routingDraft || key === "escape" || key === "enter" || key === "return") {
+        setViewMode("routing-editor")
+      } else if ((key === "up" || key === "k" || key === "down" || key === "j") && toolRows.length > 0) {
+        const next = (flowSubFocus + (key === "up" || key === "k" ? -1 : 1) + toolRows.length) % toolRows.length
+        setFlowSubFocus(next)
+        setFlowSubScroll(offset => next < offset ? next : next >= offset + visibleCount ? next - visibleCount + 1 : offset)
+      } else if ((key === "space" || key === "left" || key === "right") && toolRows[flowSubFocus]) {
+        const targetKey = toolRows[flowSubFocus].key
+        const cycle: Array<PolicyEffect | undefined> = [undefined, "deny", "ask", "allow"]
+        const current = routingDraft.tools[targetKey]
+        const nextEffect = cycle[(cycle.indexOf(current) + (key === "left" ? -1 : 1) + cycle.length) % cycle.length]
+        const tools = { ...routingDraft.tools }
+        if (nextEffect === undefined) delete tools[targetKey]
+        else tools[targetKey] = nextEffect
+        applyRoutingDraft({ ...routingDraft, tools })
+      } else if ((key === "backspace" || key === "delete") && toolRows[flowSubFocus]) {
+        const tools = { ...routingDraft.tools }
+        delete tools[toolRows[flowSubFocus].key]
+        applyRoutingDraft({ ...routingDraft, tools })
+      }
+    } else if (viewMode === "routing-permissions") {
+      const permRows = [
+        { key: "*", label: "* (All permissions fallback)" },
+        { key: "shell", label: "shell / bash (command execution)" },
+        { key: "edit", label: "edit / write (file modifications)" },
+        { key: "read", label: "read (file & directory reads)" },
+        { key: "webfetch", label: "webfetch (HTTP requests)" },
+        { key: "skill", label: "skill (load skills)" },
+        { key: "external_directory", label: "external_directory (outside workspace)" },
+      ]
+      if (!routingDraft || key === "escape" || key === "enter" || key === "return") {
+        setViewMode("routing-editor")
+      } else if (key === "up" || key === "k" || key === "down" || key === "j") {
+        setFlowSubFocus(f => (f + (key === "up" || key === "k" ? -1 : 1) + permRows.length) % permRows.length)
+      } else if ((key === "space" || key === "left" || key === "right") && permRows[flowSubFocus]) {
+        const targetKey = permRows[flowSubFocus].key
+        const cycle: Array<PolicyEffect | undefined> = [undefined, "deny", "ask", "allow"]
+        const current = routingDraft.permissions[targetKey]
+        const nextEffect = cycle[(cycle.indexOf(current) + (key === "left" ? -1 : 1) + cycle.length) % cycle.length]
+        const permissions = { ...routingDraft.permissions }
+        if (nextEffect === undefined) delete permissions[targetKey]
+        else permissions[targetKey] = nextEffect
+        applyRoutingDraft({ ...routingDraft, permissions })
+      } else if ((key === "backspace" || key === "delete") && permRows[flowSubFocus]) {
+        const permissions = { ...routingDraft.permissions }
+        delete permissions[permRows[flowSubFocus].key]
+        applyRoutingDraft({ ...routingDraft, permissions })
+      }
+    } else if (viewMode === "routing-delegations") {
+      const delRows = [
+        { name: "*", label: "* (All subagents fallback)" },
+        ...(routingView?.subagents ?? []).map(sub => ({ name: sub.name, label: sub.name })),
+      ]
+      const visibleCount = Math.max(2, Math.floor(termHeight * 0.72) - 8)
+      if (!routingDraft || key === "escape" || key === "enter" || key === "return") {
+        setViewMode("routing-editor")
+      } else if ((key === "up" || key === "k" || key === "down" || key === "j") && delRows.length > 0) {
+        const next = (flowSubFocus + (key === "up" || key === "k" ? -1 : 1) + delRows.length) % delRows.length
+        setFlowSubFocus(next)
+        setFlowSubScroll(offset => next < offset ? next : next >= offset + visibleCount ? next - visibleCount + 1 : offset)
+      } else if ((key === "space" || key === "left" || key === "right") && delRows[flowSubFocus]) {
+        const targetName = delRows[flowSubFocus].name
+        const cycle: Array<DelegationEffect | undefined> = [undefined, "deny", "allow"]
+        const current = routingDraft.delegations[targetName]
+        const nextEffect = cycle[(cycle.indexOf(current) + (key === "left" ? -1 : 1) + cycle.length) % cycle.length]
+        const delegations = { ...routingDraft.delegations }
+        if (nextEffect === undefined) delete delegations[targetName]
+        else delegations[targetName] = nextEffect
+        applyRoutingDraft({ ...routingDraft, delegations })
+      } else if ((key === "backspace" || key === "delete") && delRows[flowSubFocus]) {
+        const delegations = { ...routingDraft.delegations }
+        delete delegations[delRows[flowSubFocus].name]
+        applyRoutingDraft({ ...routingDraft, delegations })
+      }
+    } else if (viewMode === "pack-init") {
+      const fieldOrder: Array<"name" | "version" | "desc" | "organize"> = ["name", "version", "desc", "organize"]
+      if (key === "escape") {
+        setViewMode(routingArchetype ? "routing-configs" : "main")
+      } else if (key === "tab" || key === "up" || key === "down") {
+        const delta = key === "up" ? -1 : 1
+        setInitPackField(f => fieldOrder[(fieldOrder.indexOf(f) + delta + fieldOrder.length) % fieldOrder.length])
+      } else if (key === "space" && initPackField === "organize") {
+        setInitPackOrganize(prev => !prev)
+      } else if (key === "backspace") {
+        if (initPackField === "name") setInitPackName(s => s.slice(0, -1))
+        else if (initPackField === "version") setInitPackVersion(s => s.slice(0, -1))
+        else if (initPackField === "desc") setInitPackDesc(s => s.slice(0, -1))
+      } else if (key === "enter" || key === "return") {
+        try {
+          const res = initPackManifest(workspaceRoot, {
+            name: initPackName,
+            version: initPackVersion,
+            description: initPackDesc,
+            organize: initPackOrganize,
+          })
+          refreshData()
+          setRoutingArchetype(null)
+          setActionResultTitle("Pack Manifest Initialized")
+          setActionResultLines([
+            `Created ${res.manifestPath}`,
+            `Pack: ${res.manifest.name}@${res.manifest.version} (contract ${res.manifest.contract})`,
+            ...(res.movedAgents.length ? ["", "Organized agents:", ...res.movedAgents.map(m => `  ${m.from} -> ${m.to}`)] : []),
+            ...(res.warnings.length ? ["", "Validation notes:", ...res.warnings.map(w => `  ${w}`)] : []),
+          ])
+          setViewMode("action-result")
+        } catch (err: any) {
+          setActionResultTitle("Pack Initialization Failed")
+          setActionResultLines([`Error: ${terminalSafeText(err?.message || err)}`])
+          setViewMode("action-result")
+        }
+      } else if (/^[\x20-\x7E]$/.test(rawChar)) {
+        if (initPackField === "name" && /[a-zA-Z0-9-]/.test(rawChar)) setInitPackName(s => (s + rawChar.toLowerCase()).slice(0, 64))
+        else if (initPackField === "version" && rawChar !== " ") setInitPackVersion(s => s + rawChar)
+        else if (initPackField === "desc") setInitPackDesc(s => s + rawChar)
       }
     } else if (viewMode === "color-selector") {
       // 8. Color selector mode
@@ -1595,15 +2403,17 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
               const selectedAgents = selectedAgentPaths.size > 0
                 ? agents.filter((a) => selectedAgentPaths.has(a.currentPath))
                 : (activeItems[focusedIndex]?.agent ? [activeItems[focusedIndex].agent!] : [])
-               const tx = mutate(selectedAgents.map(a => a.currentPath), "tune", () => updateAgentsColor(selectedAgents, selectedColor))
-                try { refreshData() } catch (error) { setMutationRefreshFailure(error, tx.warning); return }
-              setSelectedAgentPaths(new Set())
-                setMutationSuccess("Color Updated Successfully", [`Successfully set color:`, `  ${selectedColor} (${item.label.trim()})`, `on ${selectedAgents.length} agents.`], tx.warning)
+              applyAgentMutation(
+                selectedAgents.map(a => a.currentPath),
+                writer => updateAgentsColor(selectedAgents, selectedColor, writer),
+                "Color Updated Successfully",
+                [`Successfully set color:`, `  ${selectedColor} (${item.label.trim()})`, `on ${selectedAgents.length} agents.`]
+              )
             } catch (error: any) {
               setActionResultTitle("Error Updating Color")
               setActionResultLines([`An error occurred:`, `  ${error.message || error}`])
+              setViewMode("action-result")
             }
-            setViewMode("action-result")
           }
         }
       } else if (key === "escape") {
@@ -1621,15 +2431,17 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
           ? agents.filter((a) => selectedAgentPaths.has(a.currentPath))
           : (activeItems[focusedIndex]?.agent ? [activeItems[focusedIndex].agent!] : [])
         try {
-           const tx = mutate(targetAgents.map(a => a.currentPath), "tune", () => applySafetyPreset(targetAgents, preset.key))
-           try { refreshData() } catch (error) { setMutationRefreshFailure(error, tx.warning); return }
-          setSelectedAgentPaths(new Set())
-            setMutationSuccess("Safety Preset Applied", [`Successfully applied preset '${preset.name}'`, `to ${targetAgents.length} agents.`], tx.warning)
+          applyAgentMutation(
+            targetAgents.map(a => a.currentPath),
+            writer => applySafetyPreset(targetAgents, preset.key, writer),
+            "Safety Preset Applied",
+            [`Successfully applied preset '${preset.name}'`, `to ${targetAgents.length} agents.`]
+          )
         } catch (error: any) {
           setActionResultTitle("Error Applying Safety Preset")
           setActionResultLines([`An error occurred:`, `  ${error.message || error}`])
+          setViewMode("action-result")
         }
-        setViewMode("action-result")
       } else if (key === "escape") {
         setViewMode("main")
       }
@@ -1670,14 +2482,17 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
         if (delegationTargetAgent) {
           const allowedNames: string[] = Array.from(selectedDelegations)
           try {
-             const tx = mutate([delegationTargetAgent.currentPath], "tune", () => updateAgentDelegations(delegationTargetAgent, allowedNames))
-             try { refreshData() } catch (error) { setMutationRefreshFailure(error, tx.warning); return }
-             setMutationSuccess("Delegation Graph Updated", [`Updated subagent delegation permissions for:`, `  ${delegationTargetAgent.filename}`, ``, `Allowed subagents (${allowedNames.length}):`, ...allowedNames.map((name) => `  * ${name}`)], tx.warning)
+            applyAgentMutation(
+              [delegationTargetAgent.currentPath],
+              writer => updateAgentDelegations(delegationTargetAgent, allowedNames, writer),
+              "Delegation Graph Updated",
+              [`Updated subagent delegation permissions for:`, `  ${delegationTargetAgent.filename}`, ``, `Allowed subagents (${allowedNames.length}):`, ...allowedNames.map((name) => `  * ${name}`)]
+            )
           } catch (error: any) {
             setActionResultTitle("Error Updating Delegations")
             setActionResultLines([`An error occurred:`, `  ${error.message || error}`])
+            setViewMode("action-result")
           }
-          setViewMode("action-result")
         }
       } else if (key === "escape") {
         setViewMode("main")
@@ -1755,10 +2570,12 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
         }
         try {
           const target = resourceTargetAgent
-          const tx = mutate([target.currentPath], "tune", () => updateAgentResources(target, resourceCatalog, changes))
-          try { refreshData() } catch (error) { setMutationRefreshFailure(error, tx.warning); return }
-          setMutationSuccess("Resources Updated", [`Updated skills, custom tools, and MCP permissions for:`, `  ${target.filename}`], tx.warning)
-          setViewMode("action-result")
+          applyAgentMutation(
+            [target.currentPath],
+            writer => { updateAgentResources(target, resourceCatalog, changes, writer) },
+            "Resources Updated",
+            [`Updated skills, custom tools, and MCP permissions for:`, `  ${target.filename}`]
+          )
         } catch (error: any) {
           setActionResultTitle("Error Updating Agent Resources")
           setActionResultLines([`An error occurred:`, `  ${error.message || error}`])
@@ -1824,22 +2641,23 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
             tuningDirtyFields,
             modelVariants && modelVariants.length > 0 ? modelVariants : undefined
           )
-          const tx = mutate(targetAgents.map(a => a.currentPath), "tune", () => updateAgentParams(targetAgents, params))
-          try { refreshData() } catch (error) { setMutationRefreshFailure(error, tx.warning); return }
-          setSelectedAgentPaths(new Set())
-          setMutationSuccess("Parameters Updated Successfully", [
-           `Successfully tuned parameters for ${targetAgents.length} agents:`,
-           `  * Steps:  ${tuningDirtyFields.has("steps") ? tuningSteps : "unchanged"}`,
-           `  * Temp:   ${tuningDirtyFields.has("temp") ? tuningTemp : "unchanged"}`,
-           `  * Variant (Effort): ${tuningDirtyFields.has("variant") ? (tuningVariant.trim() || "cleared (default)") : "unchanged"}`,
-           `  * Mode:   ${tuningDirtyFields.has("mode") ? tuningMode : "unchanged"}`,
-           `  * Hidden: ${tuningDirtyFields.has("hidden") ? tuningHidden : "unchanged"}`
-          ], tx.warning)
+          applyAgentMutation(
+            targetAgents.map(a => a.currentPath),
+            writer => updateAgentParams(targetAgents, params, writer),
+            "Parameters Updated Successfully",
+            [
+              `Successfully tuned parameters for ${targetAgents.length} agents:`,
+              `  * Steps:  ${tuningDirtyFields.has("steps") ? tuningSteps : "unchanged"}`,
+              `  * Temp:   ${tuningDirtyFields.has("temp") ? tuningTemp : "unchanged"}`,
+              `  * Variant (Effort): ${tuningDirtyFields.has("variant") ? (tuningVariant.trim() || "cleared (default)") : "unchanged"}`,
+              `  * Mode:   ${tuningDirtyFields.has("mode") ? tuningMode : "unchanged"}`,
+              `  * Hidden: ${tuningDirtyFields.has("hidden") ? tuningHidden : "unchanged"}`
+            ]
+          )
         } catch (error: any) {
           setLayoutStatus(error.message || String(error))
           return
         }
-        setViewMode("action-result")
       } else if (/^[\x20-\x7E]$/.test(rawChar) && rawChar !== " ") {
         if (tuningFocusedField === "steps" && /[0-9]/.test(rawChar)) {
           if (!tuningDirtyFields.has("steps") && tuningSummary.steps.mixed) setTuningSteps(rawChar)
@@ -2136,7 +2954,11 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
            <box width="100%" height={layout.listRows} minHeight={0} overflow="hidden" flexGrow={0} flexShrink={0} flexDirection="column" marginTop={1}>
             {activeItems.length === 0 ? (
               <text style={{ textColor: "yellow" }}>
-                {searchQuery ? `No agents match search: "${searchQuery}"` : "No agent markdown files found."}
+                {!activeDataSource
+                  ? "No data source connected. Press [O] to connect a GitHub repo or local folder."
+                  : searchQuery
+                    ? `No agents match search: "${searchQuery}"`
+                    : "No agent markdown files found in this source (press [O] to switch sources)."}
               </text>
             ) : (
               visibleItems.map((item, index) => {
@@ -2463,14 +3285,28 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
                   )}
                 </box>
               ) : (
-                           <box flexDirection="column" flexGrow={1} overflow="hidden">
+                <box flexDirection="column" flexGrow={1} overflow="hidden">
                   <text style={{ textColor: "yellow" }} b>
                      {middleEllipsis(`📁 Pack: ${currentItem.category.toUpperCase()}`, 40)}
                   </text>
                   <text style={{ textColor: "white" }} marginTop={1}>
-                     {middleEllipsis(`Directory: ${path.relative(workspaceRoot, path.join(packDir(workspaceRoot, currentItem.category) ?? workspaceRoot, "agents"))}/`, 50)}
+                     {middleEllipsis(`Directory: ${path.relative(workspaceRoot, packDir(workspaceRoot, currentItem.category) ?? workspaceRoot) || "."}/`, 50)}
                   </text>
-                  <text style={{ textColor: "gray" }} marginTop={2}>
+                  {(() => {
+                    const folderDir = packDir(workspaceRoot, currentItem.category)
+                    const isVirtual = Boolean(folderDir && !fs.existsSync(path.join(folderDir, "opencode-pack.json")))
+                    return (
+                      <box flexDirection="column" marginTop={1}>
+                        <text style={{ textColor: isVirtual ? "cyan" : "green" }}>
+                          {middleEllipsis(isVirtual ? "Format: Virtual .md Pack (no opencode-pack.json)" : "Format: OpenCode Pack (opencode-pack.json)", Math.max(20, panelWidths.inspector - 6))}
+                        </text>
+                        <text style={{ textColor: "cyan" }}>
+                          {middleEllipsis(`[M] Conditional IF/OR Flows${isVirtual && !isReadOnlyGitSource ? " · [I] Init opencode-pack.json" : ""}`, Math.max(20, panelWidths.inspector - 6))}
+                        </text>
+                      </box>
+                    )
+                  })()}
+                  <text style={{ textColor: "gray" }} marginTop={1}>
                     Purpose Summary:
                   </text>
                   <box borderStyle="single" borderColor="#333333" padding={1} marginTop={1} flexGrow={1}>
@@ -2493,14 +3329,15 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
         {(() => {
           const footerInnerWidth = Math.max(0, termWidth - 6)
           const compact = footerInnerWidth < 118
+          const showInitHint = isWorkspaceVirtualPack
             const footerRows = viewMode !== "main" ? [[], [], []] : compact ? [
-              [["SPACE", "Select"], ["A", "All"], ["S", "Match"], ["/", "Search"], ["1-5", "Tabs"], ["S+L", "Layout"]],
-              [["M", "Mod"], ["C", "Col"], ["P", "Perm"], ["G", "Del"], ["T", "Tun"], ["S+T", "Tier"]],
-              [["B", "Claude"], ["S+B", "Codex"], ["R", "Rename"], ["E", "Install"], ["V", "Repair"], ["U", "Resources"]]
+              [["O", "Sources"], ["SPACE", "Sel"], ["A", "All"], ["S", "Match"], ["/", "Search"], ["1-5", "Tabs"]],
+              [["M", "Mod/Flows"], ["C", "Col"], ["P", "Perm"], ["G", "Del"], ["T", "Tun"], ["S+T", "Tier"], ["S+L", "Layout"]],
+              [["B", "Claude"], ["S+B", "Codex"], ["R", "Rename"], ["E", "Install"], ...(showInitHint ? [["I", "InitPack"]] : []), ["V", "Repair"], ["U", "Resources"]]
             ] : [
-              [["SPACE", "Select"], ["A", "All"], ["S", "Same model"], ["/", "Search"], ["1-5", "Inspector"], ["SHIFT+L", "Layout"]],
-              [["M", "Model"], ["C", "Color"], ["P", "Permissions"], ["G", "Delegations"], ["T", "Tune"], ["SHIFT+T", "Tier"], ["V", "Repair models"]],
-              [["B", "Claude bridge"], ["SHIFT+B", "Codex bridge"], ["R", "Rename"], ["E", "Install"], ["U", "Skills/Tools"]]
+              [["O", "Sources"], ["SPACE", "Select"], ["A", "All"], ["S", "Same model"], ["/", "Search"], ["1-5", "Inspector"]],
+              [["M", "Model/Flows"], ["C", "Color"], ["P", "Permissions"], ["G", "Delegations"], ["T", "Tune"], ["SHIFT+T", "Tier"], ["V", "Repair"]],
+              [["B", "Claude bridge"], ["SHIFT+B", "Codex bridge"], ["R", "Rename"], ["E", "Install"], ...(showInitHint ? [["I", "Init pack"]] : []), ["U", "Skills/Tools"], ["SHIFT+L", "Layout"]]
           ]
          return (
            <box height={5} flexShrink={0} overflow="hidden" flexDirection="column" borderStyle="single" borderColor="#2B5581" paddingLeft={1} paddingRight={1}>
@@ -2953,7 +3790,7 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
           borderStyle="double"
           borderColor="#00AAFF"
           backgroundColor="#1e1e1e"
-           title={viewMode === "repair-selector" ? ` Repair Model Group ${Number(repairGroupKey) + 1}/${invalidModelGroups.length} ` : routingPick ? " Model Configuration " : " Select LLM Model "}
+           title={viewMode === "repair-selector" ? ` Repair Model Group ${Number(repairGroupKey) + 1}/${invalidModelGroups.length} ` : routingPick?.kind === "trigger" ? " Select OR Triggers " : routingPick ? " Model Configuration " : " Select LLM Model "}
           titleColor="#00AAFF"
           padding={1}
           flexDirection="column"
@@ -2963,9 +3800,9 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
              {viewMode === "repair-selector"
                 ? middleEllipsis(`Choose an exact replacement for explicit model ${JSON.stringify(invalidModelGroups[Number(repairGroupKey)]?.value)} (${invalidModelGroups[Number(repairGroupKey)]?.agents.length || 0} agents):`, modelModalInnerWidth)
                : routingPick?.kind === "trigger"
-                 ? middleEllipsis(`When ${routingView ? callersLabel(routingView) : "the reference agent"} runs on… (a model, or ★ any model of a provider):`, modelModalInnerWidth)
+                 ? middleEllipsis(`When ${routingView ? callersLabel(routingView) : "callers"} run on (OR)${pendingTriggers.size > 0 ? `: [${[...pendingTriggers].join(" OR ")}]` : " — SPACE/TAB toggle multiple, ENTER confirm"}:`, modelModalInnerWidth)
                  : routingPick?.kind === "roles"
-                   ? middleEllipsis(`${routingPick.roles.map(role => `${routingArchetype}-${role}`).join(", ")} use (when ${routingView ? callersLabel(routingView) : "?"} runs on ${routingDraft?.trigger || "?"}):`, modelModalInnerWidth)
+                   ? middleEllipsis(`${routingPick.roles.map(role => `${routingArchetype}-${role}`).join(", ")} use (when ${routingView ? callersLabel(routingView) : "?"} runs on ${routingDraft ? formatTriggerLabel(routingDraft.triggers) : "?"}):`, modelModalInnerWidth)
                    : `Choose model to apply to ${selectedAgentPaths.size > 0 ? selectedAgentPaths.size : 1} selected agents:`}
           </text>
           <text style={{ textColor: modelFilter ? "cyan" : "gray" }} flexShrink={0}>{middleEllipsis(modelFilter ? `Search: ${modelFilter}▏ (${modelTreeItems.filter(item => item.type === "model").length} matches)` : "Search: type to filter models", modelModalInnerWidth)}</text>
@@ -3004,8 +3841,8 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
           </box>
 
           <box flexDirection="column" borderStyle="single" border={["top"]} borderColor="#333333" paddingTop={1} flexShrink={0}>
-              <text width="100%" height={1} flexShrink={0} wrapMode="none" overflow="hidden" style={{ textColor: "gray" }}>{middleEllipsis(`Total: ${modelTreeItems.length} · Position: ${focusedModelIndex + 1}/${modelTreeItems.length}`, modelModalInnerWidth)}</text>
-              <text width="100%" height={1} flexShrink={0} wrapMode="none" overflow="hidden" style={{ textColor: "gray" }}>{middleEllipsis("ENTER select · ↑/↓ browse · ←/→ fold provider · type to search", modelModalInnerWidth)}</text>
+              <text width="100%" height={1} flexShrink={0} wrapMode="none" overflow="hidden" style={{ textColor: "gray" }}>{middleEllipsis(`Total: ${modelTreeItems.length} · Position: ${focusedModelIndex + 1}/${modelTreeItems.length}${routingPick?.kind === "trigger" && pendingTriggers.size > 0 ? ` · Selected OR: ${pendingTriggers.size}` : ""}`, modelModalInnerWidth)}</text>
+              <text width="100%" height={1} flexShrink={0} wrapMode="none" overflow="hidden" style={{ textColor: "gray" }}>{middleEllipsis(routingPick?.kind === "trigger" ? "SPACE/TAB toggle OR triggers · ENTER confirm · ↑/↓ browse · ←/→ fold · type to search" : "ENTER select · ↑/↓ browse · ←/→ fold provider · type to search", modelModalInnerWidth)}</text>
               <text width="100%" height={1} flexShrink={0} wrapMode="none" overflow="hidden" style={{ textColor: "gray" }}>{middleEllipsis("BACKSPACE edit search · ESC clear search / cancel · CTRL+R reload catalog", modelModalInnerWidth)}</text>
           </box>
         </box>
@@ -3041,59 +3878,283 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
         </box>
       })()}
 
-      {/* Modal - Model configurations of an archetype (M on its folder) */}
-      {(viewMode === "routing-configs" || viewMode === "routing-editor") && (
+      {/* Modal - Conditional IF/OR Flows of any pack (M on its folder) */}
+      {(viewMode === "routing-configs" || viewMode === "routing-editor" || viewMode === "routing-callers" || viewMode === "routing-tools" || viewMode === "routing-permissions" || viewMode === "routing-delegations") && (
         <box
-          style={{ position: "absolute", left: "10%", top: "10%", width: "80%", height: "80%" }}
+          style={{ position: "absolute", left: "10%", top: "8%", width: "80%", height: "84%" }}
           borderStyle="double"
           borderColor="#00AAFF"
           backgroundColor="#1e1e1e"
-          title={` ${(routingArchetype || "").toUpperCase()} · Model Configurations `}
+          title={` ${(routingArchetype || "").toUpperCase()} · Conditional Flows (IF / OR) `}
           titleColor="#00AAFF"
           padding={1}
           flexDirection="column"
           overflow="hidden"
         >
           {!routingView ? (
-            <text style={{ textColor: "red" }}>{routingLoad.error || `No reference agent found for ${routingArchetype}.`}</text>
-          ) : (
+            <text style={{ textColor: "red" }}>{routingLoad.error || `No agents found for ${routingArchetype}.`}</text>
+          ) : viewMode === "routing-callers" ? (
+            <>
+              <text style={{ textColor: "white" }} flexShrink={0}>
+                {middleEllipsis(`Choose which agents act as callers in OR for ${routingArchetype} (saved in routing.json):`, modelModalInnerWidth)}
+              </text>
+              <text style={{ textColor: "gray" }} flexShrink={0}>
+                {middleEllipsis(`Active source: ${routingView.callerSource} · Press R to reset to pack / inferred defaults.`, modelModalInnerWidth)}
+              </text>
+              <box flexGrow={1} flexDirection="column" marginTop={1} overflow="hidden">
+                {routingView.callerCandidates.map((cand, index) => {
+                  const focused = index === callerFocus
+                  const checked = callerDraftSet.has(cand.name)
+                  return (
+                    <box key={`caller-${cand.name}`} height={1} backgroundColor={focused ? "#00AAFF" : "transparent"} paddingLeft={1} flexShrink={0}>
+                      <text style={{ textColor: focused ? "#FFFFFF" : checked ? "green" : "#E1E4E8" }}>
+                        {middleEllipsis(`${focused ? "> " : "  "}${checked ? "[x]" : "[ ]"} ${cand.name}${cand.model ? ` (${cand.model})` : ""}`, modelModalInnerWidth)}
+                      </text>
+                    </box>
+                  )
+                })}
+              </box>
+              {routingStatus && <text style={{ textColor: routingStatus.startsWith("Error") ? "red" : "yellow" }} flexShrink={0}>{middleEllipsis(routingStatus, modelModalInnerWidth)}</text>}
+              <text style={{ textColor: "gray" }} flexShrink={0}>[↑/↓] Navigate | [SPACE] Toggle caller | [ENTER] Save callers | [R] Reset defaults | [ESC] Back</text>
+            </>
+          ) : viewMode === "routing-tools" && routingDraft ? (() => {
+            const toolRows = [{ key: "*", label: "* (All tools fallback)", group: "builtin" as const, staticallyDeniedByCaller: false }, ...routingView.availableTools]
+            const visibleCount = Math.max(2, Math.floor(termHeight * 0.72) - 8)
+            const visible = toolRows.slice(flowSubScroll, flowSubScroll + visibleCount)
+            return (
+              <>
+                <text style={{ textColor: "white" }} flexShrink={0}>
+                  {middleEllipsis(`Tools & MCP overrides when ${callersLabel(routingView)} runs on ${formatTriggerLabel(routingDraft.triggers)}:`, modelModalInnerWidth)}
+                </text>
+                <text style={{ textColor: "gray" }} flexShrink={0}>
+                  {middleEllipsis(`SPACE or ←/→ cycles: unchanged -> deny -> ask -> allow. Denied tools are removed from context & blocked.`, modelModalInnerWidth)}
+                </text>
+                <box flexGrow={1} flexDirection="column" marginTop={1} overflow="hidden">
+                  {visible.map((row, idx) => {
+                    const globalIdx = flowSubScroll + idx
+                    const focused = globalIdx === flowSubFocus
+                    const effect = routingDraft.tools[row.key]
+                    const effectColor = focused ? "#FFFFFF" : effect === "deny" ? "red" : effect === "ask" ? "yellow" : effect === "allow" ? "green" : "gray"
+                    return (
+                      <box key={`ftool-${row.key}`} flexDirection="row" height={1} backgroundColor={focused ? "#00AAFF" : "transparent"} paddingLeft={1} flexShrink={0}>
+                        <text style={{ textColor: focused ? "#FFFFFF" : "#E1E4E8" }} width="55%">
+                          {middleEllipsis(`${focused ? "> " : "  "}${row.label}`, Math.max(12, Math.floor(modelModalInnerWidth * 0.54)))}
+                        </text>
+                        <text style={{ textColor: effectColor }}>
+                          {middleEllipsis(`${effect ? effect.toUpperCase() : "unchanged"}${effect === "allow" && row.staticallyDeniedByCaller ? " ⚠ static deny on caller" : ""}`, Math.max(12, Math.floor(modelModalInnerWidth * 0.44)))}
+                        </text>
+                      </box>
+                    )
+                  })}
+                </box>
+                {routingStatus && <text style={{ textColor: routingStatus.startsWith("Error") ? "red" : "yellow" }} flexShrink={0}>{middleEllipsis(routingStatus, modelModalInnerWidth)}</text>}
+                <text style={{ textColor: "gray" }} flexShrink={0}>[↑/↓] Navigate | [SPACE/←/→] Cycle allow/ask/deny | [BACKSPACE] Unchanged | [ENTER/ESC] Done</text>
+              </>
+            )
+          })() : viewMode === "routing-permissions" && routingDraft ? (() => {
+            const permRows = [
+              { key: "*", label: "* (All permissions fallback)" },
+              { key: "shell", label: "shell / bash (command execution)" },
+              { key: "edit", label: "edit / write (file modifications)" },
+              { key: "read", label: "read (file & directory reads)" },
+              { key: "webfetch", label: "webfetch (HTTP requests)" },
+              { key: "skill", label: "skill (load skills)" },
+              { key: "external_directory", label: "external_directory (outside workspace)" },
+            ]
+            return (
+              <>
+                <text style={{ textColor: "white" }} flexShrink={0}>
+                  {middleEllipsis(`Permission overrides when ${callersLabel(routingView)} runs on ${formatTriggerLabel(routingDraft.triggers)}:`, modelModalInnerWidth)}
+                </text>
+                <text style={{ textColor: "gray" }} flexShrink={0}>
+                  {middleEllipsis(`SPACE or ←/→ cycles: unchanged -> deny -> ask -> allow.`, modelModalInnerWidth)}
+                </text>
+                <box flexGrow={1} flexDirection="column" marginTop={1} overflow="hidden">
+                  {permRows.map((row, idx) => {
+                    const focused = idx === flowSubFocus
+                    const effect = routingDraft.permissions[row.key]
+                    const staticDeny = routingView.staticDeniedTools.has(row.key) || routingView.staticDeniedTools.has("*")
+                    const effectColor = focused ? "#FFFFFF" : effect === "deny" ? "red" : effect === "ask" ? "yellow" : effect === "allow" ? "green" : "gray"
+                    return (
+                      <box key={`fperm-${row.key}`} flexDirection="row" height={1} backgroundColor={focused ? "#00AAFF" : "transparent"} paddingLeft={1} flexShrink={0}>
+                        <text style={{ textColor: focused ? "#FFFFFF" : "#E1E4E8" }} width="55%">
+                          {middleEllipsis(`${focused ? "> " : "  "}${row.label}`, Math.max(12, Math.floor(modelModalInnerWidth * 0.54)))}
+                        </text>
+                        <text style={{ textColor: effectColor }}>
+                          {middleEllipsis(`${effect ? effect.toUpperCase() : "unchanged"}${effect === "allow" && staticDeny ? " ⚠ static deny on caller" : ""}`, Math.max(12, Math.floor(modelModalInnerWidth * 0.44)))}
+                        </text>
+                      </box>
+                    )
+                  })}
+                </box>
+                {routingStatus && <text style={{ textColor: routingStatus.startsWith("Error") ? "red" : "yellow" }} flexShrink={0}>{middleEllipsis(routingStatus, modelModalInnerWidth)}</text>}
+                <text style={{ textColor: "gray" }} flexShrink={0}>[↑/↓] Navigate | [SPACE/←/→] Cycle allow/ask/deny | [BACKSPACE] Unchanged | [ENTER/ESC] Done</text>
+              </>
+            )
+          })() : viewMode === "routing-delegations" && routingDraft ? (() => {
+            const delRows = [
+              { name: "*", label: "* (All subagents fallback)", staticDeny: routingView.staticDeniedDelegations.has("*") },
+              ...routingView.subagents.map(sub => ({ name: sub.name, label: sub.name, staticDeny: routingView.staticDeniedDelegations.has(sub.name) || routingView.staticDeniedDelegations.has("*") })),
+            ]
+            const visibleCount = Math.max(2, Math.floor(termHeight * 0.72) - 8)
+            const visible = delRows.slice(flowSubScroll, flowSubScroll + visibleCount)
+            return (
+              <>
+                <text style={{ textColor: "white" }} flexShrink={0}>
+                  {middleEllipsis(`Subagent delegation policy when ${callersLabel(routingView)} runs on ${formatTriggerLabel(routingDraft.triggers)}:`, modelModalInnerWidth)}
+                </text>
+                <text style={{ textColor: "gray" }} flexShrink={0}>
+                  {middleEllipsis(`SPACE or ←/→ cycles: unchanged -> deny -> allow. Denied delegations are blocked before execution.`, modelModalInnerWidth)}
+                </text>
+                <box flexGrow={1} flexDirection="column" marginTop={1} overflow="hidden">
+                  {visible.map((row, idx) => {
+                    const globalIdx = flowSubScroll + idx
+                    const focused = globalIdx === flowSubFocus
+                    const effect = routingDraft.delegations[row.name]
+                    const effectColor = focused ? "#FFFFFF" : effect === "deny" ? "red" : effect === "allow" ? "green" : "gray"
+                    return (
+                      <box key={`fdel-${row.name}`} flexDirection="row" height={1} backgroundColor={focused ? "#00AAFF" : "transparent"} paddingLeft={1} flexShrink={0}>
+                        <text style={{ textColor: focused ? "#FFFFFF" : "#E1E4E8" }} width="55%">
+                          {middleEllipsis(`${focused ? "> " : "  "}${row.label}`, Math.max(12, Math.floor(modelModalInnerWidth * 0.54)))}
+                        </text>
+                        <text style={{ textColor: effectColor }}>
+                          {middleEllipsis(`${effect ? effect.toUpperCase() : "unchanged"}${effect === "allow" && row.staticDeny ? " ⚠ static deny on caller" : ""}`, Math.max(12, Math.floor(modelModalInnerWidth * 0.44)))}
+                        </text>
+                      </box>
+                    )
+                  })}
+                </box>
+                {routingStatus && <text style={{ textColor: routingStatus.startsWith("Error") ? "red" : "yellow" }} flexShrink={0}>{middleEllipsis(routingStatus, modelModalInnerWidth)}</text>}
+                <text style={{ textColor: "gray" }} flexShrink={0}>[↑/↓] Navigate | [SPACE/←/→] Cycle allow/deny | [BACKSPACE] Unchanged | [ENTER/ESC] Done</text>
+              </>
+            )
+          })() : (
             <>
               <text style={{ textColor: "white" }} flexShrink={0}>{middleEllipsis(viewMode === "routing-configs"
-                ? `When ${callersLabel(routingView)} runs on a model or provider, the subagents it calls use these models. Anything else: they inherit the caller's model.`
-                : `Select one or more subagents (SPACE, A) and press M to set their model, as in the agent list.`, modelModalInnerWidth)}</text>
-              <text style={{ textColor: "gray" }} flexShrink={0}>{middleEllipsis(`Starts on (M on the agent): ${routingView.callers.map(agent => `${agent.name} = ${agent.model || "the model chosen in OpenCode"}`).join(", ")}`, modelModalInnerWidth)}</text>
-              {routingView.pinned.length > 0 && <text style={{ textColor: "gray" }} flexShrink={0}>{middleEllipsis(`Fixed, skipped by configurations (M on the agent to change): ${routingView.pinned.map(agent => `${agent.name} = ${agent.model}`).join(", ")}`, modelModalInnerWidth)}</text>}
+                ? `Callers (OR): ${callersLabel(routingView)} [${routingView.callerSource}] · press [C] to edit callers`
+                : `Configure triggers (OR), subagent models, tools/MCP [U] and delegations [G] for this flow.`, modelModalInnerWidth)}</text>
+              <text style={{ textColor: "cyan" }} flexShrink={0}>{middleEllipsis(
+                isReadOnlyGitSource
+                  ? `Saved in user settings (routing.json) · reconciles target automatically`
+                  : routingView.hasManifest
+                    ? `Saved in user settings (routing.json) by default · press [W] to export defaults into opencode-pack.json`
+                    : `Virtual .md pack · saved in routing.json · press [I] to generate opencode-pack.json`,
+                modelModalInnerWidth,
+              )}</text>
+              {routingView.pinned.length > 0 && <text style={{ textColor: "gray" }} flexShrink={0}>{middleEllipsis(`Pinned subagents (fixed model, skipped by model routing): ${routingView.pinned.map(agent => `${agent.name}=${agent.model}`).join(", ")}`, modelModalInnerWidth)}</text>}
+              {viewMode === "routing-editor" && routingDraft && (() => {
+                const blockedAllowTools = Object.entries(routingDraft.tools).filter(([k, v]) => v === "allow" && (routingView.staticDeniedTools.has(k) || routingView.staticDeniedTools.has("*"))).map(([k]) => k)
+                const blockedAllowDels = Object.entries(routingDraft.delegations).filter(([k, v]) => v === "allow" && (routingView.staticDeniedDelegations.has(k) || routingView.staticDeniedDelegations.has("*"))).map(([k]) => k)
+                if (!blockedAllowTools.length && !blockedAllowDels.length) return null
+                return (
+                  <text style={{ textColor: "yellow" }} flexShrink={0}>
+                    {middleEllipsis(`⚠ Static 'deny' on caller frontmatter overrides runtime 'allow' in OpenCode V2 (${[...blockedAllowTools, ...blockedAllowDels].join(", ")}); set caller base permission to allow/ask.`, modelModalInnerWidth)}
+                  </text>
+                )
+              })()}
               <box flexGrow={1} flexDirection="column" marginTop={1} overflow="hidden">
                 {viewMode === "routing-configs"
-                  ? [...Object.entries(routingView.configs), ["", null] as const].map(([trigger, roles], index) => {
+                  ? [...routingView.flows, null].map((flow, index) => {
                       const focused = index === routingFocus
                       return (
-                        <box key={`routing-${trigger || "new"}`} flexDirection="column" backgroundColor={focused ? "#00AAFF" : "transparent"} paddingLeft={1} flexShrink={0}>
-                          <text style={{ textColor: focused ? "#FFFFFF" : trigger ? "yellow" : "#7EE787" }}>{roles ? `${focused ? "> " : "  "}${callersLabel(routingView)} on ${trigger}${trigger.includes("/") ? "" : " (any model)"}` : `${focused ? "> " : "  "}+ New configuration`}</text>
-                          {roles && <text style={{ textColor: focused ? "#FFFFFF" : "gray" }}>{middleEllipsis(`    ${summarizeRoutingConfig(roles, routingView.related)}`, modelModalInnerWidth)}</text>}
+                        <box key={flow ? flow.key : "routing-new"} flexDirection="column" backgroundColor={focused ? "#00AAFF" : "transparent"} paddingLeft={1} flexShrink={0}>
+                          <text style={{ textColor: focused ? "#FFFFFF" : flow ? "yellow" : "#7EE787" }}>
+                            {middleEllipsis(
+                              flow
+                                ? `${focused ? "> " : "  "}IF ${flow.callers?.join(" or ") || callersLabel(routingView)} runs on ${formatTriggerLabel(flow.triggers)} [${flow.origin}]`
+                                : `${focused ? "> " : "  "}+ New conditional flow (IF / OR)`,
+                              modelModalInnerWidth,
+                            )}
+                          </text>
+                          {flow && <text style={{ textColor: focused ? "#FFFFFF" : "gray" }}>{middleEllipsis(`    ${summarizeUnifiedFlow(flow, routingView.related)}`, modelModalInnerWidth)}</text>}
                         </box>
                       )
                     })
-                  : routingDraft && [
-                      { role: "", label: `When ${routingView.callers.map(agent => agent.role).join("/")} runs on`, value: `${routingDraft.trigger}${routingDraft.trigger.includes("/") ? "" : " (any model)"}` },
-                      ...routingView.related.map(agent => ({ role: agent.role, label: agent.name, value: routingDraft.roles[agent.role] && routingDraft.roles[agent.role] !== INHERIT ? routingDraft.roles[agent.role] : INHERIT })),
-                    ].map((row, index) => {
-                      const focused = index === routingEditorFocus
-                      const selected = routingSelected.has(row.role)
-                      return (
-                        <box key={`routing-row-${index}`} flexDirection="row" backgroundColor={focused ? "#00AAFF" : "transparent"} paddingLeft={1} height={1} flexShrink={0} marginBottom={index === 0 ? 1 : 0}>
-                          <text style={{ textColor: focused ? "#FFFFFF" : index === 0 ? "yellow" : selected ? "green" : "#E1E4E8" }} width="40%">{index === 0 ? `${focused ? "> " : "  "}${row.label}` : `${selected ? "[x]" : "[ ]"} ${row.label}`}</text>
-                          <text style={{ textColor: focused ? "#FFFFFF" : row.value === INHERIT ? "gray" : "cyan" }}>{middleEllipsis(row.value === INHERIT ? "inherit (same model as the caller)" : row.value, Math.max(1, Math.floor(modelModalInnerWidth * 0.6)))}</text>
-                        </box>
-                      )
-                    })}
+                  : routingDraft && (() => {
+                      const toolsSummary = Object.entries(routingDraft.tools).map(([k, v]) => `${k}=${v}`).join(", ") || "unchanged (press U or ENTER to configure)"
+                      const permSummary = Object.entries(routingDraft.permissions).map(([k, v]) => `${k}=${v}`).join(", ") || "unchanged (press P or ENTER to configure)"
+                      const delSummary = Object.entries(routingDraft.delegations).map(([k, v]) => `${k}=${v}`).join(", ") || "unchanged (press G or ENTER to configure)"
+                      const editorRows = [
+                        { kind: "triggers" as const, role: "", label: `When ${routingView.callers.map(agent => agent.role).join("/")} runs on (OR)`, value: formatTriggerLabel(routingDraft.triggers) },
+                        ...routingView.related.map(agent => ({
+                          kind: "agent" as const,
+                          role: agent.role,
+                          label: agent.name,
+                          value: routingDraft.roles[agent.role] && routingDraft.roles[agent.role] !== INHERIT ? routingDraft.roles[agent.role] : INHERIT,
+                        })),
+                        { kind: "tools" as const, role: "", label: "Tools & MCP policy [U]", value: toolsSummary },
+                        { kind: "permissions" as const, role: "", label: "Permissions policy [P]", value: permSummary },
+                        { kind: "delegations" as const, role: "", label: "Subagent delegations [G]", value: delSummary },
+                      ]
+                      return editorRows.map((row, index) => {
+                        const focused = index === routingEditorFocus
+                        const selected = row.kind === "agent" && routingSelected.has(row.role)
+                        const leftText = row.kind === "agent"
+                          ? `${selected ? "[x]" : "[ ]"} ${row.label}`
+                          : `${focused ? "> " : "  "}${row.label}`
+                        const leftColor = focused ? "#FFFFFF" : row.kind === "triggers" ? "yellow" : row.kind !== "agent" ? "magenta" : selected ? "green" : "#E1E4E8"
+                        const rightColor = focused ? "#FFFFFF" : row.value === INHERIT || row.value.startsWith("unchanged") ? "gray" : "cyan"
+                        return (
+                          <box key={`routing-row-${index}`} flexDirection="row" backgroundColor={focused ? "#00AAFF" : "transparent"} paddingLeft={1} height={1} flexShrink={0} marginBottom={index === 0 ? 1 : 0} marginTop={row.kind === "tools" ? 1 : 0}>
+                            <text style={{ textColor: leftColor }} width="42%">{middleEllipsis(leftText, Math.max(10, Math.floor(modelModalInnerWidth * 0.41)))}</text>
+                            <text style={{ textColor: rightColor }}>{middleEllipsis(row.value === INHERIT ? "inherit (same model as caller)" : row.value, Math.max(10, Math.floor(modelModalInnerWidth * 0.56)))}</text>
+                          </box>
+                        )
+                      })
+                    })()}
               </box>
+              {routingStatus && <text style={{ textColor: routingStatus.startsWith("Error") ? "red" : "yellow" }} flexShrink={0}>{middleEllipsis(routingStatus, modelModalInnerWidth)}</text>}
+              <text style={{ textColor: "gray" }} flexShrink={0}>{middleEllipsis(
+                viewMode === "routing-configs"
+                  ? `[↑/↓] Select | [ENTER] Edit/New | [C] Callers (OR)${!isReadOnlyGitSource ? (routingView.hasManifest ? " | [W] Save to pack" : " | [I] Init pack") : ""} | [D] Delete | [ESC] Close`
+                  : "[SPACE/A] Select | [M/ENTER] Pick | [U] Tools | [P] Perms | [G] Delegations | [TAB/←/→] Variant | [ESC] Back",
+                modelModalInnerWidth,
+              )}</text>
             </>
           )}
-          {routingStatus && <text style={{ textColor: routingStatus.startsWith("Error") ? "red" : "yellow" }} flexShrink={0}>{middleEllipsis(routingStatus, modelModalInnerWidth)}</text>}
-          <text style={{ textColor: "gray" }} flexShrink={0}>{viewMode === "routing-configs"
-            ? "[↑/↓] Select | [ENTER] Edit / new | [D] Delete | [ESC] Close"
-            : "[SPACE] Select | [A] All | [M/ENTER] Model | [TAB/←/→] Variant | [BACKSPACE] Inherit | [ESC] Back · changes are saved at once"}</text>
+        </box>
+      )}
+
+      {/* Modal - Guided opencode-pack.json Initializer ([I] on virtual .md folder) */}
+      {viewMode === "pack-init" && (
+        <box
+          style={{ position: "absolute", left: "15%", top: "18%", width: "70%", height: "62%" }}
+          borderStyle="double"
+          borderColor="#7EE787"
+          backgroundColor="#1e1e1e"
+          title=" Initialize OpenCode Pack (opencode-pack.json) "
+          titleColor="#7EE787"
+          padding={1}
+          flexDirection="column"
+          justifyContent="space-between"
+          overflow="hidden"
+        >
+          <box flexDirection="column">
+            <text style={{ textColor: "white" }}>
+              {middleEllipsis(`Turn ${workspaceRoot} into a standard contract pack while keeping virtual mode compatible:`, Math.max(20, Math.floor(termWidth * 0.66)))}
+            </text>
+            <box flexDirection="row" marginTop={1} backgroundColor={initPackField === "name" ? "#2B5581" : "transparent"} paddingLeft={1}>
+              <text style={{ textColor: "yellow" }} width="32%">Pack Name:</text>
+              <text style={{ textColor: "white" }}>{`${initPackName}${initPackField === "name" ? "▏" : ""}`}</text>
+            </box>
+            <box flexDirection="row" marginTop={1} backgroundColor={initPackField === "version" ? "#2B5581" : "transparent"} paddingLeft={1}>
+              <text style={{ textColor: "yellow" }} width="32%">Semver Version:</text>
+              <text style={{ textColor: "white" }}>{`${initPackVersion}${initPackField === "version" ? "▏" : ""}`}</text>
+            </box>
+            <box flexDirection="row" marginTop={1} backgroundColor={initPackField === "desc" ? "#2B5581" : "transparent"} paddingLeft={1}>
+              <text style={{ textColor: "yellow" }} width="32%">Description:</text>
+              <text style={{ textColor: "white" }}>{middleEllipsis(`${initPackDesc}${initPackField === "desc" ? "▏" : ""}`, Math.max(16, Math.floor(termWidth * 0.42)))}</text>
+            </box>
+            <box flexDirection="row" marginTop={1} backgroundColor={initPackField === "organize" ? "#2B5581" : "transparent"} paddingLeft={1}>
+              <text style={{ textColor: "yellow" }} width="32%">Organize Layout:</text>
+              <text style={{ textColor: initPackOrganize ? "green" : "gray" }}>
+                {`${initPackOrganize ? "[x]" : "[ ]"} Move loose .md agents into agents/ & normalize V2 frontmatter`}
+              </text>
+            </box>
+          </box>
+          <box borderStyle="single" border={["top"]} borderColor="#333333" paddingTop={1}>
+            <text style={{ textColor: "gray" }}>[TAB/↑/↓] Next field | [SPACE] Toggle organize | [ENTER] Create opencode-pack.json | [ESC] Cancel</text>
+          </box>
         </box>
       )}
 
@@ -3336,6 +4397,138 @@ export function App({ workspaceRoot, listShare = 2 / 3, uiConfigWarning, configR
           </box>
         </box>
       )}
+
+      {/* Modal - Data Sources (GitHub & Local) */}
+      {viewMode === "sources" && (() => {
+        const innerWidth = Math.max(20, Math.floor(termWidth * 0.88) - 6)
+        const visibleSourceRows = sourceModalRows.slice(sourcesScrollOffset, sourcesScrollOffset + maxVisibleSourceRows)
+        const ghLine = !ghAuth
+          ? "GitHub CLI (gh): checking status..."
+          : ghAuth.authenticated
+            ? `✓ GitHub CLI: authenticated on ${ghAuth.host}${ghAuth.login ? ` as ${ghAuth.login}` : ""} (${ghRepos.length} repos)`
+            : ghAuth.available
+              ? `⚠ GitHub CLI: ${ghAuth.message} — press [G] to log in via browser`
+              : `⚠ ${ghAuth.message}`
+        const ghColor = ghAuth?.authenticated ? "#2ECC71" : "yellow"
+        const inputDisplay = sourcesQuery
+          ? `${sourcesQuery}${sourcesInputFocused ? "█" : ""}`
+          : sourcesInputFocused
+            ? "█"
+            : "owner/repo[#ref], https://...git, or /local/path  (press [A] or [/] to type)"
+
+        return (
+          <box
+            style={{
+              position: "absolute",
+              left: "6%",
+              top: "8%",
+              width: "88%",
+              height: "84%"
+            }}
+            borderStyle="double"
+            borderColor="#9ECBFF"
+            backgroundColor="#1e1e1e"
+            title=" Data Sources (GitHub & Local) "
+            titleColor="#9ECBFF"
+            padding={1}
+            flexDirection="column"
+            justifyContent="space-between"
+            overflow="hidden"
+          >
+            <box flexDirection="column" flexGrow={1} overflow="hidden">
+              <text width="100%" height={1} wrapMode="none" overflow="hidden" style={{ textColor: ghColor }} b>
+                {middleEllipsis(terminalSafeText(ghLine), innerWidth)}
+              </text>
+
+              <box
+                width="100%"
+                height={3}
+                marginTop={1}
+                borderStyle="single"
+                borderColor={sourcesInputFocused ? "cyan" : "#444444"}
+                title={sourcesInputFocused ? " Connect or Filter (typing) " : " Connect or Filter "}
+                titleColor={sourcesInputFocused ? "cyan" : "gray"}
+                paddingLeft={1}
+                paddingRight={1}
+                overflow="hidden"
+              >
+                <text width="100%" height={1} wrapMode="none" overflow="hidden" style={{ textColor: sourcesQuery || sourcesInputFocused ? "white" : "gray" }}>
+                  {middleEllipsis(terminalSafeText(inputDisplay), Math.max(10, innerWidth - 4))}
+                </text>
+              </box>
+
+              <box flexDirection="column" marginTop={1} flexGrow={1} overflow="hidden">
+                {sourceModalRows.length === 0 ? (
+                  <box flexDirection="column">
+                    <text style={{ textColor: "yellow" }}>
+                      No registered sources or GitHub repositories listed yet.
+                    </text>
+                    <text style={{ textColor: "gray" }} marginTop={1}>
+                      Press [G] to sign in with GitHub CLI, or press [A] and type owner/repo (e.g. lorecanc/agents) or a local folder path.
+                    </text>
+                  </box>
+                ) : (
+                  visibleSourceRows.map((row, idx) => {
+                    const globalIdx = sourcesScrollOffset + idx
+                    const focused = globalIdx === sourcesFocusIndex
+                    const bg = focused ? "#2B5581" : "transparent"
+                    let line = ""
+                    let color = "#E1E4E8"
+                    if (row.kind === "connect-input") {
+                      line = `+ Attach "${row.spec}"`
+                      color = focused ? "#FFFFFF" : "#2ECC71"
+                    } else if (row.kind === "registered") {
+                      const mark = row.isActive ? "★" : "●"
+                      const trustTag = row.source.trusted ? "trusted" : "untrusted"
+                      const loc = row.source.kind === "local"
+                        ? formatDisplayPath(row.source.path)
+                        : `${row.source.url.replace(/^https?:\/\/github\.com\//i, "github.com/").replace(/\.git$/i, "")}${row.source.ref ? `#${row.source.ref}` : ""} (${row.revision ? row.revision.slice(0, 7) : "not pulled"})`
+                      line = `${mark} [source] ${row.source.name}  [${row.source.kind} · ${trustTag}]  ${loc}`
+                      color = focused ? "#FFFFFF" : row.isActive ? "#9ECBFF" : "yellow"
+                    } else {
+                      const vis = row.repo.isPrivate ? "private" : "public"
+                      const desc = row.repo.description ? ` · ${row.repo.description}` : ""
+                      line = `  [gh]     ${row.repo.nameWithOwner}  [${vis}]${desc}`
+                      color = focused ? "#FFFFFF" : "#E1E4E8"
+                    }
+                    return (
+                      <box key={row.id} width="100%" height={1} backgroundColor={bg} paddingLeft={1} overflow="hidden" flexShrink={0}>
+                        <text width="100%" height={1} wrapMode="none" overflow="hidden" style={{ textColor: color }}>
+                          {middleEllipsis(terminalSafeText(line), Math.max(10, innerWidth - 2))}
+                        </text>
+                      </box>
+                    )
+                  })
+                )}
+              </box>
+            </box>
+
+            <box flexDirection="column" borderStyle="single" border={["top"]} borderColor="#333333" paddingTop={1} flexShrink={0} overflow="hidden">
+              {sourcesStatus !== "" && (
+                <text width="100%" height={1} wrapMode="none" overflow="hidden" style={{ textColor: "yellow" }}>
+                  {middleEllipsis(terminalSafeText(sourcesStatus), innerWidth)}
+                </text>
+              )}
+              <text width="100%" height={1} wrapMode="none" overflow="hidden" style={{ textColor: "#2ECC71" }}>
+                {middleEllipsis(
+                  sourcesInputFocused
+                    ? "[ENTER] Attach/Open selected | [↑/↓] Choose row"
+                    : "[ENTER] Open/Attach | [A /] Type repo or path | [G] gh Login",
+                  innerWidth
+                )}
+              </text>
+              <text width="100%" height={1} wrapMode="none" overflow="hidden" style={{ textColor: "gray" }}>
+                {middleEllipsis(
+                  sourcesInputFocused
+                    ? "[CTRL+G] gh Login | [ESC] Done typing"
+                    : "[P] Pull/Refresh | [T] Trust | [X] Remove | [ESC] Back",
+                  innerWidth
+                )}
+              </text>
+            </box>
+          </box>
+        )
+      })()}
 
       {/* Modal - Action Result */}
       {viewMode === "action-result" && (

@@ -3,11 +3,11 @@ import { builtinModules } from "node:module"
 import path from "node:path"
 import semver from "semver"
 import YAML from "yaml"
-import { isModelRef, isTrigger } from "./values.js"
+import { isModelRef, isTrigger, validateConditionalRule, type ConditionalRule } from "./values.js"
 import { extractFrontmatter } from "./agents.js"
 
 /** Pack contract implemented by this engine (contract/CONTRACT.md). */
-export const CONTRACT_VERSION = { major: 1, minor: 0 } as const
+export const CONTRACT_VERSION = { major: 1, minor: 1 } as const
 export const MANIFEST_FILE = "opencode-pack.json"
 
 export interface PackManifest {
@@ -18,6 +18,7 @@ export interface PackManifest {
   requires: Record<string, string>
   archetype?: { callers: string[]; reference: string }
   routingDefaults?: Record<string, Record<string, string>>
+  flowDefaults?: ConditionalRule[]
 }
 
 export interface PackAgent {
@@ -58,6 +59,11 @@ export interface PackIssue {
   message: string
 }
 
+export interface VirtualFileEntry {
+  sourceRel: string
+  content?: Buffer
+}
+
 export interface PackValidation {
   root: string
   manifest: PackManifest | null
@@ -67,6 +73,8 @@ export interface PackValidation {
   executable: ExecutableSurface
   unresolved: UnresolvedReference[]
   issues: PackIssue[]
+  /** Present on virtual packs (folders of .md agents without opencode-pack.json): maps canonical rel -> source file/bytes. */
+  virtualFiles?: Record<string, VirtualFileEntry>
 }
 
 export interface ValidatePackOptions {
@@ -75,8 +83,10 @@ export interface ValidatePackOptions {
 }
 
 export const PACK_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/
+export const DISCOVERY_DEPTH = 4
+export const SKIPPED_DIRS = new Set([".git", "node_modules"])
 const CONTRACT_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)$/
-const MANIFEST_KEYS = new Set(["$schema", "contract", "name", "version", "description", "requires", "archetype", "routingDefaults"])
+const MANIFEST_KEYS = new Set(["$schema", "contract", "name", "version", "description", "requires", "archetype", "routingDefaults", "flowDefaults"])
 const ROOT_FILE_RE = /^(?:opencode-pack\.json|opencode\.jsonc?|AGENTS\.md|(?:README|LICENSE|LICENCE|CHANGELOG)(?:\.(?:md|txt|rst))?)$/i
 const NATIVE_DIRS = new Set(["agents", "commands", "skills", "plugins", "themes", "tools"])
 const LEGACY_DIRS = new Map([["agent", "agents"], ["mode", "agents"], ["modes", "agents"], ["command", "commands"], ["skill", "skills"], ["plugin", "plugins"], ["tool", "tools"]])
@@ -262,8 +272,32 @@ function readManifest(root: string, issues: PackIssue[], options: ValidatePackOp
     }
   }
 
+  let flowDefaults: PackManifest["flowDefaults"]
+  if (raw.flowDefaults !== undefined) {
+    if (Number(contract[2]) < 1) error('"flowDefaults" requires contract "1.1" or newer')
+    else if (raw.archetype === undefined) error('"flowDefaults" requires "archetype"')
+    else if (!Array.isArray(raw.flowDefaults)) error('"flowDefaults" must be a list of conditional rules')
+    else {
+      flowDefaults = []
+      raw.flowDefaults.forEach((entry, index) => {
+        const { rule, error: ruleErr } = validateConditionalRule(entry, `flowDefaults[${index}]`)
+        if (ruleErr) error(ruleErr)
+        else if (rule) flowDefaults!.push(rule)
+      })
+    }
+  }
+
   if (issues.some(issue => issue.level === "error" && issue.path === MANIFEST_FILE)) return null
-  return { contract: raw.contract as string, name: name as string, version: raw.version as string, description: raw.description as string, requires, ...(archetype ? { archetype } : {}), ...(routingDefaults ? { routingDefaults } : {}) }
+  return {
+    contract: raw.contract as string,
+    name: name as string,
+    version: raw.version as string,
+    description: raw.description as string,
+    requires,
+    ...(archetype ? { archetype } : {}),
+    ...(routingDefaults ? { routingDefaults } : {}),
+    ...(flowDefaults ? { flowDefaults } : {}),
+  }
 }
 
 /** Reads only the manifest, for discovery; `validatePack` does the full check. */
@@ -528,6 +562,24 @@ function checkArchetype(manifest: PackManifest, result: PackValidation) {
       else if (agent.model) result.issues.push({ level: "warning", code: "archetype-pinned", path: MANIFEST_FILE, message: `routingDefaults.${trigger}: "${id}" has a fixed model and is not routed` })
     }
   }
+  ;(manifest.flowDefaults ?? []).forEach((rule, index) => {
+    for (const caller of rule.callers ?? []) {
+      const agent = byId.get(caller)
+      if (!agent) error(`flowDefaults[${index}]: caller "${caller}" is not an agent of this pack`)
+      else if (agent.mode === "subagent") error(`flowDefaults[${index}]: caller "${caller}" is a subagent; callers must be primary agents`)
+    }
+    const ruleCallers = rule.callers ?? manifest.archetype?.callers ?? []
+    for (const id of Object.keys(rule.then.models ?? {})) {
+      const agent = byId.get(id)
+      if (!agent || ruleCallers.includes(id) || agent.mode === "primary") error(`flowDefaults[${index}].then.models: "${id}" is not a subagent of this pack`)
+      else if (agent.model) result.issues.push({ level: "warning", code: "archetype-pinned", path: MANIFEST_FILE, message: `flowDefaults[${index}].then.models: "${id}" has a fixed model and is not routed` })
+    }
+    for (const id of Object.keys(rule.then.delegations ?? {})) {
+      if (id === "*") continue
+      const agent = byId.get(id)
+      if (!agent || ruleCallers.includes(id) || agent.mode === "primary") error(`flowDefaults[${index}].then.delegations: "${id}" is not a subagent of this pack`)
+    }
+  })
 }
 
 export const hasErrors = (validation: PackValidation) => validation.issues.some(issue => issue.level === "error")

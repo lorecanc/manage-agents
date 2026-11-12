@@ -22,11 +22,16 @@ import { AUTO_COMMIT_MESSAGES, isRepositoryLocalPath, repositoryTransaction, par
 import { loadUiConfig } from "./utils/uiConfig.js"
 import { hasErrors, MANIFEST_FILE, PACK_NAME_RE, validatePack, type PackValidation } from "./utils/packs.js"
 import { packDir, packsDir, readManifest } from "./utils/catalog.js"
-import { addSource, discoverAllPacks, findSource, loadSources, pullSource, removeSource, saveSources, sourceRevision } from "./utils/sources.js"
+import { addSource, deriveSourceName, discoverAllPacks, findSource, loadSources, pullSource, removeSource, saveSources, sourceRevision, sourceRoot, type Source } from "./utils/sources.js"
+import { inspectGhAuth, runGhWebLogin } from "./utils/github.js"
 import { describeExecutable, parsePackRequest, resolvePacks } from "./utils/resolver.js"
 import { buildLock, confirmationsNeeded, defaultTarget, diffLocks, readLock } from "./utils/lock.js"
 import { changeTarget, installChange, reconcileChange, restoreBackup, targetStatus, uninstallChange, updateChange, type ChangeResult } from "./utils/installer.js"
-import { loadOverrideSettings, loadRoutingSettings, saveOverrideSettings, saveRoutingSettings, scopeOf, setOverride, setRoutes, unsetOverride, unsetRoutes } from "./utils/userSettings.js"
+import { exportFlowsToPackManifest } from "./utils/archetypes.js"
+import { describeConfiguredPackFlows } from "./utils/sourceCustomization.js"
+import { loadOverrideSettings, loadRoutingSettings, saveOverrideSettings, saveRoutingSettings, scopeOf, setOverride, setPackCallers, setPackRules, setRoutes, unsetOverride, unsetRoutes } from "./utils/userSettings.js"
+import { parseTriggerList, validateConditionalRule, type ConditionalPolicy, type DelegationEffect, type PolicyEffect } from "./utils/values.js"
+import { initPackManifest, isVirtualPackRoot } from "./utils/virtualPacks.js"
 import YAML from "yaml"
 import { isPathInsideWorkspace, realpathThroughExistingAncestor } from "./utils/pathValidation.js"
 import { terminalSafeText } from "./utils/terminalText.js"
@@ -734,15 +739,36 @@ function printPackValidation(validation: PackValidation) {
 
 function runPackCLI() {
   const [action, ...rest] = process.argv.slice(3)
-  if ((action !== "validate" && action !== "list") || rest.includes("--help") || rest.includes("-h")) {
+  if ((action !== "validate" && action !== "list" && action !== "init") || rest.includes("--help") || rest.includes("-h")) {
     console.log("Usage: manage-agents pack validate <pack-dir>... [--json] [--git]")
     console.log("       manage-agents pack list [--json]")
-    console.log("validate checks directories against the OpenCode pack contract (manage-agents/contract/CONTRACT.md); --git applies the rules for git sources. list shows the packs offered by the registered sources.")
-    if (action !== "validate" && action !== "list" && action !== "--help" && action !== "-h") process.exitCode = 2
+    console.log("       manage-agents pack init [<dir>] [--name <slug>] [--version <semver>] [--description <text>] [--no-organize] [--json]")
+    console.log("validate checks directories against the OpenCode pack contract (manage-agents/contract/CONTRACT.md); list shows packs from registered sources; init generates opencode-pack.json for a folder of .md agents.")
+    if (action !== "validate" && action !== "list" && action !== "init" && action !== "--help" && action !== "-h") process.exitCode = 2
     return
   }
-  const parsed = parseCliArgs(rest, [], action === "validate" ? ["--json", "--git"] : ["--json"])
+  const valued = action === "init" ? ["--name", "--version", "--description"] : []
+  const booleans = action === "validate" ? ["--json", "--git"] : action === "init" ? ["--json", "--no-organize"] : ["--json"]
+  const parsed = parseCliArgs(rest, valued, booleans)
   if (typeof parsed === "string") return cliError(parsed)
+  if (action === "init") {
+    try {
+      const targetDir = path.resolve(parsed.positional[0] ?? process.cwd())
+      const result = initPackManifest(targetDir, {
+        name: parsed.values["--name"],
+        version: parsed.values["--version"],
+        description: parsed.values["--description"],
+        organize: !parsed.flags.has("--no-organize"),
+      })
+      if (parsed.flags.has("--json")) return printJson(result)
+      console.log(`Initialized pack "${terminalSafeText(result.manifest.name)}"@${terminalSafeText(result.manifest.version)} at ${terminalSafeText(result.manifestPath)}`)
+      for (const moved of result.movedAgents) console.log(`  moved ${terminalSafeText(moved.from)} -> ${terminalSafeText(moved.to)}`)
+      for (const warning of result.warnings) console.log(`  ${terminalSafeText(warning)}`)
+    } catch (error) {
+      cliError(error instanceof Error ? error.message : String(error), 1)
+    }
+    return
+  }
   if (action === "list") {
     const { candidates, problems } = discoverAllPacks(loadSources())
     if (parsed.flags.has("--json")) return printJson({ packs: candidates.map(({ manifest, ...candidate }) => ({ ...candidate, name: manifest.name, version: manifest.version, description: manifest.description, requires: manifest.requires })), problems })
@@ -760,9 +786,12 @@ function runPackCLI() {
 
 const SOURCE_USAGE = `Usage: manage-agents source <command>
   list [--json]                                   registered sources
-  add <name> <dir|git-url> [--ref <ref>] [--trust]  register a local directory or a git repository (https:, ssh:, git@host:path)
+  add [<name>] <dir|git-url|owner/repo[#ref]> [--ref <ref>] [--trust] [--pull]
+                                                  register a local directory, git URL or GitHub repo
   remove <name>
   pull [<name>...]                                clone or fetch git sources into the cache (default: all)
+  login [--hostname <host>]                       authenticate GitHub CLI (gh auth login --web)
+  auth [--hostname <host>] [--json]               show GitHub CLI authentication status
   trust <name> | untrust <name>                   allow installing executable content from the source without asking
   prefer <pack> <source> | prefer <pack> --clear  which source to use when several offer the same pack
 Sources live in $XDG_CONFIG_HOME/manage-agents/sources.json; git checkouts in $XDG_CACHE_HOME/manage-agents/sources/.`
@@ -774,7 +803,9 @@ function runSourceCLI() {
     if (!action) process.exitCode = 2
     return
   }
-  const parsed = parseCliArgs(rest, action === "add" ? ["--ref"] : [], action === "add" ? ["--trust"] : action === "list" ? ["--json"] : action === "prefer" ? ["--clear"] : [])
+  const valueFlags = action === "add" ? ["--ref"] : action === "login" || action === "auth" ? ["--hostname"] : []
+  const boolFlags = action === "add" ? ["--trust", "--pull"] : action === "list" || action === "auth" ? ["--json"] : action === "prefer" ? ["--clear"] : []
+  const parsed = parseCliArgs(rest, valueFlags, boolFlags)
   if (typeof parsed === "string") return cliError(parsed)
   const [first, second] = parsed.positional
   try {
@@ -782,19 +813,43 @@ function runSourceCLI() {
     const safe = terminalSafeText
     if (action === "list") {
       if (parsed.flags.has("--json")) return printJson(registry)
-      if (!registry.sources.length) console.log("No sources. Add one with `manage-agents source add <name> <dir|git-url>`.")
+      if (!registry.sources.length) console.log("No sources. Add one with `manage-agents source add [<name>] <dir|git-url|owner/repo>`.")
       for (const source of registry.sources) {
+        const activeMark = registry.active === source.name ? "* " : "  "
         const location = source.kind === "local" ? source.path : `${source.url}${source.ref ? `#${source.ref}` : ""} (${sourceRevision(source)?.slice(0, 12) ?? "not pulled"})`
-        console.log(`${safe(source.name)}  ${source.kind}  ${source.trusted ? "trusted" : "untrusted"}  ${safe(location)}`)
+        console.log(`${activeMark}${safe(source.name)}  ${source.kind}  ${source.trusted ? "trusted" : "untrusted"}  ${safe(location)}`)
       }
       for (const [pack, source] of Object.entries(registry.prefer)) console.log(`prefer ${safe(pack)} from ${safe(source)}`)
       return
     }
     if (action === "add") {
-      if (!first || !second || parsed.positional.length > 2) return cliError("usage: source add <name> <dir|git-url> [--ref <ref>] [--trust]")
-      const source = addSource(registry, first, second, { ref: parsed.values["--ref"], trusted: parsed.flags.has("--trust") })
+      if (!first || parsed.positional.length > 2) return cliError("usage: source add [<name>] <dir|git-url|owner/repo[#ref]> [--ref <ref>] [--trust] [--pull]")
+      const name = second ? first : deriveSourceName(first, registry)
+      const location = second ?? first
+      const source = addSource(registry, name, location, { ref: parsed.values["--ref"], trusted: parsed.flags.has("--trust") })
+      if (!registry.active) registry.active = source.name
       saveSources(registry)
-      console.log(`Added ${source.kind} source ${safe(source.name)}${source.trusted ? " (trusted)" : ""}.${source.kind === "git" ? ` Fetch it with \`manage-agents source pull ${source.name}\`.` : ""}`)
+      if (source.kind === "git" && parsed.flags.has("--pull")) {
+        const commit = pullSource(source)
+        console.log(`Added and pulled ${source.kind} source ${safe(source.name)}${source.trusted ? " (trusted)" : ""} (${commit?.slice(0, 12) ?? "ok"}).`)
+      } else {
+        console.log(`Added ${source.kind} source ${safe(source.name)}${source.trusted ? " (trusted)" : ""}.${source.kind === "git" ? ` Fetch it with \`manage-agents source pull ${source.name}\`.` : ""}`)
+      }
+      return
+    }
+    if (action === "login") {
+      const host = parsed.values["--hostname"] ?? "github.com"
+      const outcome = runGhWebLogin(host)
+      if (!outcome.ok) return cliError(outcome.message, 1)
+      console.log(safe(outcome.message))
+      return
+    }
+    if (action === "auth") {
+      const host = parsed.values["--hostname"] ?? "github.com"
+      const status = inspectGhAuth(host)
+      if (parsed.flags.has("--json")) return printJson(status)
+      console.log(safe(status.message))
+      if (!status.authenticated) process.exitCode = 1
       return
     }
     if (action === "remove") {
@@ -962,11 +1017,18 @@ async function runTargetCLI(command: "install" | "uninstall" | "update" | "recon
   }
 }
 
-const SETTINGS_USAGE = `Usage (user settings applied at reconcile; never written into packs):
+const SETTINGS_USAGE = `Usage (user settings applied at reconcile; never written into packs unless exported):
   models show [--json]
-  models set <pack> <trigger> <agent>=<provider/model[#variant]|inherit>...
-                     when a caller of archetype <pack> runs on <trigger> (a provider, or provider/model), route its subagents
-  models unset <pack> <trigger> [<agent>...]
+  models set <pack> <trigger[,trigger2...]> <agent>=<provider/model[#variant]|inherit>...
+                     when a caller of <pack> runs on any trigger ("*", provider, or provider/model), route its subagents
+  models unset <pack> <trigger[,trigger2...]> [<agent>...]
+  models callers <pack> [<caller>...] [--unset]
+                     configure or clear OR caller agents for <pack> in routing.json (works even without manifest archetype)
+  models rule-set <pack> <trigger[,trigger2...]> [--callers <a,b>] [--model <sub=m>]... [--tool <k=allow|ask|deny>]...
+                     [--perm <action=allow|ask|deny>]... [--delegate <sub=allow|deny>]... [--index <n>]
+  models rule-unset <pack> [<index|all>]
+  models export-pack <pack> [--dir <workspace-or-pack-dir>]
+                     write effective callers, routingDefaults and flowDefaults into local <pack>/opencode-pack.json
   models pin <pack>/<agent> <provider/model[#variant]>
                      give a subagent a fixed model: routing skips it (writes the override "model")
   models unpin <pack>/<agent>
@@ -1001,7 +1063,21 @@ async function runSettingsCLI(command: "models" | "override") {
     if (!action) process.exitCode = 2
     return
   }
-  const parsed = parseCliArgs(rest, ["--target"], ["--global", "--no-reconcile", "--yes", "--json", ...(command === "override" ? ["--command"] : [])])
+  const multiFlags = command === "models" && action === "rule-set" ? new Set(["--model", "--tool", "--perm", "--delegate"]) : new Set<string>()
+  const collectedMulti: Record<string, string[]> = {}
+  const filteredRest: string[] = []
+  for (let i = 0; i < rest.length; i++) {
+    const token = rest[i]
+    if (multiFlags.has(token)) {
+      if (rest[i + 1] === undefined || rest[i + 1].startsWith("--")) return cliError(`${token} needs a value\n${SETTINGS_USAGE}`)
+      ;(collectedMulti[token] ??= []).push(...rest[++i].split(",").map(s => s.trim()).filter(Boolean))
+    } else {
+      filteredRest.push(token)
+    }
+  }
+  const valued = ["--target", ...(command === "models" ? ["--callers", "--index", "--dir"] : [])]
+  const booleans = ["--global", "--no-reconcile", "--yes", "--json", ...(command === "override" ? ["--command"] : ["--unset"])]
+  const parsed = parseCliArgs(filteredRest, valued, booleans)
   if (typeof parsed === "string") return cliError(`${parsed}\n${SETTINGS_USAGE}`)
   try {
     const target = realpathThroughExistingAncestor(path.resolve(parsed.values["--target"] ?? defaultTarget()))
@@ -1016,13 +1092,22 @@ async function runSettingsCLI(command: "models" | "override") {
       if (parsed.flags.has("--json")) return printJson(command === "models" ? { ...view, installed } : view)
       console.log(`Settings for every target:\n${JSON.stringify(view.default, null, 2)}`)
       console.log(`Settings for ${terminalSafeText(target)} (win over the above):\n${JSON.stringify(view.target, null, 2)}`)
-      if (command === "models") console.log(installed ? `Installed routing (packs' defaults + settings):\n${JSON.stringify(installed.archetypes, null, 2)}` : "No archetype pack is installed in this target.")
+      if (command === "models") console.log(installed ? `Installed routing (packs' defaults + settings):\n${JSON.stringify(installed.archetypes, null, 2)}` : "No archetype or conditional flow is active in this target.")
+      return
+    }
+    if (command === "models" && action === "export-pack") {
+      if (!first) return cliError(`usage: models export-pack <pack> [--dir <workspace-or-pack-dir>]\n${SETTINGS_USAGE}`)
+      const wsRoot = parsed.values["--dir"] ? path.resolve(parsed.values["--dir"]) : (findWorkspace(process.cwd()) ?? process.cwd())
+      const flowView = describeConfiguredPackFlows(wsRoot, first, { target })
+      if (!flowView) return cliError(`pack "${first}" was not found in ${terminalSafeText(wsRoot)}`, 1)
+      const manifestPath = exportFlowsToPackManifest(wsRoot, flowView)
+      console.log(`Exported callers and conditional flows of ${terminalSafeText(first)} to ${terminalSafeText(manifestPath)}.`)
       return
     }
     let message: string
     if (command === "models") {
       if (action === "set" || action === "unset") {
-        if (!first || !others.length && action === "set") return cliError(`usage: models ${action} <pack> <trigger> ...\n${SETTINGS_USAGE}`)
+        if (!first || (!others.length && action === "set")) return cliError(`usage: models ${action} <pack> <trigger> ...\n${SETTINGS_USAGE}`)
         const [trigger, ...assignments] = others
         const settings = loadRoutingSettings()
         const scope = scopeOf(settings, scopeTarget)
@@ -1030,6 +1115,58 @@ async function runSettingsCLI(command: "models" | "override") {
         else if (!unsetRoutes(scope, first, trigger ?? "", assignments)) return cliError(`no routing for ${first} ${trigger ?? ""} in ${scopeLabel}`, 1)
         saveRoutingSettings(settings)
         message = `Routing of ${terminalSafeText(first)} for ${terminalSafeText(trigger)} updated for ${scopeLabel}.`
+      } else if (action === "callers") {
+        if (!first || (!parsed.flags.has("--unset") && !others.length)) {
+          return cliError(`usage: models callers <pack> <caller>... | models callers <pack> --unset\n${SETTINGS_USAGE}`)
+        }
+        const settings = loadRoutingSettings()
+        const scope = scopeOf(settings, scopeTarget)
+        const callers = parsed.flags.has("--unset") ? null : others.flatMap(item => item.split(",").map(s => s.trim()).filter(Boolean))
+        const changed = setPackCallers(scope, first, callers)
+        if (!changed && callers === null) return cliError(`no custom callers set for ${first} in ${scopeLabel}`, 1)
+        saveRoutingSettings(settings)
+        message = callers ? `Callers (OR) of ${terminalSafeText(first)} set to [${callers.map(terminalSafeText).join(", ")}] for ${scopeLabel}.` : `Custom callers of ${terminalSafeText(first)} cleared for ${scopeLabel}.`
+      } else if (action === "rule-set") {
+        if (!first || !others[0]) return cliError(`usage: models rule-set <pack> <trigger[,trigger2...]> [--model ...] [--tool ...] [--perm ...] [--delegate ...]\n${SETTINGS_USAGE}`)
+        const triggers = parseTriggerList(others[0])
+        const callers = parsed.values["--callers"] ? parsed.values["--callers"].split(",").map(s => s.trim()).filter(Boolean) : undefined
+        const then: ConditionalPolicy = {}
+        if (collectedMulti["--model"]?.length) then.models = parseAssignments(collectedMulti["--model"], raw => raw) as Record<string, string>
+        if (collectedMulti["--tool"]?.length) then.tools = parseAssignments(collectedMulti["--tool"], raw => raw) as Record<string, PolicyEffect>
+        if (collectedMulti["--perm"]?.length) then.permissions = parseAssignments(collectedMulti["--perm"], raw => raw) as Record<string, PolicyEffect>
+        if (collectedMulti["--delegate"]?.length) then.delegations = parseAssignments(collectedMulti["--delegate"], raw => raw) as Record<string, DelegationEffect>
+        const { rule, error: ruleErr } = validateConditionalRule({ ...(callers?.length ? { callers } : {}), triggers, then }, `${first}`)
+        if (ruleErr || !rule) return cliError(ruleErr ?? "invalid rule", 1)
+        const settings = loadRoutingSettings()
+        const scope = scopeOf(settings, scopeTarget)
+        const existing = [...(scope[first]?.$rules ?? [])]
+        if (parsed.values["--index"] !== undefined) {
+          const idx = Number(parsed.values["--index"])
+          if (!Number.isInteger(idx) || idx < 0 || idx > existing.length) return cliError(`invalid --index ${parsed.values["--index"]} (0..${existing.length})`, 1)
+          existing[idx] = rule
+        } else {
+          existing.push(rule)
+        }
+        setPackRules(scope, first, existing)
+        saveRoutingSettings(settings)
+        message = `Conditional flow of ${terminalSafeText(first)} on [${triggers.map(terminalSafeText).join(" OR ")}] saved for ${scopeLabel}.`
+      } else if (action === "rule-unset") {
+        if (!first) return cliError(`usage: models rule-unset <pack> [<index|all>]\n${SETTINGS_USAGE}`)
+        const which = others[0] ?? "all"
+        const settings = loadRoutingSettings()
+        const scope = scopeOf(settings, scopeTarget)
+        const existing = [...(scope[first]?.$rules ?? [])]
+        if (!existing.length) return cliError(`no conditional rules for ${first} in ${scopeLabel}`, 1)
+        if (which === "all") {
+          setPackRules(scope, first, null)
+        } else {
+          const idx = Number(which)
+          if (!Number.isInteger(idx) || idx < 0 || idx >= existing.length) return cliError(`invalid rule index "${which}" (0..${existing.length - 1})`, 1)
+          existing.splice(idx, 1)
+          setPackRules(scope, first, existing)
+        }
+        saveRoutingSettings(settings)
+        message = `Conditional rule(s) of ${terminalSafeText(first)} updated for ${scopeLabel}.`
       } else if (action === "pin" || action === "unpin") {
         if (!first || (action === "pin" ? others.length !== 1 : others.length)) return cliError(`usage: models ${action} <pack>/<agent>${action === "pin" ? " <provider/model[#variant]>" : ""}`)
         const [pack, agent] = splitPackId(first)
@@ -1064,12 +1201,14 @@ async function runSettingsCLI(command: "models" | "override") {
 
 /** The pack catalog (a directory with packs/<name>/opencode-pack.json) or single pack the agent commands and the TUI edit. */
 export function findWorkspace(start: string): string | null {
-  for (let dir = path.resolve(start); ; dir = path.dirname(dir)) {
+  const resolvedStart = path.resolve(start)
+  for (let dir = resolvedStart; ; dir = path.dirname(dir)) {
     const packs = path.join(dir, "packs")
     if (fs.existsSync(packs) && fs.readdirSync(packs).some(name => fs.existsSync(path.join(packs, name, "opencode-pack.json")))) return dir
     if (fs.existsSync(path.join(dir, "opencode-pack.json"))) return dir
-    if (path.dirname(dir) === dir) return null
+    if (path.dirname(dir) === dir) break
   }
+  return isVirtualPackRoot(resolvedStart) ? resolvedStart : null
 }
 
 const COMMANDS = ["pack", "source", "resolve", "install", "uninstall", "update", "reconcile", "status", "restore", "models", "override", "create", "lint", "fix-names", "audit", "tune", "bridge"]
@@ -1089,12 +1228,15 @@ async function run() {
   const workspaceFlag = process.argv.indexOf("--workspace")
   const explicitWorkspace = workspaceFlag === -1 ? process.env.MANAGE_AGENTS_WORKSPACE : process.argv[workspaceFlag + 1]
   if (workspaceFlag !== -1) process.argv.splice(workspaceFlag, 2)
+  const sourceFlag = process.argv.indexOf("--source")
+  const explicitSource = sourceFlag === -1 ? undefined : process.argv[sourceFlag + 1]
+  if (sourceFlag !== -1) process.argv.splice(sourceFlag, 2)
   const command = process.argv[2]
 
   if (command === "--help" || command === "-h") {
-    console.log("Usage: manage-agents [<command>] [options] [--workspace <catalog-or-pack-dir>]")
-    console.log(`Commands: ${COMMANDS.join(", ")}. Without a command the TUI opens on the workspace.`)
-    console.log("The workspace (for create, lint, fix-names, audit, tune, bridge and the TUI) is --workspace, $MANAGE_AGENTS_WORKSPACE, or the nearest pack catalog or pack above the current directory.")
+    console.log("Usage: manage-agents [<command>] [options] [--workspace <catalog-or-pack-dir>] [--source <registered-source>]")
+    console.log(`Commands: ${COMMANDS.join(", ")}. Without a command the TUI opens on the workspace, active source, or Data Sources screen.`)
+    console.log("The workspace (for create, lint, fix-names, audit, tune, bridge) is --workspace, $MANAGE_AGENTS_WORKSPACE, or the nearest pack catalog or pack above the current directory.")
     return
   }
   if (command === "pack") return runPackCLI()
@@ -1104,11 +1246,69 @@ async function run() {
   if (command === "install" || command === "uninstall" || command === "update" || command === "reconcile" || command === "status" || command === "restore") return runTargetCLI(command)
   if (command && !command.startsWith("-") && !WORKSPACE_COMMANDS[command]) return cliError(`unknown command ${terminalSafeText(command)}; run manage-agents --help`)
 
-  const workspaceRoot = explicitWorkspace ? path.resolve(explicitWorkspace) : findWorkspace(process.cwd())
-  if (!workspaceRoot || findWorkspace(workspaceRoot) !== workspaceRoot) {
-    return cliError(`no pack catalog or pack found${explicitWorkspace ? ` at ${terminalSafeText(explicitWorkspace)}` : " above the current directory"}; pass --workspace <dir> (a directory with packs/<name>/opencode-pack.json, or a pack)`, 1)
+  if (command) {
+    const workspaceRoot = explicitWorkspace ? path.resolve(explicitWorkspace) : findWorkspace(process.cwd())
+    if (!workspaceRoot || findWorkspace(workspaceRoot) !== workspaceRoot) {
+      return cliError(`no pack catalog or pack found${explicitWorkspace ? ` at ${terminalSafeText(explicitWorkspace)}` : " above the current directory"}; pass --workspace <dir> (a directory with packs/<name>/opencode-pack.json, or a pack)`, 1)
+    }
+    return WORKSPACE_COMMANDS[command](workspaceRoot)
   }
-  if (command) return WORKSPACE_COMMANDS[command](workspaceRoot)
+
+  let tuiWorkspaceRoot: string | undefined
+  let initialSource: Source | undefined
+  let startupNotice: string | undefined
+
+  if (explicitWorkspace) {
+    const resolved = path.resolve(explicitWorkspace)
+    if (findWorkspace(resolved) !== resolved) {
+      return cliError(`no pack catalog or pack found at ${terminalSafeText(explicitWorkspace)}; pass --workspace <dir> (a directory with packs/<name>/opencode-pack.json, or a pack)`, 1)
+    }
+    tuiWorkspaceRoot = resolved
+  } else if (explicitSource !== undefined) {
+    if (!explicitSource) return cliError("--source requires a source name", 2)
+    const registry = loadSources()
+    const chosen = findSource(registry, explicitSource)
+    if (chosen.kind === "git" && !fs.existsSync(path.join(sourceRoot(chosen), ".git"))) {
+      try {
+        pullSource(chosen)
+        initialSource = chosen
+      } catch (error) {
+        startupNotice = `Could not pull "${chosen.name}": ${error instanceof Error ? error.message : String(error)}`
+      }
+    } else {
+      initialSource = chosen
+    }
+    if (initialSource && registry.active !== chosen.name) {
+      registry.active = chosen.name
+      saveSources(registry)
+    }
+  } else {
+    const discovered = findWorkspace(process.cwd())
+    if (discovered) {
+      tuiWorkspaceRoot = discovered
+    } else {
+      try {
+        const registry = loadSources()
+        const chosen = (registry.active ? registry.sources.find(s => s.name === registry.active) : undefined) ?? registry.sources[0]
+        if (chosen) {
+          if (chosen.kind === "git" && !fs.existsSync(path.join(sourceRoot(chosen), ".git"))) {
+            try {
+              pullSource(chosen)
+              initialSource = chosen
+            } catch (error) {
+              startupNotice = `Could not pull "${chosen.name}": ${error instanceof Error ? error.message : String(error)}`
+            }
+          } else if (chosen.kind === "local" && !fs.existsSync(chosen.path)) {
+            startupNotice = `Local source "${chosen.name}" does not exist on disk (${chosen.path}).`
+          } else {
+            initialSource = chosen
+          }
+        }
+      } catch (error) {
+        startupNotice = error instanceof Error ? error.message : String(error)
+      }
+    }
+  }
 
   const uiConfig = loadUiConfig()
   if (uiConfig.warning) console.error(`UI CONFIG WARNING: ${uiConfig.warning}`)
@@ -1118,7 +1318,17 @@ async function run() {
   })
 
   const root = createRoot(renderer)
-  root.render(<App workspaceRoot={workspaceRoot} listShare={uiConfig.config.listShare} uiConfigWarning={uiConfig.warning} configReadOnly={uiConfig.readOnly} uiConfigRevision={uiConfig.revision} />)
+  root.render(
+    <App
+      workspaceRoot={tuiWorkspaceRoot}
+      initialSource={initialSource}
+      startupNotice={startupNotice}
+      listShare={uiConfig.config.listShare}
+      uiConfigWarning={uiConfig.warning}
+      configReadOnly={uiConfig.readOnly}
+      uiConfigRevision={uiConfig.revision}
+    />
+  )
 }
 
 const IS_CLI_ENTRYPOINT = /(?:^|[\\/])(?:manage-agents\.mjs|index\.(?:js|tsx))$/.test(process.argv[1] ?? "")

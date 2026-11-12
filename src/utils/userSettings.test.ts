@@ -2,12 +2,13 @@ import assert from "node:assert/strict"
 import fs from "node:fs"
 import path from "node:path"
 import test from "node:test"
+import { decideSubagentModel } from "../../runtime/plugins/manage-agents-router/router.js"
 import { tempDir, writePack } from "../../test/helpers.js"
 import { changeTarget, installChange, reconcileChange, uninstallChange, type ChangeOptions } from "./installer.js"
 import { addSource, type SourceRegistry } from "./sources.js"
 import {
   buildRuntimeRouting, effectiveOverrides, loadOverrideSettings, loadRoutingSettings, patchFrontmatter, saveOverrideSettings, saveRoutingSettings,
-  scopeOf, setOverride, setRoutes, unsetOverride, unsetRoutes,
+  scopeOf, setOverride, setPackCallers, setPackRules, setRoutes, unsetOverride, unsetRoutes,
 } from "./userSettings.js"
 
 const FLOW = {
@@ -159,4 +160,80 @@ test("routing settings for packs that are not archetypes are reported", async (t
   const warnings = (await reconcile()).plan!.warnings
   assert.ok(warnings.some(warning => /routing for "plain" has no effect/.test(warning)))
   assert.ok(warnings.some(warning => /"flow-ghost" is not a subagent of the pack; ignored/.test(warning)))
+})
+
+test("packs without manifest archetype (like slides) infer primary callers and compile IF/OR rules on reconcile", async (t) => {
+  const base = tempDir(t)
+  const env = { ...process.env, XDG_CONFIG_HOME: path.join(base, "config"), XDG_CACHE_HOME: path.join(base, "cache") }
+  const source = path.join(base, "catalog")
+  writePack(
+    path.join(source, "slides"),
+    {
+      "agents/slides-agent.md": "---\nmode: primary\n---\nslides lead\n",
+      "agents/slides-html-writer.md": "---\nmode: subagent\n---\nhtml writer\n",
+      "agents/slides-template-writer.md": "---\nmode: subagent\n---\ntpl writer\n",
+    },
+    { name: "slides" },
+  )
+  const registry: SourceRegistry = { schemaVersion: 1, sources: [], prefer: {} }
+  addSource(registry, "main", source, { trusted: true })
+  const target = path.join(base, "target")
+  const options: ChangeOptions = { env, confirm: async () => true }
+
+  assert.equal((await changeTarget(target, "install", registry, installChange(registry, ["slides"], env), options)).status, "applied")
+  assert.ok(!fs.existsSync(path.join(target, "plugins/manage-agents-router")), "no rules yet -> no router")
+
+  const settings = loadRoutingSettings(env)
+  setRoutes(scopeOf(settings, target), "slides", "anthropic,openai/gpt-5.4", { "slides-html-writer": "google/gemini-4#high" })
+  setPackRules(scopeOf(settings, target), "slides", [
+    {
+      triggers: ["mistral"],
+      then: { tools: { bash: "deny" }, delegations: { "slides-template-writer": "deny" } },
+    },
+  ])
+  saveRoutingSettings(settings, env)
+
+  const rec = await changeTarget(target, "reconcile", registry, reconcileChange, options)
+  assert.equal(rec.status, "applied")
+  assert.deepEqual(rec.plan?.warnings, [])
+  const generated = JSON.parse(fs.readFileSync(path.join(target, "plugins/manage-agents-router/routing.json"), "utf8"))
+  assert.deepEqual(generated.archetypes.slides.callers, ["slides-agent"])
+  assert.deepEqual(generated.archetypes.slides.routes, {
+    anthropic: { "slides-html-writer": "google/gemini-4#high" },
+    "openai/gpt-5.4": { "slides-html-writer": "google/gemini-4#high" },
+  })
+  assert.equal(generated.archetypes.slides.rules.length, 1)
+  assert.deepEqual(generated.archetypes.slides.rules[0].then.tools, { bash: "deny" })
+
+  // Custom OR callers override inferred callers
+  setPackCallers(scopeOf(settings, target), "slides", ["slides-agent"])
+  saveRoutingSettings(settings, env)
+  assert.equal((await changeTarget(target, "reconcile", registry, reconcileChange, options)).status, "unchanged")
+
+  // Target-scope routes override pack-level flowDefaults.then.models
+  const withFlowDefaults = buildRuntimeRouting(
+    [{
+      manifest: {
+        contract: "1.1",
+        name: "slides",
+        version: "1.0.0",
+        description: "slides",
+        requires: {},
+        archetype: { callers: ["slides-agent"], reference: "slides-agent" },
+        flowDefaults: [{ triggers: ["anthropic/claude-opus-4-6"], then: { models: { "slides-html-writer": "pack/default-model" } } }],
+      },
+      agents: { "slides-agent": { mode: "primary" }, "slides-html-writer": { mode: "subagent" } },
+    }],
+    settings,
+    target,
+  )!
+  assert.deepEqual(
+    decideSubagentModel(withFlowDefaults, {
+      callerAgent: "slides-agent",
+      callerModel: "anthropic/claude-opus-4-6",
+      targetAgent: "slides-html-writer",
+      requestedModel: undefined,
+    }),
+    { model: "google/gemini-4#high" },
+  )
 })

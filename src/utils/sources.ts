@@ -3,7 +3,9 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { atomicWriteRestrictedFile } from "./agents.js"
-import { MANIFEST_FILE, PACK_NAME_RE, readPackManifest, type PackManifest } from "./packs.js"
+import { extractHttpsHost, inspectGhAuth, parseGitHubShorthand, type GhRunner } from "./github.js"
+import { DISCOVERY_DEPTH, MANIFEST_FILE, PACK_NAME_RE, readPackManifest, SKIPPED_DIRS, type PackManifest } from "./packs.js"
+import { derivePackSlug, validateVirtualPack } from "./virtualPacks.js"
 import { cleanGitEnvironment } from "./repositoryTransaction.js"
 
 export type Source =
@@ -15,6 +17,8 @@ export interface SourceRegistry {
   sources: Source[]
   /** pack name -> source name, used when several sources offer the same pack. */
   prefer: Record<string, string>
+  /** Last source selected in the TUI. */
+  active?: string
 }
 
 export interface PackCandidate {
@@ -30,12 +34,14 @@ export interface PackCandidate {
 export interface GitOptions {
   /** file: URLs and local paths are accepted only by tests (bare repositories on disk). */
   allowFileUrls?: boolean
+  /** Use `gh auth git-credential` automatically when `gh` is authenticated for the HTTPS host (default: true). */
+  useGhAuth?: boolean
+  ghRunner?: GhRunner
 }
 
-const GIT_URL_RE = /^(?:https:\/\/[^\s]+|ssh:\/\/[^\s]+|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[^\s-][^\s]*)$/
-const GIT_REF_RE = /^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]+$/
-const DISCOVERY_DEPTH = 4
-const SKIPPED_DIRS = new Set([".git", "node_modules"])
+const GIT_URL_RE = /^(?:https:\/\/[^\s#]+|ssh:\/\/[^\s#]+|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[^\s#-][^\s#]*)$/
+export const GIT_REF_RE = /^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]+$/
+export { DISCOVERY_DEPTH, SKIPPED_DIRS }
 
 export function engineConfigDir(env: NodeJS.ProcessEnv = process.env): string {
   return path.join(env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "manage-agents")
@@ -62,11 +68,18 @@ export function loadSources(env: NodeJS.ProcessEnv = process.env): SourceRegistr
   }
   const prefer = raw.prefer ?? {}
   if (typeof prefer !== "object" || Array.isArray(prefer) || !Object.entries(prefer).every(([pack, source]) => PACK_NAME_RE.test(pack) && names.has(source as string))) throw new Error(`${file}: invalid "prefer" map`)
-  return { schemaVersion: 1, sources: raw.sources, prefer }
+  if (raw.active !== undefined && (typeof raw.active !== "string" || !names.has(raw.active))) throw new Error(`${file}: invalid "active" source`)
+  return { schemaVersion: 1, sources: raw.sources, prefer, ...(raw.active ? { active: raw.active } : {}) }
 }
 
 export function saveSources(registry: SourceRegistry, env: NodeJS.ProcessEnv = process.env): void {
-  const sorted = { schemaVersion: 1, sources: [...registry.sources].sort((a, b) => a.name.localeCompare(b.name)), prefer: Object.fromEntries(Object.entries(registry.prefer).sort()) }
+  const active = registry.active && registry.sources.some(source => source.name === registry.active) ? registry.active : undefined
+  const sorted = {
+    schemaVersion: 1,
+    sources: [...registry.sources].sort((a, b) => a.name.localeCompare(b.name)),
+    prefer: Object.fromEntries(Object.entries(registry.prefer).sort()),
+    ...(active ? { active } : {}),
+  }
   atomicWriteRestrictedFile(registryPath(env), Buffer.from(`${JSON.stringify(sorted, null, 2)}\n`))
 }
 
@@ -75,24 +88,57 @@ function isGitLocation(location: string, options: GitOptions): boolean {
   return GIT_URL_RE.test(location)
 }
 
-/** Credentials in a URL would be stored in sources.json and printed by `source list`; use a git credential helper instead. */
-const hasUrlCredentials = (location: string) => /^https:\/\/[^/]*@/.test(location) || /^ssh:\/\/[^/@]*:[^/@]*@/.test(location)
+/** Credentials or query tokens in a URL would be stored in sources.json and printed by `source list`; use a git credential helper instead. */
+const hasUrlCredentials = (location: string) =>
+  /^https:\/\/[^/]*@/.test(location) || /^ssh:\/\/[^/@]*:[^/@]*@/.test(location) || /^(?:https|ssh):\/\/[^?]*\?/.test(location)
 
-/** Adds a source; `location` is a directory or a git URL (https:, ssh:, git@host:path). */
+/** Derives a unique valid source name from a directory, Git URL, or GitHub `owner/repo` spec. */
+export function deriveSourceName(location: string, registry: SourceRegistry): string {
+  const withoutRef = location.trim().split("#")[0].replace(/^(?:github|gh):/i, "").replace(/[\\/]+$/, "").replace(/\.git$/i, "")
+  const tail = withoutRef.split(/[/:\\]/).filter(Boolean).pop() ?? ""
+  const normalized = tail.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/-+/g, "-").replace(/^-+|-+$/g, "").slice(0, 56).replace(/-+$/g, "")
+  const base = PACK_NAME_RE.test(normalized) ? normalized : "source"
+  let candidate = base
+  for (let index = 2; registry.sources.some(source => source.name === candidate); index++) {
+    candidate = `${base}-${index}`
+  }
+  return candidate
+}
+
+/** Adds a source; `location` is a directory, a git URL (https:, ssh:, git@host:path), or GitHub shorthand (`[github:]owner/repo[#ref]`). */
 export function addSource(registry: SourceRegistry, name: string, location: string, settings: { ref?: string; trusted?: boolean } = {}, options: GitOptions = {}): Source {
   if (!PACK_NAME_RE.test(name)) throw new Error(`invalid source name "${name}": use lowercase letters, digits and hyphens`)
   if (registry.sources.some(source => source.name === name)) throw new Error(`source "${name}" already exists`)
-  if (settings.ref !== undefined && !GIT_REF_RE.test(settings.ref)) throw new Error(`invalid git ref "${settings.ref}"`)
+  let resolvedLocation = location.trim()
+  let resolvedRef = settings.ref
+  const shorthand = parseGitHubShorthand(resolvedLocation)
+  if (shorthand) {
+    if (resolvedRef !== undefined && shorthand.ref !== undefined && resolvedRef !== shorthand.ref) {
+      throw new Error(`conflicting git refs "${resolvedRef}" and "${shorthand.ref}"`)
+    }
+    resolvedLocation = shorthand.url
+    resolvedRef = resolvedRef ?? shorthand.ref
+  } else if (/^(?:github|gh):/i.test(resolvedLocation)) {
+    throw new Error(`invalid GitHub repository "${location}": use github:<owner>/<repo>[#<ref>]`)
+  } else if (/^(?:https|ssh):\/\//i.test(resolvedLocation) && resolvedLocation.includes("#")) {
+    const hashIndex = resolvedLocation.indexOf("#")
+    const inlineRef = resolvedLocation.slice(hashIndex + 1)
+    if (!inlineRef || !GIT_REF_RE.test(inlineRef)) throw new Error(`invalid git ref "${inlineRef}"`)
+    if (resolvedRef !== undefined && resolvedRef !== inlineRef) throw new Error(`conflicting git refs "${resolvedRef}" and "${inlineRef}"`)
+    resolvedLocation = resolvedLocation.slice(0, hashIndex)
+    resolvedRef = resolvedRef ?? inlineRef
+  }
+  if (resolvedRef !== undefined && !GIT_REF_RE.test(resolvedRef)) throw new Error(`invalid git ref "${resolvedRef}"`)
   let source: Source
-  if (isGitLocation(location, options)) {
-    if (hasUrlCredentials(location)) throw new Error("credentials in source URLs are not stored: configure a git credential helper or an SSH key instead")
-    source = { name, kind: "git", url: location, ...(settings.ref ? { ref: settings.ref } : {}), trusted: settings.trusted === true }
-  } else if (/^[a-z][a-z0-9+.-]*:/i.test(location) && !path.win32.isAbsolute(location)) {
-    throw new Error(`unsupported source URL "${location}": use https:, ssh: or git@host:path`)
+  if (isGitLocation(resolvedLocation, options)) {
+    if (hasUrlCredentials(resolvedLocation)) throw new Error("credentials in source URLs are not stored: configure a git credential helper or an SSH key instead")
+    source = { name, kind: "git", url: resolvedLocation, ...(resolvedRef ? { ref: resolvedRef } : {}), trusted: settings.trusted === true }
+  } else if (/^[a-z][a-z0-9+.-]*:/i.test(resolvedLocation) && !path.win32.isAbsolute(resolvedLocation)) {
+    throw new Error(`unsupported source URL "${location}": use https:, ssh:, git@host:path or owner/repo`)
   } else {
-    const dir = path.resolve(location)
+    const dir = path.resolve(resolvedLocation)
     if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) throw new Error(`${dir} is not a directory`)
-    if (settings.ref !== undefined) throw new Error("--ref applies only to git sources")
+    if (resolvedRef !== undefined) throw new Error("--ref applies only to git sources")
     source = { name, kind: "local", path: fs.realpathSync(dir), trusted: settings.trusted === true }
   }
   registry.sources.push(source)
@@ -104,6 +150,10 @@ export function removeSource(registry: SourceRegistry, name: string): void {
   if (index === -1) throw new Error(`unknown source "${name}"`)
   registry.sources.splice(index, 1)
   for (const [pack, preferred] of Object.entries(registry.prefer)) if (preferred === name) delete registry.prefer[pack]
+  if (registry.active === name) {
+    if (registry.sources.length > 0) registry.active = registry.sources[0].name
+    else delete registry.active
+  }
 }
 
 export function findSource(registry: SourceRegistry, name: string): Source {
@@ -123,12 +173,29 @@ function git(args: string[], cwd?: string) {
   return result.stdout.trim()
 }
 
+export function ghCredentialArgs(url: string, env: NodeJS.ProcessEnv = process.env, options: GitOptions = {}): string[] {
+  if (options.useGhAuth === false) return []
+  const host = extractHttpsHost(url)
+  if (!host) return []
+  try {
+    if (!inspectGhAuth(host, options.ghRunner, env).authenticated) return []
+  } catch {
+    return []
+  }
+  return [
+    "-c",
+    `credential.https://${host}.helper=`,
+    "-c",
+    `credential.https://${host}.helper=!gh auth git-credential`,
+  ]
+}
+
 /** Clones or fetches a git source into the cache and checks out its ref (default: the remote HEAD). Returns the commit. */
 export function pullSource(source: Source, env: NodeJS.ProcessEnv = process.env, options: GitOptions = {}): string | null {
   if (source.kind === "local") return null
   if (!isGitLocation(source.url, options)) throw new Error(`source "${source.name}": refusing git URL "${source.url}"`)
   const dir = sourceRoot(source, env)
-  const protocol = options.allowFileUrls ? [] : ["-c", "protocol.file.allow=never"]
+  const protocol = [...(options.allowFileUrls ? [] : ["-c", "protocol.file.allow=never"]), ...ghCredentialArgs(source.url, env, options)]
   if (!fs.existsSync(path.join(dir, ".git"))) {
     fs.mkdirSync(path.dirname(dir), { recursive: true })
     git([...protocol, "clone", "--quiet", "--no-checkout", "--", source.url, dir])
@@ -163,12 +230,16 @@ export function lastFetchedRevision(source: Source, env: NodeJS.ProcessEnv = pro
   return fs.existsSync(path.join(dir, ".git")) ? fetchedRevision(source, dir) ?? null : null
 }
 
-/** Commit checked out for a git source, or null for local sources and sources never pulled. */
+/** Commit checked out for a git source, or null for local sources and sources never pulled (or with no resolvable HEAD). */
 export function sourceRevision(source: Source, env: NodeJS.ProcessEnv = process.env): string | null {
   if (source.kind === "local") return null
   const dir = sourceRoot(source, env)
   if (!fs.existsSync(path.join(dir, ".git"))) return null
-  return git(["rev-parse", "HEAD"], dir)
+  try {
+    return git(["rev-parse", "HEAD"], dir)
+  } catch {
+    return null
+  }
 }
 
 /** Read-only checkout of one commit of a git source, created once and reused: reconcile installs exactly the locked revision. */
@@ -215,6 +286,20 @@ export function discoverPacks(source: Source, env: NodeJS.ProcessEnv = process.e
     }
   }
   visit(root, 0)
+  if (!candidates.length && !problems.length) {
+    const virtualName = source.kind === "git" ? derivePackSlug(source.name) : derivePackSlug(path.basename(path.resolve(root)))
+    const virtualValidation = validateVirtualPack(root, { name: virtualName, sourceKind: source.kind })
+    if (virtualValidation.manifest && !virtualValidation.issues.some(issue => issue.level === "error")) {
+      candidates.push({
+        source: source.name,
+        sourceKind: source.kind,
+        trusted: source.trusted,
+        dir: root,
+        relativeDir: ".",
+        manifest: virtualValidation.manifest,
+      })
+    }
+  }
   return { candidates, problems }
 }
 

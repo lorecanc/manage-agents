@@ -1,17 +1,14 @@
-// manage-agents-router: picks the model of each subagent of an archetype from the model its caller runs on.
+// manage-agents-router: applies conditional IF/OR flows (subagent models, tools, permissions and delegations).
 // Installed and kept up to date by `manage-agents reconcile`; the rules are in ./router.js and the data in the
-// generated ./routing.json. Fail-open: a missing or broken routing.json, or any unexpected error, leaves the call
-// as it is. OPENCODE_AGENT_ROUTER=off disables it.
-//
-// V2 plugin API: `model.request` remembers the agent and model of each session; `tool.execute.before` sets
-// input.model on subagent calls. OpenCode picks a subagent's model as input.model ?? agent.model ?? parent model.
+// generated ./routing.json. Fail-open on unexpected errors; explicit "deny" rules reject prohibited actions.
+// OPENCODE_AGENT_ROUTER=off disables it.
 
 import fs from "node:fs"
 import { fileURLToPath } from "node:url"
 
 import { Plugin } from "@opencode/plugin"
 
-import { SUBAGENT_TOOLS, decideSubagentModel, validateRouting } from "./router.js"
+import { decidePermission, decideSessionTools, decideToolExecution, validateRouting } from "./router.js"
 
 const MAX_SESSIONS = 1000
 // Hidden system agents run on their own small model inside a session; they must not hide the owner's model.
@@ -22,11 +19,17 @@ export async function setupRouter(ctx, options = {}) {
   const routingPath = fileURLToPath(new URL("./routing.json", import.meta.url))
   const sessions = new Map()
   const disposers = []
-  const keep = (dispose) => {
-    if (typeof dispose === "function") disposers.push(dispose)
+  const keep = async (registrationPromise) => {
+    try {
+      const registration = await registrationPromise
+      if (typeof registration === "function") disposers.push(registration)
+      else if (registration && typeof registration.dispose === "function") disposers.push(() => registration.dispose())
+    } catch {
+      /* optional hook domain unavailable in host version */
+    }
   }
 
-  // Read on every subagent call (a few KB); parse only when it changed.
+  // Read on every hook evaluation (a few KB); parse only when it changed.
   let cached = { text: null, routing: null }
   const routing = () => {
     try {
@@ -38,34 +41,71 @@ export async function setupRouter(ctx, options = {}) {
     return cached.routing
   }
 
-  keep(ctx.session.hook("model.request", async (event) => {
+  const recordSession = (id, agent, model) => {
+    if (!id || typeof agent !== "string" || INTERNAL_AGENTS.has(agent)) return
+    if (sessions.size >= MAX_SESSIONS && !sessions.has(id)) sessions.delete(sessions.keys().next().value)
+    sessions.set(id, { agent, model })
+  }
+
+  await keep(ctx.session?.hook?.("model.request", async (event) => {
     try {
-      const id = event?.sessionID || event?.sessionId
-      const agent = event?.agent
-      if (!id || typeof agent !== "string" || INTERNAL_AGENTS.has(agent)) return
-      if (sessions.size >= MAX_SESSIONS && !sessions.has(id)) sessions.delete(sessions.keys().next().value)
-      sessions.set(id, { agent, model: event.model })
+      if (event?.kind && event.kind !== "primary") return
+      recordSession(event?.sessionID || event?.sessionId, event?.agent, event?.model)
     } catch {
       /* fail open */
     }
   }))
 
-  keep(ctx.tool.hook("execute.before", async (event) => {
+  await keep(ctx.session?.hook?.("context", async (event) => {
     try {
-      if (!SUBAGENT_TOOLS.has(event?.tool)) return
-      const input = event.input
-      if (!input || typeof input !== "object") return
-      const session = sessions.get(event.sessionID || event.sessionId)
-      const decision = decideSubagentModel(routing(), {
-        callerAgent: typeof event.agent === "string" ? event.agent : session?.agent,
-        callerModel: session?.model,
-        targetAgent: input.agent ?? input.subagent_type,
-        requestedModel: input.model,
+      const id = event?.sessionID || event?.sessionId
+      recordSession(id, event?.agent, event?.model)
+      if (!event?.tools || typeof event.tools !== "object") return
+      const denied = decideSessionTools(routing(), {
+        agent: event.agent,
+        model: event.model,
+        toolNames: Object.keys(event.tools),
       })
-      if (decision) input.model = decision.model
+      for (const name of denied) delete event.tools[name]
     } catch {
       /* fail open */
     }
+  }))
+
+  await keep(ctx.permission?.hook?.("evaluate", async (event) => {
+    try {
+      if (!event || typeof event !== "object") return
+      const session = sessions.get(event.sessionID || event.sessionId)
+      const decision = decidePermission(routing(), {
+        agent: typeof event.agent === "string" && event.agent ? event.agent : session?.agent,
+        model: session?.model,
+        action: event.action,
+      })
+      if (!decision) return
+      event.effect = decision.effect
+      if (decision.message) event.message = decision.message
+    } catch {
+      /* fail open */
+    }
+  }))
+
+  await keep(ctx.tool?.hook?.("execute.before", async (event) => {
+    let decision = null
+    try {
+      const session = sessions.get(event?.sessionID || event?.sessionId)
+      decision = decideToolExecution(routing(), {
+        callerAgent: typeof event?.agent === "string" && event.agent ? event.agent : session?.agent,
+        callerModel: session?.model,
+        tool: event?.tool,
+        input: event?.input,
+      })
+      if (decision && !decision.blocked && decision.model && event?.input && typeof event.input === "object") {
+        event.input.model = decision.model
+      }
+    } catch {
+      /* fail open on unexpected internal errors */
+    }
+    if (decision?.blocked) throw new Error(decision.reason)
   }))
 
   return () => {

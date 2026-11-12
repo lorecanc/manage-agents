@@ -35,14 +35,16 @@ the sources are newer.
 ## Quick start
 
 ```bash
-manage-agents source add catalog https://github.com/lorecanc/agents.git   # or a local directory
-manage-agents source pull                                                 # clone/fetch git sources
+manage-agents source login                                                # optional: log in via GitHub CLI (gh)
+manage-agents source add lorecanc/agents --pull                           # GitHub owner/repo, git URL, or local dir
 manage-agents install flow pipeline                                       # into $XDG_CONFIG_HOME/opencode
 manage-agents status                                                      # "In sync." when nothing drifted
 manage-agents update                                                      # pull and move to the new versions
 ```
 
-To edit a catalog, open the TUI in it: `cd agents && manage-agents` (or `manage-agents --workspace <dir>`).
+Run `manage-agents` (or `npm start`) anywhere: inside a local catalog it opens that workspace; outside one it opens
+your active registered source (or the **Data Sources** screen to sign in with `gh` and attach a GitHub repository or
+local directory). Pass `--workspace <dir>` or `--source <name>` to pick one explicitly.
 
 ## Concepts
 
@@ -64,7 +66,7 @@ To edit a catalog, open the TUI in it: `cd agents && manage-agents` (or `manage-
 
 ## CLI
 
-Without a command the TUI opens on the workspace. Every command has `--help`.
+Without a command the TUI opens on the workspace, active source, or Data Sources screen. Every command has `--help`.
 
 Packs, sources and targets:
 
@@ -72,12 +74,15 @@ Packs, sources and targets:
   namespaces, `opencode.json` keys, references between files and packs, archetype declarations. Reports the pack's
   IDs, its executable surface (plugins, tool modules, skill scripts, MCP servers, external commands) and what a
   required pack must provide; exit 1 on errors. `--git` applies the stricter rules for git sources. `pack list
-  [--json]` shows the packs the registered sources offer.
-* `source list|add|remove|pull|trust|untrust|prefer` — `add <name> <dir|git-url> [--ref <ref>] [--trust]` registers a
-  directory or a git repository (`https:`, `ssh:`, `git@host:path`; other schemes and URLs with credentials are
-  refused). `pull` clones or fetches git sources and checks them out detached at their ref (default: the remote
-  HEAD). Installing executable content from an untrusted source, or a change to executable content from any source,
-  needs confirmation. `prefer <pack> <source>`
+  [--json]` shows the packs the registered sources offer (including virtual packs synthesized from manifest-free `.md`
+  agent folders). `pack init [<dir>] [--name <slug>] [--version <semver>] [--description <text>] [--no-organize]`
+  scaffolds `opencode-pack.json` and optionally moves loose `.md` agents into `agents/`.
+* `source list|add|remove|pull|login|auth|trust|untrust|prefer` — `add [<name>] <dir|git-url|owner/repo[#ref]> [--ref <ref>] [--trust] [--pull]`
+  registers a directory, a git repository (`https:`, `ssh:`, `git@host:path`) or a GitHub repository (`owner/repo` or
+  `github:owner/repo`; URLs with credentials are refused, and `<name>` is derived when omitted). `login` runs
+  `gh auth login --web` and `auth` checks `gh` status; when `gh` is authenticated on an HTTPS host, `pull` uses
+  `gh auth git-credential` automatically without storing tokens in `sources.json`. Installing executable content from
+  an untrusted source, or a change to executable content from any source, needs confirmation. `prefer <pack> <source>`
   picks a source when several offer the same pack.
 * `resolve <[source/]pack[@range]>... [--target <dir>] [--json]` — resolve packs and their `requires` without writing:
   exactly one candidate per pack name (the newest is never picked silently), cycles and missing packs are errors,
@@ -91,12 +96,15 @@ Packs, sources and targets:
   reported before anything is written; `--adopt` backs up and replaces, `restore` undoes it. Writes are journaled
   and rolled back on failure or after a crash; one command at a time per target. Semantics:
   [`contract/CONTRACT.md` §8](contract/CONTRACT.md#8-installation-semantics-engine-side).
-* `models show|set|unset|pin|unpin` and `override show|set|unset` (with `[--target <dir>] [--global]
-  [--no-reconcile] [--yes]`) — user settings. `models set <pack> <trigger> <agent>=<provider/model[#variant]|inherit>`
-  routes the subagents of an archetype pack when a caller runs on `<trigger>` (a provider, or `provider/model`);
-  `models pin <pack>/<agent> <model>` fixes a subagent's model, `unpin` removes any fixed model, the pack's included.
-  `override set <pack>/<id> steps=30 hidden=true` patches frontmatter (YAML values, `null` removes a field;
-  `--command` for commands). Each edit reconciles the target.
+* `models show|set|unset|callers|rule-set|rule-unset|export-pack|pin|unpin` and `override show|set|unset` (with
+  `[--target <dir>] [--global] [--no-reconcile] [--yes]`) — user settings. `models set <pack> <trigger[,trigger2...]>
+  <agent>=<provider/model[#variant]|inherit>` routes subagents when a caller runs on `<trigger>` (`*`, a provider, or
+  `provider/model`) for any pack (inferring primary agents as callers when `opencode-pack.json` omits `archetype`, or
+  configured explicitly with `models callers <pack> <caller>...`); `models rule-set` adds full `IF / OR` rules with
+  `--model`, `--tool`, `--perm` and `--delegate`; `models export-pack <pack>` writes effective callers and defaults
+  into a local pack's `opencode-pack.json`. `models pin <pack>/<agent> <model>` fixes a subagent's model, `unpin`
+  removes any fixed model, the pack's included. `override set <pack>/<id> steps=30 hidden=true` patches frontmatter
+  (YAML values, `null` removes a field; `--command` for commands). Each edit reconciles the target.
 
 Workspace (catalog or pack you are editing):
 
@@ -121,21 +129,27 @@ The agent list is a tree with one folder per pack, all closed at startup; `→`/
 closes it. The search (`/`) hides folders without matches and shows the others expanded; clearing it restores each
 folder's state. The model selector opens with the provider of the current model expanded.
 
-Main view: arrows or `j/k` move (on inspector tabs 3–5 with an agent focused they scroll the tab), `/` searches file
-names (`Enter` keeps the filter, `Esc` clears it), `Space` selects the focused agent, `a` toggles every agent of the
-focused pack, `s` the agents of the same pack with the focused agent's model, `m` model (on an archetype pack folder
-with no selection: its routing defaults), `v` repair invalid models, `Shift-T` tier, `t` parameters (selection,
-focused folder or focused agent), `c` color, `p` permission preset, `g` delegations, `u` skills, tools and MCP
-permissions of the focused agent, `r` rename, `b` Claude bridge, `Shift-B` Codex bridge (of the focused pack), `e`
-install the focused pack into OpenCode, `1–5` inspector tabs, `Shift-L` layout, `F` fix permission order (inspector
-tab 3), `PageUp/PageDown` scroll, `Esc` close modals, `Ctrl-C` quit.
+Main view: `o` opens Data Sources (attach/switch GitHub or local sources, `gh` login, pull, trust, remove), arrows or
+`j/k` move (on inspector tabs 3–5 with an agent focused they scroll the tab), `/` searches file names (`Enter` keeps
+the filter, `Esc` clears it), `Space` selects the focused agent, `a` toggles every agent of the focused pack, `s` the
+agents of the same pack with the focused agent's model, `m` model (on any pack folder with no selection: its
+conditional `IF / OR` flows), `i` initialize `opencode-pack.json` (on local manifest-free `.md` folders), `v` repair invalid models, `Shift-T` tier, `t` parameters (selection, focused folder or focused agent), `c`
+color, `p` permission preset, `g` delegations, `u` skills, tools and MCP permissions of the focused agent, `r` rename
+(local workspaces only), `b` Claude bridge, `Shift-B` Codex bridge (of the focused pack), `e` install the focused pack
+into OpenCode, `1–5` inspector tabs, `Shift-L` layout, `F` fix permission order (inspector tab 3), `PageUp/PageDown`
+scroll, `Esc` close modals, `Ctrl-C` quit. When the active source is a GitHub/git source, edits in the TUI save to
+`overrides.json` and `routing.json` (and reconcile the installed target) without modifying the cached git checkout.
 
 - **Model selector**: only the arrows navigate; printable keys type into the search (every word must appear in
   `provider/model`), `Backspace` edits it, `Esc` clears it and then closes, `Enter` toggles a provider or assigns a
   model, `Ctrl-R` reloads the catalog.
-- **Routing defaults** (`m` on an archetype pack): one row per trigger. Editing a configuration writes the pack's
-  `routingDefaults` in `opencode-pack.json` and validates the pack, restoring the file if it no longer satisfies the
-  contract. They are what the pack ships; a user changes them per target with `manage-agents models`.
+- **Conditional `IF / OR` flows** (`m` on any pack folder): opens on every pack (including packs without `archetype` in
+  `opencode-pack.json` and virtual `.md` folders). Saves by default to user settings (`routing.json`) and reconciles the
+  target; `C` edits `OR` callers, `Space`/`Tab` in the trigger picker selects multiple `OR` triggers (`*`, provider, or
+  `provider/model`), `U` configures conditional tool/MCP `allow`/`ask`/`deny` policies, `G` configures subagent
+  delegation policies, and `W` on local packs exports callers, `routingDefaults` and `flowDefaults` to
+  `opencode-pack.json`. Note: in OpenCode V2, a static `deny` in an agent's frontmatter cannot be widened at runtime by
+  a plugin; set `allow` or `ask` on the caller and narrow via conditional flows.
 - **Install** (`e`): previews the change with a dry run (packs, files, confirmations needed for executable content)
   and installs on `Y`. The workspace becomes a local source the first time (named after its directory).
 - **Skills, Tools & MCP** (`u` on an agent): `Space` toggles the agent's `allow`/`deny` for a skill (or `* (All

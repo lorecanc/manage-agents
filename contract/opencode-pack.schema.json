@@ -43,12 +43,36 @@
     "routingDefaults": {
       "description": "Suggested routing: trigger (\"provider\" or \"provider/model\") -> subagent ID -> \"provider/model[#variant]\" or \"inherit\". The user's routing configuration overrides it.",
       "type": "object",
-      "propertyNames": { "pattern": "^[^\\s/#]+(?:/[^\\s#]+)?$" },
+      "propertyNames": { "pattern": "^(?!\\$)[^\\s/#]+(?:/[^\\s#]+)?$" },
       "additionalProperties": {
         "type": "object",
         "additionalProperties": { "type": "string", "pattern": "^(?:inherit|[^\\s/#]+/[^\\s#]+(?:#[^\\s#]+)?)$" }
       }
+    },
+    "flowDefaults": {
+      "description": "Suggested conditional IF/OR rules (contract 1.1+): multi-trigger OR over provider/model/*, with subagent models, tool/MCP policies, permissions and delegation policies.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["triggers", "then"],
+        "properties": {
+          "callers": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+          "triggers": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^(?:\\*|(?!\\$)[^\\s/#]+(?:/[^\\s#]+)?)$" } },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "minProperties": 1,
+            "properties": {
+              "models": { "type": "object", "additionalProperties": { "type": "string", "pattern": "^(?:inherit|[^\\s/#]+/[^\\s#]+(?:#[^\\s#]+)?)$" } },
+              "tools": { "type": "object", "additionalProperties": { "type": "string", "enum": ["allow", "ask", "deny"] } },
+              "permissions": { "type": "object", "additionalProperties": { "type": "string", "enum": ["allow", "ask", "deny"] } },
+              "delegations": { "type": "object", "additionalProperties": { "type": "string", "enum": ["allow", "deny"] } }
+            }
+          }
+        }
+      }
     }
   },
-  "dependentRequired": { "routingDefaults": ["archetype"] }
+  "dependentRequired": { "routingDefaults": ["archetype"], "flowDefaults": ["archetype"] }
 }

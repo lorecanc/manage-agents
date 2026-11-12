@@ -6,11 +6,12 @@ import { isDeepStrictEqual } from "node:util"
 import { fileURLToPath } from "node:url"
 import { atomicWriteRestrictedFile } from "./agents.js"
 import { buildLock, confirmationsNeeded, diffLocks, readLock, serializeLock, targetStateDir, type LockChange, type LockedPack, type PackLock } from "./lock.js"
-import { hasErrors, installableFiles, parseJsonc, validatePack, type PackValidation } from "./packs.js"
+import { hasErrors, installableFiles, MANIFEST_FILE, parseJsonc, validatePack, type PackValidation } from "./packs.js"
 import { hashFile, orderByRequires, packContent, parsePackRequest, resolvePacks, type ResolveOptions } from "./resolver.js"
 import { discoverAllPacks, findSource, lastFetchedRevision, pullSource, revisionSnapshot, sourceRevision, type GitOptions, type SourceRegistry } from "./sources.js"
 import { own, setOwn } from "./values.js"
-import { buildRuntimeRouting, effectiveOverrides, loadOverrideSettings, loadRoutingSettings, patchFrontmatter, type PackOverrides } from "./userSettings.js"
+import { buildRuntimeRouting, effectiveOverrides, loadOverrideSettings, loadRoutingSettings, patchFrontmatter, resolveEffectiveCallers, routesOfEntry, type PackOverrides } from "./userSettings.js"
+import { validateVirtualPack, VIRTUAL_PACK_VERSION, virtualManifestHash } from "./virtualPacks.js"
 
 export interface DesiredState {
   desiredVersion: 1
@@ -181,10 +182,14 @@ export function loadLockedPacks(lock: PackLock, registry: SourceRegistry, env: N
     const dir = path.resolve(base, ...locked.path.split("/"))
     const inside = path.relative(base, dir)
     if (inside.startsWith("..") || path.isAbsolute(inside) || !fs.existsSync(dir)) { problems.push(`${name}: ${locked.path} is missing from source "${locked.source}"`); continue }
-    const validation = validatePack(dir, { sourceKind: source.kind })
+    const isVirtual = locked.version === VIRTUAL_PACK_VERSION && !fs.existsSync(path.join(dir, MANIFEST_FILE))
+    const validation = isVirtual
+      ? validateVirtualPack(dir, { name, sourceKind: source.kind })
+      : validatePack(dir, { sourceKind: source.kind })
     const changed = `${name}: the source changed since the lock; run \`manage-agents update ${name}\``
     if (hasErrors(validation)) { problems.push(`${name}: the pack no longer satisfies the contract; run \`manage-agents pack validate ${dir}\``); continue }
-    if (hashFile(path.join(dir, "opencode-pack.json")) !== locked.manifestHash) { problems.push(changed); continue }
+    const currentManifestHash = isVirtual && validation.manifest ? virtualManifestHash(validation.manifest) : hashFile(path.join(dir, MANIFEST_FILE))
+    if (currentManifestHash !== locked.manifestHash) { problems.push(changed); continue }
     const configRel = validation.files.find(file => PACK_CONFIG_FILES.has(file))
     const configText = configRel ? fs.readFileSync(path.join(dir, configRel), "utf8") : null
     const { fileHashes, contentHash, executableHash } = packContent(validation)
@@ -320,26 +325,39 @@ export function planReconcile(target: string, lock: PackLock, registry: SourceRe
     for (const rel of installableFiles(pack.validation)) {
       if (PACK_CONFIG_FILES.has(rel)) continue
       const dest = rel === "AGENTS.md" ? `instructions/${pack.name}.md` : rel
-      const from = path.join(pack.dir, ...rel.split("/"))
+      const virtual = pack.validation.virtualFiles?.[rel]
+      const from = path.join(pack.dir, ...(virtual?.sourceRel ?? rel).split("/"))
       const mode = (fs.statSync(from).mode & 0o111) ? 0o755 : 0o644
       const [top, ...rest] = rel.split("/")
       const patch = (top === "agents" || top === "commands") && rel.endsWith(".md") ? own(packOverrides[top], rest.join("/").slice(0, -3)) : undefined
-      if (!patch) { add({ rel: dest, from, hash: pack.fileHashes[rel], mode, kind: "create", owner: pack.name }); continue }
-      const text = fs.readFileSync(from, "utf8")
-      if (sha256(text) !== pack.fileHashes[rel]) { plan.conflicts.push(`${pack.name}: the source changed since the lock; run \`manage-agents update ${pack.name}\``); continue }
-      const content = Buffer.from(patchFrontmatter(text, patch))
-      add({ rel: dest, from, content, hash: sha256(content), mode, kind: "create", owner: pack.name })
+      if (!patch && !virtual?.content) { add({ rel: dest, from, hash: pack.fileHashes[rel], mode, kind: "create", owner: pack.name }); continue }
+      const baseBytes = virtual?.content ?? fs.readFileSync(from)
+      if (sha256(baseBytes) !== pack.fileHashes[rel]) { plan.conflicts.push(`${pack.name}: the source changed since the lock; run \`manage-agents update ${pack.name}\``); continue }
+      const content = patch ? Buffer.from(patchFrontmatter(baseBytes.toString("utf8"), patch)) : baseBytes
+      add({ rel: dest, from: "", content, hash: sha256(content), mode, kind: "create", owner: pack.name })
     }
   }
 
   const routingSettings = loadRoutingSettings(env)
-  for (const [pack, routes] of Object.entries({ ...routingSettings.default, ...own(routingSettings.targets, target) })) {
+  const configuredPacks = new Set([...Object.keys(routingSettings.default), ...Object.keys(own(routingSettings.targets, target) ?? {})])
+  for (const pack of [...configuredPacks].sort()) {
     const loaded = packs.find(candidate => candidate.name === pack)
-    if (!loaded?.validation.manifest?.archetype) { plan.warnings.push(`routing for "${pack}" has no effect: no installed pack of that name declares an archetype`); continue }
-    const callers = loaded.validation.manifest.archetype.callers
+    if (!loaded?.validation.manifest) { plan.warnings.push(`routing for "${pack}" has no effect: it is not installed in this target`); continue }
     const agents = agentsByPack.get(pack)!
-    for (const agent of new Set(Object.values(routes).flatMap(Object.keys))) {
-      if (!Object.hasOwn(agents, agent) || callers.includes(agent) || agents[agent].mode === "primary") plan.warnings.push(`routing for ${pack}: "${agent}" is not a subagent of the pack; ignored`)
+    const defaultEntry = own(routingSettings.default, pack)
+    const targetEntry = own(own(routingSettings.targets, target), pack)
+    const callers = resolveEffectiveCallers(loaded.validation.manifest, agents, defaultEntry, targetEntry)
+    const hasValidRuleCallers = [...(defaultEntry?.$rules ?? []), ...(targetEntry?.$rules ?? [])]
+      .some(rule => (rule.callers ?? []).some(id => Object.hasOwn(agents, id) && agents[id].mode !== "subagent"))
+    if (!callers.length && !hasValidRuleCallers) {
+      plan.warnings.push(`routing for "${pack}" has no effect: no caller or routable subagent is available in the pack`)
+      continue
+    }
+    const mergedRoutes = { ...routesOfEntry(defaultEntry), ...routesOfEntry(targetEntry) }
+    for (const agent of new Set(Object.values(mergedRoutes).flatMap(Object.keys))) {
+      if (!Object.hasOwn(agents, agent) || callers.includes(agent) || agents[agent].mode === "primary") {
+        plan.warnings.push(`routing for ${pack}: "${agent}" is not a subagent of the pack; ignored`)
+      }
     }
   }
   const routing = buildRuntimeRouting(packs.map(pack => ({ manifest: pack.validation.manifest!, agents: agentsByPack.get(pack.name)! })), routingSettings, target)

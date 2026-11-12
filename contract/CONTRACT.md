@@ -1,4 +1,4 @@
-# OpenCode pack contract 1.0
+# OpenCode pack contract 1.1
 
 This document defines the format that `manage-agents` accepts as input. A **pack** is a directory laid out like an
 OpenCode config directory (`~/.config/opencode/`), plus a small manifest. Authors and agents who write packs need
@@ -79,13 +79,14 @@ JSON Schema: [`opencode-pack.schema.json`](opencode-pack.schema.json).
 
 | Field | Rule |
 |---|---|
-| `contract` | `"MAJOR.MINOR"`. This engine implements `1.0`. |
+| `contract` | `"MAJOR.MINOR"`. This engine implements `1.1` (all `1.0` packs remain valid). |
 | `name` | Global pack identity: lowercase letters, digits and hyphens, at most 64 characters. It is also the namespace directory name. |
 | `version` | Full semver (`1.2.0`, `2.0.0-beta.1`). |
 | `description` | Non-empty. |
 | `requires` | Map `name -> semver range`, and nothing else (no arrays). `"*"` is accepted only in local sources. A pack cannot require itself. |
 | `archetype` | Optional. `callers` are the primary agents of this pack that delegate to subagents; `reference` is one of them. |
 | `routingDefaults` | Optional, only together with `archetype`. Trigger (`provider` or `provider/model`) -> subagent ID -> `provider/model[#variant]` or `inherit`. Subagents with a fixed `model` are pinned and never routed. |
+| `flowDefaults` | Optional (`1.1+`), only together with `archetype`. List of conditional `if / or` rules (`triggers` over `"*"`, `provider`, or `provider/model`; optional `callers`; `then.models`, `then.tools`, `then.permissions`, `then.delegations`). |
 
 Unknown keys are errors.
 
@@ -229,12 +230,13 @@ These are user settings, kept in `$XDG_CONFIG_HOME/manage-agents/`. They are app
 written into packs, so they also work on read-only git sources. Each setting has a default scope, valid for
 every target, and a per-target scope (`--target`) that wins over it.
 
-- **Router**: when an installed pack declares `archetype`, the engine installs its own router plugin into
-  `plugins/manage-agents-router/` and generates its `routing.json`. When a caller runs on a trigger (a provider,
-  or a `provider/model`, where the exact model wins), each subagent of the pack runs on the configured model;
-  `inherit` keeps the caller's model.
-- **Routing layers**: the pack's `routingDefaults`, then the default settings, then the target settings, merged
-  agent by agent. Edit them with `manage-agents models set|unset <pack> <trigger> <agent>=<model|inherit>`.
+- **Router**: when an installed pack declares `archetype` or the user configures conditional routes/flows for it in
+  `routing.json` (inferring primary agents as callers when omitted), the engine installs its own router plugin into
+  `plugins/manage-agents-router/` and generates its `routing.json`. When a caller runs on a trigger (`*`, a provider,
+  or a `provider/model`, where exact model beats provider beats `*`), matching rules route subagent models and
+  optionally apply `tools`, `permissions` and `delegations` policies.
+- **Routing layers**: the pack's `routingDefaults` and `flowDefaults`, then the default settings, then the target
+  settings, merged field by field. Edit them in the TUI (`m` on any pack folder) or with `manage-agents models`.
 - **Overrides** (`overrides.json`): they patch frontmatter fields of installed agents and commands. Allowed agent
   fields: `description`, `mode`, `model`, `permissions`, `hidden`, `color`, `steps`, `disabled`, `request`,
   `temperature`, `top_p`. Allowed command fields: `description`, `agent`, `model`, `subagent`. `null` removes a
