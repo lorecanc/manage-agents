@@ -9,7 +9,7 @@ export interface PluginCliOutcome {
 }
 
 export const spawnRunner: CliRunner = (file, args, options) => {
-  const result = spawnSync(file, args, { encoding: "utf8", cwd: options?.cwd, timeout: 120_000, maxBuffer: 4 * 1024 * 1024 })
+  const result = spawnSync(file, args, { encoding: "utf8", cwd: options?.cwd, timeout: 120_000, maxBuffer: 4 * 1024 * 1024, windowsHide: true })
   return {
     status: result.status,
     stdout: result.stdout ?? "",

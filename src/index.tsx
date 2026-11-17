@@ -5,8 +5,8 @@ import fs from "node:fs"
 import path from "node:path"
 import readline from "node:readline"
 import { App } from "./App.js"
-import { fetchModels, loadModelCatalog, getModelVariants } from "./utils/models.js"
-import { analyzeAgentName, renameAgent, auditSecurityPermissions, updateAgentParams, sanitizeFilename, KNOWN_MODEL_VARIANTS } from "./utils/agents.js"
+import { fetchModels, loadModelCatalog } from "./utils/models.js"
+import { analyzeAgentName, renameAgent, auditSecurityPermissions, buildTuningUpdateParams, updateAgentParams, parseTuneCliArgs, resolveAllowedTuneVariants, sanitizeFilename, KNOWN_MODEL_VARIANTS } from "./utils/agents.js"
 import {
   DEFAULT_TRANSLATION_CONFIG,
   loadTranslationConfig,
@@ -22,7 +22,7 @@ import { AUTO_COMMIT_MESSAGES, isRepositoryLocalPath, repositoryTransaction, par
 import { loadUiConfig } from "./utils/uiConfig.js"
 import { hasErrors, MANIFEST_FILE, PACK_NAME_RE, validatePack, type PackValidation } from "./utils/packs.js"
 import { packDir, packsDir, readManifest } from "./utils/catalog.js"
-import { addSource, deriveSourceName, discoverAllPacks, findSource, loadSources, pullSource, removeSource, saveSources, sourceRevision, sourceRoot, type Source } from "./utils/sources.js"
+import { addSource, deriveSourceName, discoverAllPacks, findSource, loadSources, pullSource, redactUrlCredentials, removeSource, saveSources, sourceRevision, sourceRoot, type Source } from "./utils/sources.js"
 import { inspectGhAuth, runGhWebLogin } from "./utils/github.js"
 import { describeExecutable, parsePackRequest, resolvePacks } from "./utils/resolver.js"
 import { buildLock, confirmationsNeeded, defaultTarget, diffLocks, readLock } from "./utils/lock.js"
@@ -31,13 +31,33 @@ import { exportFlowsToPackManifest } from "./utils/archetypes.js"
 import { describeConfiguredPackFlows } from "./utils/sourceCustomization.js"
 import { loadOverrideSettings, loadRoutingSettings, saveOverrideSettings, saveRoutingSettings, scopeOf, setOverride, setPackCallers, setPackRules, setRoutes, unsetOverride, unsetRoutes } from "./utils/userSettings.js"
 import { parseTriggerList, validateConditionalRule, type ConditionalPolicy, type DelegationEffect, type PolicyEffect } from "./utils/values.js"
-import { initPackManifest, isVirtualPackRoot } from "./utils/virtualPacks.js"
+import { isVirtualPackRoot } from "./utils/virtualPacks.js"
+import {
+  applyPackOnboarding,
+  bumpPackVersion,
+  cloneGitSourceForOnboarding,
+  fixPackDoctor,
+  inspectPackDoctor,
+  resolveEditablePackDir,
+  scaffoldPackResource,
+  suggestCloneDestination,
+  type OnboardingLayout,
+  type ScaffoldResourceKind,
+  type SemverReleaseKind,
+} from "./utils/packOnboarding.js"
 import YAML from "yaml"
 import { isPathInsideWorkspace, realpathThroughExistingAncestor } from "./utils/pathValidation.js"
 import { terminalSafeText } from "./utils/terminalText.js"
 import { describeChangeResult, formatLockChange } from "./utils/changeReport.js"
 import { claudeNextSteps } from "./utils/claudeNextSteps.js"
 import { registerPlugin, validatePlugin } from "./utils/claudePluginCli.js"
+import { resolveEngineVersion, writeEngineReleaseManifest } from "./utils/engineVersion.js"
+import {
+  applyEngineUpdate,
+  checkForEngineUpdate,
+  generateReleaseSigningKeypair,
+  signReleaseAssets,
+} from "./utils/selfUpdate.js"
 import type { BridgeResult } from "./utils/bridge.js"
 import type { CodexBridgeResult } from "./utils/codexBridge.js"
 
@@ -306,7 +326,7 @@ async function runBridgeCheck(workspaceRoot: string) {
   if (drifted) process.exitCode = 1
 }
 
-async function runBridge(workspaceRoot: string) {
+async function runBridge(workspaceRoot: string, explicitSource?: string) {
   if (process.argv[3] === "check") {
     await runBridgeCheck(workspaceRoot)
     return
@@ -327,6 +347,7 @@ async function runBridge(workspaceRoot: string) {
   let modelFlagsGiven = false
   let autoValidate: boolean | undefined
   let autoRegister: boolean | undefined
+  let assumeYes = false
   let marketplaceName = ""
   let marketFlagsGiven = false
 
@@ -356,6 +377,8 @@ async function runBridge(workspaceRoot: string) {
     } else if (args[i] === "--no-register") {
       autoRegister = false
       marketFlagsGiven = true
+    } else if (args[i] === "--yes" || args[i] === "-y") {
+      assumeYes = true
     } else if (args[i] === "--marketplace-name" && args[i + 1]) {
       marketplaceName = args[++i]
       validateMarketplaceName(marketplaceName)
@@ -386,6 +409,7 @@ Options:
   --map-all <target>      Shorthand for --model "*=<target>": use one model for every source
   --no-validate           Skip 'claude plugin validate' after a claude bridge
   --no-register           Skip installing the generated plugin into Claude Code
+  --yes, -y               Accept confirmation for untrusted executable content
   --marketplace-name <n>  Marketplace used when registering (default: <plugin>-local)
   --wizard, -w            Configure model mappings and save them before bridging
   --help, -h              Show this help
@@ -428,43 +452,54 @@ automation flags are persisted the same way.
   const safePluginName = sanitizeFilename(pluginName)
   const outputDir = path.resolve(output || path.join(workspaceRoot, "bridges", target === "codex" ? "codex" : "claude-code", safePluginName))
 
-  console.log(`\n🔄 Bridging pack '${pack}' to ${target} layer '${pluginName}'...`)
-  console.log(`   Prefix to strip: '${prefix}'`)
-  console.log(`   Output directory: ${outputDir}\n`)
+  const safe = terminalSafeText
+  console.log(`\n🔄 Bridging pack '${safe(pack)}' to ${safe(target)} layer '${safe(pluginName)}'...`)
+  console.log(`   Prefix to strip: '${safe(prefix)}'`)
+  console.log(`   Output directory: ${safe(outputDir)}\n`)
 
-  const { bridgePack } = await import("./utils/bridgeWorkspace.js")
+  const { bridgePack, bridgeConfirmationsNeeded, resolveBridgeWorkspaceTrust } = await import("./utils/bridgeWorkspace.js")
+  const registeredSource = explicitSource ? loadSources().sources.find(source => source.name === explicitSource) : undefined
+  const resolvedTrust = resolveBridgeWorkspaceTrust(workspaceRoot)
+  const trust = registeredSource && resolvedTrust.sourceName === registeredSource.name
+    ? { trusted: registeredSource.trusted, sourceName: registeredSource.name }
+    : resolvedTrust
+  const reasons = bridgeConfirmationsNeeded(workspaceRoot, pack, trust.trusted, trust.sourceName)
+  if (reasons.length && !await confirmInTerminal(reasons, assumeYes)) {
+    process.exitCode = 1
+    return
+  }
   const bridgeConfigPath = configFile || translationConfigPath(workspaceRoot)
   const bridgePlan = { localPaths: [bridgeConfigPath].filter(file => isRepositoryLocalPath(workspaceRoot, file)).concat(isRepositoryLocalPath(workspaceRoot, outputDir) ? [outputDir] : []), externalPaths: [bridgeConfigPath, outputDir].filter(file => !isRepositoryLocalPath(workspaceRoot, file)) }
   const result: BridgeResult | CodexBridgeResult = repositoryMutation(workspaceRoot, bridgePlan, AUTO_COMMIT_MESSAGES.bridge, () => {
     if (wizard || modelFlagsGiven || marketFlagsGiven) saveTranslationConfig(workspaceRoot, config, configFile || undefined)
-    return bridgePack({ workspaceRoot, pack, target, outputDir, config, pluginName: safePluginName, prefix })
+    return bridgePack({ workspaceRoot, pack, target, outputDir, config, pluginName: safePluginName, prefix, trusted: trust.trusted, allowUntrustedExecutable: true })
   })
 
-  console.log(`✅ ${target} layer generated successfully!\n`)
+  console.log(`✅ ${safe(target)} layer generated successfully!\n`)
   console.log(`   Files created:`)
-  result.files.forEach(f => console.log(`     * ${f}`))
+  result.files.forEach(f => console.log(`     * ${safe(f)}`))
   if (result.preview?.length) {
     console.log(`\n   Preview (agent → role → tier → model → source):`)
-    result.preview.forEach(p => console.log(`     ${p.agent} → ${p.role} → ${p.tier} → ${p.model} → ${p.source}`))
+    result.preview.forEach(p => console.log(`     ${safe(p.agent)} → ${safe(p.role)} → ${safe(p.tier)} → ${safe(p.model)} → ${safe(p.source)}`))
   }
 
   if (result.warnings.length > 0) {
     console.log(`\n   ⚠ Warnings:`)
-    result.warnings.forEach(w => console.log(`     * ${w}`))
+    result.warnings.forEach(w => console.log(`     * ${safe(w)}`))
   }
 
   if (target === "claude" && "pluginName" in result) {
     console.log(`\n   Validate and run locally:`)
-    claudeNextSteps(result.pluginName, result.orchestratorName, result.pluginDir).forEach(line => console.log(line))
+    claudeNextSteps(result.pluginName, result.orchestratorName, result.pluginDir).forEach(line => console.log(safe(line)))
     console.log()
     // Validation and registration run after the transaction: they spawn the
     // claude CLI and write user-level Claude config.
     let registrationSkipped = false
     if (config.claude.autoValidate !== false) {
       const validation = validatePlugin(result.pluginDir)
-      console.log(`   Validation: ${validation.kind}`)
-      console.log(`     ${validation.message}`)
-      if (validation.detail) console.log(`     ${validation.detail}`)
+      console.log(`   Validation: ${safe(validation.kind)}`)
+      console.log(`     ${safe(validation.message)}`)
+      if (validation.detail) console.log(`     ${safe(validation.detail)}`)
       if (validation.kind === "fail") {
         registrationSkipped = true
         console.log(`     ⚠ Registration skipped: validation failed.`)
@@ -478,17 +513,17 @@ automation flags are persisted the same way.
         console.log(`     ⚠ Registration skipped: no marketplace manifest is emitted (claude.emitMarketplace is off).`)
       } else {
         const registration = registerPlugin(result.pluginDir, result.pluginName, result.marketplaceName)
-        console.log(`   Registration: ${registration.kind}`)
-        console.log(`     ${registration.message}`)
-        if (registration.detail) console.log(`     ${registration.detail}`)
+        console.log(`   Registration: ${safe(registration.kind)}`)
+        console.log(`     ${safe(registration.message)}`)
+        if (registration.detail) console.log(`     ${safe(registration.detail)}`)
       }
     }
     console.log()
   } else {
     console.log(`\n   Codex project-scoped agents:`)
-    console.log(`     cd ${outputDir} && codex`)
+    console.log(`     cd ${safe(outputDir)} && codex`)
     console.log(`   Plugin manifest:`)
-    console.log(`     ${path.join(outputDir, ".codex-plugin", "plugin.json")}\n`)
+    console.log(`     ${safe(path.join(outputDir, ".codex-plugin", "plugin.json"))}\n`)
   }
 }
 
@@ -626,77 +661,72 @@ async function runTuneCLI(workspaceRoot: string) {
 
   const usage = () => {
     console.log("Usage: manage-agents tune [options]")
-    console.log("  --steps <number>                  Set max execution steps")
-    console.log("  --temp <0.0-1.0>                  Set temperature")
+    console.log("  --steps <number>                  Set max execution steps (positive integer)")
     console.log(`  --variant <name> / --effort <name> Set model variant (known: ${KNOWN_MODEL_VARIANTS.join("|")}; model-exposed variants from opencode models --verbose are supported)`)
     console.log("  --clear-variant / --clear-effort  Remove variant from agent frontmatter (revert to model default)")
+    console.log("  --mode <primary|subagent|all>     Set agent execution mode")
+    console.log("  --hidden / --no-hidden            Hide or unhide target agents")
     console.log("  --pack <pack> / --all             Target the agents of one pack, or all agents")
   }
 
-  if (args.includes("--help") || args.includes("-h")) {
+  const parsed = parseTuneCliArgs(args)
+  if (parsed.kind === "help") {
     usage()
     return
   }
+  if (parsed.kind === "error") {
+    console.error(`Error: ${terminalSafeText(parsed.message)}\n`)
+    usage()
+    process.exitCode = 1
+    return
+  }
 
-  let steps: number | undefined
-  let temp: number | undefined
-  let variant: string | null | undefined
-  let variantProvided = false
-  let clearVariant = false
-  let category = ""
-  let allCategories = false
+  const { category, allCategories, params } = parsed
+  const agents = findAgentFiles(workspaceRoot)
+  const targetAgents = !allCategories && category ? agents.filter(a => a.category === category) : agents
+  if (targetAgents.length === 0) {
+    console.error(
+      category
+        ? `Error: No agents found for pack "${terminalSafeText(category)}".`
+        : "Error: No agents found in workspace."
+    )
+    process.exitCode = 1
+    return
+  }
 
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--steps" && args[i + 1]) steps = parseInt(args[++i], 10)
-    else if (args[i] === "--temp" && args[i + 1]) temp = parseFloat(args[++i])
-    else if ((args[i] === "--pack" || args[i] === "--category" || args[i] === "-c") && args[i + 1]) category = args[++i]
-    else if (args[i] === "--all") allCategories = true
-    else if (args[i] === "--clear-variant" || args[i] === "--clear-effort") clearVariant = true
-    else if (args[i] === "--variant" || args[i] === "--effort") {
-      const value = args[i + 1]
-      if (value === undefined || value.trim() === "" || value.startsWith("-")) {
-        console.error(`Error: ${args[i]} requires a non-empty variant name.\n`)
-        usage()
-        process.exitCode = 1
-        return
-      }
-      variant = value
-      variantProvided = true
-      i++
+  const catalog = loadModelCatalog()
+  const allowedVariants = resolveAllowedTuneVariants(targetAgents, catalog)
+  let updateParams: Parameters<typeof updateAgentParams>[1] = { ...params, allowedVariants }
+  if (params.variant !== undefined && params.variant !== null) {
+    try {
+      const validated = buildTuningUpdateParams(
+        { steps: "50", variant: params.variant, mode: "subagent", hidden: false },
+        new Set(["variant"]),
+        allowedVariants,
+      )
+      if (validated.variant !== undefined) updateParams = { ...updateParams, variant: validated.variant }
+    } catch (error: any) {
+      console.error(`Error: ${terminalSafeText(error?.message || error)}`)
+      process.exitCode = 1
+      return
     }
   }
 
-  if (variantProvided && clearVariant) {
-    console.error("Error: --variant/--effort cannot be used with --clear-variant/--clear-effort.\n")
-    usage()
-    process.exitCode = 1
-    return
-  }
-
-  if (steps === undefined && temp === undefined && !variantProvided && !clearVariant) {
-    console.error("Error: Specify at least one of --steps, --temp, --variant, or --clear-variant.\n")
-    usage()
-    process.exitCode = 1
-    return
-  }
-
-  if (clearVariant) variant = null
-
-  const agents = findAgentFiles(workspaceRoot)
-  const targetAgents = !allCategories && category ? agents.filter(a => a.category === category) : agents
-
   console.log(`\n🎯 Parameter Tuning CLI`)
-  console.log(`   Target agents: ${targetAgents.length}${!allCategories && category ? ` (category: ${category})` : " (all)"}`)
-  console.log(`   Steps:       ${steps !== undefined ? steps : "unchanged"}`)
-  console.log(`   Temperature: ${temp !== undefined ? temp : "unchanged"}`)
-  console.log(`   Variant:     ${variant === undefined ? "unchanged" : variant === null ? "cleared" : variant}\n`)
-
-  const catalog = variant !== undefined && variant !== null ? loadModelCatalog() : undefined
-  const allowedVariants = catalog
-    ? [...new Set([...KNOWN_MODEL_VARIANTS, ...targetAgents.flatMap(agent => getModelVariants(catalog, agent.model) || [])])]
-    : undefined
-  repositoryMutation(workspaceRoot, targetAgents.map(a => a.currentPath), AUTO_COMMIT_MESSAGES.tune, () => updateAgentParams(targetAgents, { steps, temperature: temp, variant, allowedVariants }))
-  console.log(`✅ Successfully updated parameters for ${targetAgents.length} agents!\n`)
+  console.log(`   Target agents: ${targetAgents.length}${!allCategories && category ? ` (pack: ${terminalSafeText(category)})` : " (all)"}`)
+  console.log(`   Steps:       ${params.steps !== undefined ? params.steps : "unchanged"}`)
+  console.log(`   Variant:     ${params.variant === undefined ? "unchanged" : params.variant === null ? "cleared" : terminalSafeText(params.variant)}`)
+  console.log(`   Mode:        ${params.mode !== undefined ? params.mode : "unchanged"}`)
+  console.log(`   Hidden:      ${params.hidden !== undefined ? params.hidden : "unchanged"}\n`)
+  try {
+    repositoryMutation(workspaceRoot, targetAgents.map(a => a.currentPath), AUTO_COMMIT_MESSAGES.tune, () =>
+      updateAgentParams(targetAgents, updateParams)
+    )
+    console.log(`✅ Successfully updated parameters for ${targetAgents.length} agents!\n`)
+  } catch (error: any) {
+    console.error(`Error: ${terminalSafeText(error?.message || error)}`)
+    process.exitCode = 1
+  }
 }
 
 // Pack content may be hostile: escape C1 controls, which JSON.stringify leaves raw and some terminals interpret.
@@ -739,31 +769,150 @@ function printPackValidation(validation: PackValidation) {
 
 function runPackCLI() {
   const [action, ...rest] = process.argv.slice(3)
-  if ((action !== "validate" && action !== "list" && action !== "init") || rest.includes("--help") || rest.includes("-h")) {
+  const validActions = new Set(["validate", "list", "init", "onboard", "doctor", "add"])
+  if (!action || !validActions.has(action) || rest.includes("--help") || rest.includes("-h")) {
     console.log("Usage: manage-agents pack validate <pack-dir>... [--json] [--git]")
     console.log("       manage-agents pack list [--json]")
-    console.log("       manage-agents pack init [<dir>] [--name <slug>] [--version <semver>] [--description <text>] [--no-organize] [--json]")
-    console.log("validate checks directories against the OpenCode pack contract (manage-agents/contract/CONTRACT.md); list shows packs from registered sources; init generates opencode-pack.json for a folder of .md agents.")
-    if (action !== "validate" && action !== "list" && action !== "init" && action !== "--help" && action !== "-h") process.exitCode = 2
+    console.log("       manage-agents pack init|onboard [<dir>] [--name <slug>] [--version <semver>] [--description <text>] [--layout auto|root|subpack] [--authoring-kit] [--clone-source <name>] [--no-organize] [--json]")
+    console.log("       manage-agents pack doctor [<dir>] [--fix] [--authoring-kit] [--bump patch|minor|major] [--json]")
+    console.log("       manage-agents pack add <agent|skill|command> <id> [--dir <dir>] [--description <text>] [--mode primary|subagent|all] [--json]")
+    console.log("validate checks directories against the OpenCode pack contract (contract/CONTRACT.md); init/onboard turns a folder or Git source into a Contract 1.1 pack; doctor inspects & repairs drift; add scaffolds compliant resources.")
+    if (action && !validActions.has(action) && action !== "--help" && action !== "-h") process.exitCode = 2
     return
   }
-  const valued = action === "init" ? ["--name", "--version", "--description"] : []
-  const booleans = action === "validate" ? ["--json", "--git"] : action === "init" ? ["--json", "--no-organize"] : ["--json"]
+  const valued =
+    action === "init" || action === "onboard"
+      ? ["--name", "--version", "--description", "--layout", "--clone-source"]
+      : action === "doctor"
+        ? ["--bump"]
+        : action === "add"
+          ? ["--dir", "--description", "--mode"]
+          : []
+  const booleans =
+    action === "validate"
+      ? ["--json", "--git"]
+      : action === "init" || action === "onboard"
+        ? ["--json", "--no-organize", "--authoring-kit"]
+        : action === "doctor"
+          ? ["--json", "--fix", "--authoring-kit"]
+          : ["--json"]
   const parsed = parseCliArgs(rest, valued, booleans)
   if (typeof parsed === "string") return cliError(parsed)
-  if (action === "init") {
+
+  if (action === "init" || action === "onboard") {
     try {
-      const targetDir = path.resolve(parsed.positional[0] ?? process.cwd())
-      const result = initPackManifest(targetDir, {
+      const rawLayout = parsed.values["--layout"]
+      if (rawLayout !== undefined && rawLayout !== "auto" && rawLayout !== "root" && rawLayout !== "subpack") {
+        return cliError(`invalid --layout "${rawLayout}": expected auto, root or subpack`)
+      }
+      const layout: OnboardingLayout = (rawLayout as OnboardingLayout | undefined) ?? (action === "onboard" ? "auto" : "root")
+      let targetDir: string
+      let clonedInfo: { sourceName: string; localSourceName: string } | null = null
+
+      if (parsed.values["--clone-source"]) {
+        const registry = loadSources()
+        const src = findSource(registry, parsed.values["--clone-source"])
+        const destDir = parsed.positional[0] ?? suggestCloneDestination(src)
+        const cloned = cloneGitSourceForOnboarding({ source: src, destDir, registry })
+        targetDir = cloned.localRoot
+        clonedInfo = { sourceName: src.name, localSourceName: cloned.localSource.name }
+      } else {
+        targetDir = path.resolve(parsed.positional[0] ?? process.cwd())
+      }
+
+      const result = applyPackOnboarding(targetDir, {
         name: parsed.values["--name"],
         version: parsed.values["--version"],
         description: parsed.values["--description"],
+        layout,
         organize: !parsed.flags.has("--no-organize"),
+        authoringKit: parsed.flags.has("--authoring-kit"),
       })
-      if (parsed.flags.has("--json")) return printJson(result)
-      console.log(`Initialized pack "${terminalSafeText(result.manifest.name)}"@${terminalSafeText(result.manifest.version)} at ${terminalSafeText(result.manifestPath)}`)
+      if (parsed.flags.has("--json")) return printJson({ ...(clonedInfo ? { cloned: clonedInfo } : {}), ...result })
+      if (clonedInfo) {
+        console.log(`Cloned "${terminalSafeText(clonedInfo.sourceName)}" -> ${terminalSafeText(targetDir)} (active source: ${terminalSafeText(clonedInfo.localSourceName)})`)
+      }
+      console.log(`Initialized pack "${terminalSafeText(result.manifest.name)}"@${terminalSafeText(result.manifest.version)} (contract ${terminalSafeText(result.manifest.contract)}, layout: ${result.layout}) at ${terminalSafeText(result.manifestPath)}`)
       for (const moved of result.movedAgents) console.log(`  moved ${terminalSafeText(moved.from)} -> ${terminalSafeText(moved.to)}`)
+      for (const moved of result.movedResources) console.log(`  moved ${terminalSafeText(moved.from)} -> ${terminalSafeText(moved.to)}`)
+      for (const kit of result.kitFiles) console.log(`  kit ${terminalSafeText(kit)}`)
       for (const warning of result.warnings) console.log(`  ${terminalSafeText(warning)}`)
+    } catch (error) {
+      cliError(error instanceof Error ? error.message : String(error), 1)
+    }
+    return
+  }
+
+  if (action === "doctor") {
+    try {
+      const baseDir = path.resolve(parsed.positional[0] ?? process.cwd())
+      const targetPackDir = resolveEditablePackDir(baseDir) ?? baseDir
+      const rawBump = parsed.values["--bump"]
+      if (rawBump !== undefined && rawBump !== "patch" && rawBump !== "minor" && rawBump !== "major") {
+        return cliError(`invalid --bump "${rawBump}": expected patch, minor or major`)
+      }
+      let bumped: { previousVersion: string; nextVersion: string } | null = null
+      if (rawBump) {
+        bumped = bumpPackVersion(targetPackDir, rawBump as SemverReleaseKind)
+      }
+      const shouldMutate = parsed.flags.has("--fix") || parsed.flags.has("--authoring-kit")
+      const fixOutcome = shouldMutate
+        ? fixPackDoctor(targetPackDir, { repoRoot: baseDir, authoringKit: parsed.flags.has("--authoring-kit") })
+        : null
+      const report = fixOutcome ? fixOutcome.report : inspectPackDoctor(targetPackDir, baseDir)
+      if (parsed.flags.has("--json")) {
+        printJson({
+          ...(bumped ? { bumped } : {}),
+          ...(fixOutcome ? { appliedFixes: fixOutcome.appliedFixes, kitFiles: fixOutcome.kitFiles } : {}),
+          report,
+        })
+      } else {
+        const m = report.manifest
+        console.log(`${m ? `${terminalSafeText(m.name)}@${terminalSafeText(m.version)} (contract ${terminalSafeText(m.contract)})` : "Invalid pack"}  ${terminalSafeText(report.packDir)}`)
+        if (bumped) console.log(`  version: ${terminalSafeText(bumped.previousVersion)} -> ${terminalSafeText(bumped.nextVersion)}`)
+        if (fixOutcome) {
+          for (const fix of fixOutcome.appliedFixes) console.log(`  fixed: ${terminalSafeText(fix)}`)
+          for (const kf of fixOutcome.kitFiles) console.log(`  kit: ${terminalSafeText(kf)}`)
+        }
+        console.log(`  Authoring kit: skill=${report.hasAuthoringSkill ? "installed" : "missing"}, ci=${report.hasCiWorkflow ? "installed" : "missing"}`)
+        if (report.findings.length === 0) {
+          console.log("  ✓ Pack satisfies OpenCode Contract 1.1 with zero findings.")
+        } else {
+          for (const f of report.findings) {
+            console.log(`  ${f.level}${f.autoFixable ? " [fixable]" : ""} [${terminalSafeText(f.code)}]${f.path ? ` ${terminalSafeText(f.path)}:` : ""} ${terminalSafeText(f.message)}`)
+          }
+        }
+      }
+      if (hasErrors(report.validation)) process.exitCode = 1
+    } catch (error) {
+      cliError(error instanceof Error ? error.message : String(error), 1)
+    }
+    return
+  }
+
+  if (action === "add") {
+    try {
+      const [rawKind, rawId] = parsed.positional
+      if (rawKind !== "agent" && rawKind !== "skill" && rawKind !== "command") {
+        return cliError("usage: manage-agents pack add <agent|skill|command> <id> [--dir <dir>] [--description <text>] [--mode primary|subagent|all]")
+      }
+      if (!rawId) {
+        return cliError(`pack add ${rawKind} requires an <id>`)
+      }
+      const rawMode = parsed.values["--mode"]
+      if (rawMode !== undefined && rawMode !== "primary" && rawMode !== "subagent" && rawMode !== "all") {
+        return cliError(`invalid --mode "${rawMode}": expected primary, subagent or all`)
+      }
+      const baseDir = path.resolve(parsed.values["--dir"] ?? process.cwd())
+      const targetPackDir = resolveEditablePackDir(baseDir) ?? baseDir
+      const created = scaffoldPackResource(targetPackDir, {
+        kind: rawKind as ScaffoldResourceKind,
+        id: rawId,
+        description: parsed.values["--description"],
+        mode: rawMode as "primary" | "subagent" | "all" | undefined,
+      })
+      if (parsed.flags.has("--json")) return printJson(created)
+      console.log(`Created ${created.kind} "${terminalSafeText(created.id)}" at ${terminalSafeText(created.relativePath)}`)
     } catch (error) {
       cliError(error instanceof Error ? error.message : String(error), 1)
     }
@@ -816,7 +965,7 @@ function runSourceCLI() {
       if (!registry.sources.length) console.log("No sources. Add one with `manage-agents source add [<name>] <dir|git-url|owner/repo>`.")
       for (const source of registry.sources) {
         const activeMark = registry.active === source.name ? "* " : "  "
-        const location = source.kind === "local" ? source.path : `${source.url}${source.ref ? `#${source.ref}` : ""} (${sourceRevision(source)?.slice(0, 12) ?? "not pulled"})`
+        const location = source.kind === "local" ? source.path : `${redactUrlCredentials(source.url)}${source.ref ? `#${source.ref}` : ""} (${sourceRevision(source)?.slice(0, 12) ?? "not pulled"})`
         console.log(`${activeMark}${safe(source.name)}  ${source.kind}  ${source.trusted ? "trusted" : "untrusted"}  ${safe(location)}`)
       }
       for (const [pack, source] of Object.entries(registry.prefer)) console.log(`prefer ${safe(pack)} from ${safe(source)}`)
@@ -847,9 +996,9 @@ function runSourceCLI() {
     if (action === "auth") {
       const host = parsed.values["--hostname"] ?? "github.com"
       const status = inspectGhAuth(host)
+      if (!status.authenticated) process.exitCode = 1
       if (parsed.flags.has("--json")) return printJson(status)
       console.log(safe(status.message))
-      if (!status.authenticated) process.exitCode = 1
       return
     }
     if (action === "remove") {
@@ -904,7 +1053,7 @@ function runResolveCLI() {
     const registry = loadSources()
     const { candidates, problems: discoveryProblems } = discoverAllPacks(registry)
     const resolution = resolvePacks(requests, candidates, { prefer: registry.prefer, revisionOf: name => sourceRevision(findSource(registry, name)) })
-    const target = path.resolve(parsed.values["--target"] ?? defaultTarget())
+    const target = realpathThroughExistingAncestor(path.resolve(parsed.values["--target"] ?? defaultTarget()))
     const lock = resolution.problems.length ? null : buildLock(resolution)
     const previousLock = readLock(target)
     const diff = lock ? diffLocks(previousLock, lock) : { changes: [], executable: [] }
@@ -937,6 +1086,7 @@ const TARGET_USAGE = `Usage: manage-agents <command> [--target <opencode-config-
                      remove root packs; dependencies still required stay
   update [<pack>...] [--adopt] [--yes] [--dry-run] [--json]
                      pull the git sources of the named packs (all packs when none is named) and re-resolve within the ranges
+  update --self [...]  update the manage-agents engine itself from GitHub Releases (alias for self-update)
   reconcile [--adopt] [--dry-run] [--json]
                      rebuild the target from its desired state and lock (repairs missing or deleted files)
   status [--json]    read-only drift report; exit 1 when something differs
@@ -946,8 +1096,9 @@ const TARGET_USAGE = `Usage: manage-agents <command> [--target <opencode-config-
 --yes accepts executable content that needs confirmation (required without a terminal).
 Default target: $XDG_CONFIG_HOME/opencode (~/.config/opencode). State lives in <target>/.manage-agents/.`
 
-async function confirmInTerminal(reasons: string[], yes: boolean): Promise<boolean> {
-  for (const reason of reasons) console.log(`needs confirmation: ${terminalSafeText(reason)}`)
+async function confirmInTerminal(reasons: string[], yes: boolean, json = false): Promise<boolean> {
+  if (json && !yes) return false
+  if (!json) for (const reason of reasons) console.log(`needs confirmation: ${terminalSafeText(reason)}`)
   if (yes) return true
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     console.error("Error: this change needs confirmation; review the lines above and rerun with --yes.")
@@ -963,6 +1114,7 @@ function printChangeResult(command: string, target: string, result: ChangeResult
   const plan = result.plan
   const problems = [...(result.change?.problems ?? []), ...(plan?.conflicts ?? [])]
   const warnings = [...(result.change?.warnings ?? []), ...(plan?.warnings ?? [])]
+  if (result.status === "failed" || result.status === "declined") process.exitCode = 1
   if (json) {
     printJson({
       command, target, status: result.status, recovered: result.recovered, changes: result.changes, confirmations: result.confirmations, problems, warnings,
@@ -972,11 +1124,13 @@ function printChangeResult(command: string, target: string, result: ChangeResult
     return
   }
   for (const line of describeChangeResult(target, result)) console.log(line)
-  if (result.status === "failed" || result.status === "declined") process.exitCode = 1
 }
 
 async function runTargetCLI(command: "install" | "uninstall" | "update" | "reconcile" | "status" | "restore") {
   const args = process.argv.slice(3)
+  if (command === "update" && args.includes("--self")) {
+    return runSelfUpdateCLI(args.filter(arg => arg !== "--self"))
+  }
   if (args.includes("--help") || args.includes("-h")) return console.log(TARGET_USAGE)
   const booleans = { install: ["--adopt", "--yes", "--dry-run", "--json"], update: ["--adopt", "--yes", "--dry-run", "--json"], reconcile: ["--adopt", "--dry-run", "--json"], uninstall: ["--dry-run", "--json"], status: ["--json"], restore: [] }[command]
   const parsed = parseCliArgs(args, ["--target"], booleans)
@@ -1005,7 +1159,7 @@ async function runTargetCLI(command: "install" | "uninstall" | "update" | "recon
       console.log(`Restored ${restored.files.length} file(s) and ${restored.config.length} config entr${restored.config.length === 1 ? "y" : "ies"}; they are no longer managed. \`manage-agents status\` shows what now differs from the packs.`)
       return
     }
-    const options = { adopt: parsed.flags.has("--adopt"), dryRun: parsed.flags.has("--dry-run"), confirm: (reasons: string[]) => confirmInTerminal(reasons, parsed.flags.has("--yes")) }
+    const options = { adopt: parsed.flags.has("--adopt"), dryRun: parsed.flags.has("--dry-run"), confirm: (reasons: string[]) => confirmInTerminal(reasons, parsed.flags.has("--yes"), json) }
     const compute = command === "install" ? installChange(registry, names)
       : command === "uninstall" ? uninstallChange(names)
         : command === "update" ? updateChange(registry, names)
@@ -1187,13 +1341,22 @@ async function runSettingsCLI(command: "models" | "override") {
       saveOverrideSettings(settings)
       message = `Override of ${terminalSafeText(first)} updated for ${scopeLabel}.`
     }
-    console.log(message)
-    if (parsed.flags.has("--no-reconcile")) return console.log("Not reconciled: run `manage-agents reconcile` to apply it.")
-    if (!readLock(target)) return console.log(`Nothing is installed in ${terminalSafeText(target)}; the setting applies at the next install.`)
+    const json = parsed.flags.has("--json")
+    if (!json) console.log(message)
+    if (parsed.flags.has("--no-reconcile")) {
+      if (json) printJson({ updated: true, message, reconciled: false })
+      else console.log("Not reconciled: run `manage-agents reconcile` to apply it.")
+      return
+    }
+    if (!readLock(target)) {
+      if (json) printJson({ updated: true, message, reconciled: false, target })
+      else console.log(`Nothing is installed in ${terminalSafeText(target)}; the setting applies at the next install.`)
+      return
+    }
     const registry = loadSources()
-    const result = await changeTarget(target, command, registry, reconcileChange, { confirm: (reasons: string[]) => confirmInTerminal(reasons, parsed.flags.has("--yes")) })
-    printChangeResult("reconcile", target, result, false)
-    if (scopeTarget === null) console.log("Other targets pick the change up at their next `manage-agents reconcile --target <dir>`.")
+    const result = await changeTarget(target, command, registry, reconcileChange, { confirm: (reasons: string[]) => confirmInTerminal(reasons, parsed.flags.has("--yes"), json) })
+    printChangeResult("reconcile", target, result, json)
+    if (scopeTarget === null && !json) console.log("Other targets pick the change up at their next `manage-agents reconcile --target <dir>`.")
   } catch (error) {
     cliError(error instanceof Error ? error.message : String(error), 1)
   }
@@ -1211,7 +1374,205 @@ export function findWorkspace(start: string): string | null {
   return isVirtualPackRoot(resolvedStart) ? resolvedStart : null
 }
 
-const COMMANDS = ["pack", "source", "resolve", "install", "uninstall", "update", "reconcile", "status", "restore", "models", "override", "create", "lint", "fix-names", "audit", "tune", "bridge"]
+const VERSION_USAGE = `Usage: manage-agents version [--json] [--engine-root <dir>]
+       manage-agents version --write-manifest --ref-type <tag|branch> --ref-name <name> --sha <sha> [--engine-root <dir>] [--json]`
+
+const SELF_UPDATE_USAGE = `Usage: manage-agents self-update [--check] [--yes|-y] [--force] [--allow-unsigned] [--reconcile|--no-reconcile] [--repo <owner/repo>] [--target <dir>] [--engine-root <dir>] [--json]
+       manage-agents update --self [...]
+Checks or installs the latest GitHub Release of manage-agents into its installation directory, verifying SHA-256 and bundle hash (plus Ed25519 signature when release-signing.json is configured).`
+
+const RELEASE_USAGE = `Usage: manage-agents release keygen [--out <private-key-file>] [--key-id <id>] [--repo <owner/repo>] [--replace-keys] [--engine-root <dir>] [--json]
+       manage-agents release sign --tag <tag> --sha <sha> --assets-dir <dir> [--repo <owner/repo>] [--private-key-file <file>] [--engine-root <dir>] [--allow-unsigned] [--json]`
+
+async function runVersionCLI(rawArgs = process.argv.slice(3)) {
+  if (rawArgs.includes("--help") || rawArgs.includes("-h")) return console.log(VERSION_USAGE)
+  const parsed = parseCliArgs(rawArgs, ["--ref-type", "--ref-name", "--sha", "--engine-root"], ["--json", "--write-manifest"])
+  if (typeof parsed === "string") return cliError(`${parsed}\n${VERSION_USAGE}`)
+  if (parsed.positional.length) return cliError(`version takes no positional arguments\n${VERSION_USAGE}`)
+  try {
+    const engineRoot = parsed.values["--engine-root"]
+    const json = parsed.flags.has("--json")
+    if (parsed.flags.has("--write-manifest")) {
+      const refType = parsed.values["--ref-type"]
+      const refName = parsed.values["--ref-name"]
+      const sha = parsed.values["--sha"]
+      if (!refType || !refName || !sha) {
+        return cliError(`version --write-manifest requires --ref-type, --ref-name, and --sha\n${VERSION_USAGE}`)
+      }
+      const manifest = writeEngineReleaseManifest(engineRoot, { refType, refName, sha })
+      if (json) printJson(manifest)
+      else console.log(`Wrote release manifest: ${terminalSafeText(manifest.version)} (${terminalSafeText(manifest.shortCommit)})`)
+      return
+    }
+    const info = resolveEngineVersion(engineRoot)
+    if (json) {
+      printJson(info)
+      return
+    }
+    console.log(`Version: ${terminalSafeText(info.displayVersion)}`)
+    console.log(`Channel: ${terminalSafeText(info.channel)}`)
+    console.log(`Dirty: ${info.dirty ? "yes" : "no"}`)
+    console.log(`Engine root: ${terminalSafeText(info.engineRoot)}`)
+    console.log(`Bundle hash: ${terminalSafeText(info.bundleHash)}`)
+  } catch (error) {
+    cliError(error instanceof Error ? error.message : String(error), 1)
+  }
+}
+
+async function runSelfUpdateCLI(rawArgs = process.argv.slice(3)) {
+  if (rawArgs.includes("--help") || rawArgs.includes("-h")) return console.log(SELF_UPDATE_USAGE)
+  const normalized = rawArgs.map(arg => (arg === "-y" ? "--yes" : arg))
+  const parsed = parseCliArgs(
+    normalized,
+    ["--repo", "--target", "--engine-root"],
+    ["--check", "--yes", "--force", "--allow-unsigned", "--reconcile", "--no-reconcile", "--json"],
+  )
+  if (typeof parsed === "string") return cliError(`${parsed}\n${SELF_UPDATE_USAGE}`)
+  if (parsed.positional.length) return cliError(`self-update takes no pack names (use 'manage-agents update <pack>' for packs)\n${SELF_UPDATE_USAGE}`)
+  if (parsed.flags.has("--reconcile") && parsed.flags.has("--no-reconcile")) {
+    return cliError(`cannot combine --reconcile and --no-reconcile\n${SELF_UPDATE_USAGE}`)
+  }
+  try {
+    const engineRoot = parsed.values["--engine-root"]
+    const repository = parsed.values["--repo"]
+    const target = parsed.values["--target"]
+    const json = parsed.flags.has("--json")
+    const force = parsed.flags.has("--force")
+    const allowUnsigned = parsed.flags.has("--allow-unsigned")
+    const assumeYes = parsed.flags.has("--yes")
+    const reconcile = parsed.flags.has("--no-reconcile") ? false : parsed.flags.has("--reconcile") ? true : undefined
+
+    const checkResult = await checkForEngineUpdate(engineRoot, { repository, target, allowUnsigned })
+    if (parsed.flags.has("--check")) {
+      if (checkResult.downgrade && !force) process.exitCode = 1
+      if (json) {
+        printJson(checkResult)
+      } else {
+        console.log(`Current version: ${terminalSafeText(checkResult.currentVersion.displayVersion)}`)
+        console.log(`Latest release:  ${terminalSafeText(checkResult.metadata.tag)} (${terminalSafeText(checkResult.metadata.commit.slice(0, 7))})`)
+        console.log(`Verification:    ${checkResult.verificationMode === "ed25519" ? `Ed25519 (${terminalSafeText(checkResult.metadata.keyId ?? "")})` : "SHA-256 + bundle manifest"}`)
+        console.log(`Archive:         ${terminalSafeText(checkResult.metadata.archive.name)} (${terminalSafeText(checkResult.metadata.archive.sha256)})`)
+        console.log(`Update available: ${checkResult.updateAvailable ? "yes" : checkResult.downgrade ? "no (installed version is newer)" : "no"}`)
+      }
+      return
+    }
+
+    if (checkResult.downgrade && !force) {
+      const msg = `Latest release ${terminalSafeText(checkResult.metadata.tag)} is older than installed ${terminalSafeText(checkResult.currentVersion.displayVersion)}; pass --force to downgrade.`
+      process.exitCode = 1
+      if (json) printJson({ updated: false, applied: false, downgrade: true, checkResult })
+      else console.log(msg)
+      return
+    }
+
+    if (!checkResult.updateAvailable && !force && reconcile !== true) {
+      if (json) printJson({ updated: false, applied: false, checkResult })
+      else console.log(`manage-agents is already up to date (${terminalSafeText(checkResult.currentVersion.displayVersion)}).`)
+      return
+    }
+
+    if (!assumeYes) {
+      if (json || !process.stdin.isTTY || !process.stdout.isTTY) {
+        return cliError("self-update requires --yes when running without an interactive terminal or with --json.", 1)
+      }
+      const answer = await askQuestion(
+        `Update manage-agents ${terminalSafeText(checkResult.currentVersion.displayVersion)} -> ${terminalSafeText(checkResult.metadata.tag)}? [Y/n] `,
+      )
+      if (answer !== "" && !/^y(es)?$/i.test(answer)) {
+        console.log("Self-update cancelled.")
+        return
+      }
+    }
+
+    const result = await applyEngineUpdate(engineRoot, {
+      force,
+      reconcile,
+      target,
+      repository,
+      allowUnsigned,
+      checkResult,
+      onProgress: json ? undefined : msg => console.log(terminalSafeText(msg)),
+    })
+
+    if (result.reconcileResult && (result.reconcileResult.status === "failed" || result.reconcileResult.status === "declined")) process.exitCode = 1
+    if (json) {
+      printJson(result)
+      return
+    }
+    console.log(`Updated manage-agents: ${terminalSafeText(result.checkResult.currentVersion.displayVersion)} -> ${terminalSafeText(result.versionInfo.displayVersion)}`)
+    if (result.dependenciesInstalled) console.log("Dependencies synchronized.")
+    if (result.reconcileResult) console.log(`OpenCode target reconciled (${terminalSafeText(result.reconcileResult.status)}).`)
+  } catch (error) {
+    cliError(error instanceof Error ? error.message : String(error), 1)
+  }
+}
+
+async function runReleaseCLI(rawArgs = process.argv.slice(3)) {
+  const action = rawArgs[0]
+  if (!action || action === "--help" || action === "-h" || rawArgs.includes("--help") || rawArgs.includes("-h")) {
+    return console.log(RELEASE_USAGE)
+  }
+  if (action !== "keygen" && action !== "sign") {
+    return cliError(`release requires 'keygen' or 'sign'\n${RELEASE_USAGE}`)
+  }
+  const rest = rawArgs.slice(1)
+  try {
+    if (action === "keygen") {
+      const parsed = parseCliArgs(rest, ["--out", "--key-id", "--repo", "--engine-root"], ["--replace-keys", "--json"])
+      if (typeof parsed === "string") return cliError(`${parsed}\n${RELEASE_USAGE}`)
+      if (parsed.positional.length) return cliError(`release keygen takes no positional arguments\n${RELEASE_USAGE}`)
+      const engineRoot = parsed.values["--engine-root"]
+      const res = generateReleaseSigningKeypair(engineRoot, {
+        outPrivateKeyPath: parsed.values["--out"] ?? ".release-key.pem",
+        keyId: parsed.values["--key-id"],
+        repository: parsed.values["--repo"],
+        replaceKeys: parsed.flags.has("--replace-keys"),
+      })
+      if (parsed.flags.has("--json")) {
+        printJson({
+          keyId: res.keyId,
+          publicKeyPem: res.publicKeyPem,
+          configPath: res.configPath,
+          privateKeyPath: res.privateKeyPath,
+        })
+      } else {
+        console.log(`Generated Ed25519 release signing key: ${terminalSafeText(res.keyId)}`)
+        console.log(`Public trust config: ${terminalSafeText(res.configPath)}`)
+        if (res.privateKeyPath) console.log(`Private key file (0600): ${terminalSafeText(res.privateKeyPath)}`)
+        console.log("Store the private key as RELEASE_SIGNING_PRIVATE_KEY in your GitHub Actions 'release' environment.")
+      }
+      return
+    }
+
+    const parsed = parseCliArgs(rest, ["--tag", "--sha", "--assets-dir", "--repo", "--private-key-file", "--engine-root"], ["--allow-unsigned", "--json"])
+    if (typeof parsed === "string") return cliError(`${parsed}\n${RELEASE_USAGE}`)
+    if (parsed.positional.length) return cliError(`release sign takes no positional arguments\n${RELEASE_USAGE}`)
+    const tag = parsed.values["--tag"]
+    const sha = parsed.values["--sha"]
+    const assetsDir = parsed.values["--assets-dir"]
+    if (!tag || !sha || !assetsDir) return cliError(`release sign requires --tag, --sha, and --assets-dir\n${RELEASE_USAGE}`)
+    const privateKeyPem = parsed.values["--private-key-file"] ? fs.readFileSync(parsed.values["--private-key-file"], "utf8") : undefined
+    const res = signReleaseAssets(parsed.values["--engine-root"], {
+      tag,
+      sha,
+      assetsDir,
+      repository: parsed.values["--repo"],
+      privateKeyPem,
+      allowUnsigned: parsed.flags.has("--allow-unsigned"),
+    })
+    if (parsed.flags.has("--json")) {
+      printJson(res)
+    } else {
+      console.log(`Wrote release metadata: ${terminalSafeText(res.metadataPath)}`)
+      if (res.signaturePath) console.log(`Signed Ed25519 (${terminalSafeText(res.metadata.keyId ?? "")}): ${terminalSafeText(res.signaturePath)}`)
+      else console.log("Unsigned SHA-256 metadata mode (no release-signing.json / RELEASE_SIGNING_PRIVATE_KEY configured).")
+    }
+  } catch (error) {
+    cliError(error instanceof Error ? error.message : String(error), 1)
+  }
+}
+
+const COMMANDS = ["pack", "source", "resolve", "install", "uninstall", "update", "self-update", "version", "release", "reconcile", "status", "restore", "models", "override", "create", "lint", "fix-names", "audit", "tune", "bridge"]
 const WORKSPACE_COMMANDS: Record<string, (workspaceRoot: string) => Promise<void>> = {
   create: workspaceRoot => runCreate(workspaceRoot),
   lint: runLint,
@@ -1233,12 +1594,18 @@ async function run() {
   if (sourceFlag !== -1) process.argv.splice(sourceFlag, 2)
   const command = process.argv[2]
 
+  if (command === "--version" || command === "-v" || command === "-V") {
+    return runVersionCLI(process.argv.slice(3))
+  }
   if (command === "--help" || command === "-h") {
     console.log("Usage: manage-agents [<command>] [options] [--workspace <catalog-or-pack-dir>] [--source <registered-source>]")
     console.log(`Commands: ${COMMANDS.join(", ")}. Without a command the TUI opens on the workspace, active source, or Data Sources screen.`)
     console.log("The workspace (for create, lint, fix-names, audit, tune, bridge) is --workspace, $MANAGE_AGENTS_WORKSPACE, or the nearest pack catalog or pack above the current directory.")
     return
   }
+  if (command === "version") return runVersionCLI()
+  if (command === "self-update") return runSelfUpdateCLI()
+  if (command === "release") return runReleaseCLI()
   if (command === "pack") return runPackCLI()
   if (command === "source") return runSourceCLI()
   if (command === "resolve") return runResolveCLI()
@@ -1251,7 +1618,7 @@ async function run() {
     if (!workspaceRoot || findWorkspace(workspaceRoot) !== workspaceRoot) {
       return cliError(`no pack catalog or pack found${explicitWorkspace ? ` at ${terminalSafeText(explicitWorkspace)}` : " above the current directory"}; pass --workspace <dir> (a directory with packs/<name>/opencode-pack.json, or a pack)`, 1)
     }
-    return WORKSPACE_COMMANDS[command](workspaceRoot)
+    return command === "bridge" ? runBridge(workspaceRoot, explicitSource) : WORKSPACE_COMMANDS[command](workspaceRoot)
   }
 
   let tuiWorkspaceRoot: string | undefined
@@ -1324,6 +1691,7 @@ async function run() {
       initialSource={initialSource}
       startupNotice={startupNotice}
       listShare={uiConfig.config.listShare}
+      reducedMotion={uiConfig.config.reducedMotion}
       uiConfigWarning={uiConfig.warning}
       configReadOnly={uiConfig.readOnly}
       uiConfigRevision={uiConfig.revision}

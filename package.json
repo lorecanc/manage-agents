@@ -20,7 +20,7 @@
     "start": "node manage-agents.mjs",
     "build": "node src/build.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "npm run typecheck && node --import tsx --test \"src/utils/*.test.ts\" \"runtime/**/*.test.mjs\"",
+    "test": "npm run typecheck && node --experimental-ffi --no-warnings=ExperimentalWarning --import tsx --test \"src/utils/*.test.ts\" \"runtime/**/*.test.mjs\"",
     "validate": "npm test && npm run build && node manage-agents.mjs pack validate contract/examples/minimal-pack"
   },
   "dependencies": {
@@ -42,7 +42,7 @@
   "files": [
     "manage-agents.mjs",
     "dist",
-    "assets",
+    "assets/plugin-icon.png",
     "contract",
     "runtime",
     "README.md",

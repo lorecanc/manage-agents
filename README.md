@@ -1,232 +1,328 @@
 # manage-agents
 
-Install, edit and route OpenCode agents distributed as **packs**.
+[![CI](https://github.com/lorecanc/manage-agents/actions/workflows/ci.yml/badge.svg)](https://github.com/lorecanc/manage-agents/actions/workflows/ci.yml)
+![Node >=26.4.0 | Bun >=1.3.0](https://img.shields.io/badge/runtime-Node%20%3E%3D26.4.0%20%7C%20Bun%20%3E%3D1.3.0-3fb950)
+![Pack Contract 1.1](https://img.shields.io/badge/pack%20contract-1.1-58a6ff)
+![License MIT](https://img.shields.io/badge/license-MIT-blue)
 
-A pack is a directory laid out like an OpenCode config directory (`agents/`, `commands/`, `skills/`, `plugins/`,
-`tools/<pack>/`, `opencode.json`) plus an `opencode-pack.json` manifest. Packs come from **sources**: local
-directories or git repositories, any number of them. manage-agents resolves the packs you ask for and the packs they
-require, copies them into an OpenCode config directory, merges their `opencode.json` entries into yours, and keeps
-track of what it owns so it can update or remove it later. It also edits agents (models, permissions, skills,
-delegations, parameters), generates the model routing of archetype packs, and translates packs into Claude Code
-plugins and Codex layers.
+Catalog-agnostic CLI and 3-workspace OpenTUI engine for validating, onboarding, resolving, editing, routing, and installing **OpenCode V2 agent packs** from local directories or Git/GitHub repositories.
 
-The engine and the packs are independent: the engine knows nothing about a particular catalog, and a catalog needs
-nothing from the engine beyond the contract.
+A **pack** mirrors an OpenCode configuration directory (`agents/`, `commands/`, `skills/`, `plugins/`, `themes/`, `tools/<pack>/`, optional `opencode.json(c)` and `AGENTS.md`) plus an `opencode-pack.json` manifest. `manage-agents` resolves requested packs and their SemVer `requires` dependencies, merges managed entries into `<target>/opencode.json` without touching your own keys, installs a runtime router plugin (`manage-agents-router`) for dynamic `IF / OR` model and policy routing, customizes read-only Git sources non-destructively via scoped user overrides, and translates packs into **Claude Code plugins** and **Codex layers**.
 
-- Pack contract (what a pack may contain, how it is installed): [`contract/CONTRACT.md`](contract/CONTRACT.md),
-  JSON Schema [`contract/opencode-pack.schema.json`](contract/opencode-pack.schema.json), example
-  [`contract/examples/minimal-pack`](contract/examples/minimal-pack).
-- Skill for agents that write packs: [`contract/skills/opencode-pack-authoring`](contract/skills/opencode-pack-authoring/SKILL.md).
-- [Guida pratica in italiano](GUIDA.md).
+The engine and pack catalogs are strictly independent: the engine embeds zero catalog-specific pack names or rules, and pack repositories require no build step or engine dependency beyond the contract.
 
-## Requirements and installation
+- **Pack Contract `1.1`:** [`contract/CONTRACT.md`](contract/CONTRACT.md) · JSON Schema [`contract/opencode-pack.schema.json`](contract/opencode-pack.schema.json) · Reference pack [`contract/examples/minimal-pack`](contract/examples/minimal-pack)
+- **Pack Authoring Skill:** [`contract/skills/opencode-pack-authoring/SKILL.md`](contract/skills/opencode-pack-authoring/SKILL.md)
+- **Project Wiki:** [`wiki/index.md`](wiki/index.md) (architecture, module internals, CLI/contract references, security model)
+- **Guida in italiano:** [`GUIDA.md`](GUIDA.md)
 
-Node.js `>=26.4.0` or Bun `>=1.3.0` (OpenTUI uses FFI; the launcher re-executes Node with `--experimental-ffi`).
+---
+
+## How It Works & Core Concepts
+
+```mermaid
+graph TD
+    Sources["Local & Git/GitHub Sources (Packs & Virtual Packs)"] --> Engine["manage-agents CLI & 3-Workspace OpenTUI"]
+    Settings["Scoped User Settings (routing.json, overrides.json)"] --> Engine
+    Engine --> Validator["Contract 1.1 Validator & Semver Resolver"]
+    Validator --> Installer["Transactional Target Reconciler"]
+    Validator --> Translator["Cross-Harness Bridge Translator"]
+    Installer --> Target["OpenCode Target (opencode.json + .manage-agents/)"]
+    Installer --> Router["Runtime Plugin (manage-agents-router)"]
+    Router --> Target
+    Translator --> Bridges["Claude Code Plugins & Codex Layers"]
+```
+
+| Concept | Definition |
+|---|---|
+| **Pack** | Self-contained unit laid out like `~/.config/opencode/` and governed by `opencode-pack.json` ([Contract `1.1`](contract/CONTRACT.md), backward-compatible with `1.0`). |
+| **Virtual Pack** | In-memory pack view (`0.0.0-virtual`) synthesized automatically from manifest-free `.md` agent folders or project `.opencode/` directories before formal onboarding. |
+| **Workspace** | Local multi-pack catalog (`packs/<name>/opencode-pack.json`) or single pack edited by the TUI and workspace commands (`--workspace <dir>`, `$MANAGE_AGENTS_WORKSPACE`, or ancestor auto-discovery). |
+| **Source** | Named local directory or Git/GitHub repository registered in `$XDG_CONFIG_HOME/manage-agents/sources.json`. Git checkouts live read-only under `$XDG_CACHE_HOME/manage-agents/sources/<name>`. |
+| **Target** | OpenCode config directory (default `$XDG_CONFIG_HOME/opencode`, i.e. `~/.config/opencode`). Tracks `desired.json`, `lock.json`, and `installed.json` inside `<target>/.manage-agents/`. |
+| **Archetype & `IF / OR` Flows** | Caller-driven routing where primary agents (`archetype.callers` or custom `$callers`) dynamically assign subagent models and narrowable `tools`, `permissions`, and `delegations` policies based on the active caller model (`*`, `provider`, or `provider/model`). |
+| **User Settings** | Scoped `routing.json` and `overrides.json` files in `$XDG_CONFIG_HOME/manage-agents/` (global `default` + per-target `targets.<realpath>`). Applied at `reconcile` without modifying pack sources. |
+| **Bridge** | Deterministic, closure-aware translation of a pack and its `requires` into a Claude Code plugin (`bridges/claude-code/<name>`) or Codex layer (`bridges/codex/<name>`). |
+
+---
+
+## Requirements & Installation
+
+### Runtime & External CLIs
+
+- **JavaScript runtime (one required):**
+  - **Node.js `>=26.4.0`** — `@opentui/core` uses native FFI; `manage-agents.mjs` checks the Node version and automatically re-executes with `--experimental-ffi` and `--no-warnings=ExperimentalWarning` (pinning UTF-8 `chcp 65001` on Windows).
+  - **Bun `>=1.3.0`** — supported natively without extra flags.
+
+| CLI | Requirement | Used For |
+|---|---|---|
+| `git` | Required | Cloning/pulling Git sources, commit-pinned cache snapshots, release ancestry checks, and optional scoped workspace `--auto-commit`. |
+| `opencode` | Optional | Queries `opencode models` to populate the live `provider/model` and variant catalog in the TUI picker, `create`, and `tune`. |
+| `gh` | Optional | `source login`, `source auth`, GitHub repo discovery in the TUI, and token-free HTTPS pulls via `gh auth git-credential`. |
+| `claude` | Optional | Runs `claude plugin validate --strict` and user-scope plugin registration during `bridge --target claude`. |
+
+### Install from Source
 
 ```bash
 git clone https://github.com/lorecanc/manage-agents.git manage-agents && cd manage-agents
 npm ci            # or: bun install
-npm link          # optional: puts `manage-agents` on PATH
+npm link          # optional: exposes `manage-agents` on PATH
 ```
 
-Run it with `manage-agents`, `node manage-agents.mjs` or `bun manage-agents.mjs`. The launcher rebuilds `dist/` when
-the sources are newer.
+Run with `manage-agents` (if linked), `./manage-agents.mjs`, `node manage-agents.mjs`, `bun manage-agents.mjs`, or `npm start`.
 
-## Quick start
+**Self-bootstrapping launcher:** When launched from a source checkout, `manage-agents.mjs` verifies `node_modules` against `package.json` (installing with `--ignore-scripts` if out of sync unless `MANAGE_AGENTS_SKIP_AUTO_INSTALL=1` is set) and automatically rebuilds `dist/index.js` via `esbuild` whenever `src/` or `package.json` is newer.
+
+### Self-Update from GitHub Releases
+
+Tagged `v*` GitHub Releases ship prebuilt `manage-agents-<tag>.tar.gz` bundles (`dist/` included, no build step needed):
 
 ```bash
-manage-agents source login                                                # optional: log in via GitHub CLI (gh)
-manage-agents source add lorecanc/agents --pull                           # GitHub owner/repo, git URL, or local dir
-manage-agents install flow pipeline                                       # into $XDG_CONFIG_HOME/opencode
-manage-agents status                                                      # "In sync." when nothing drifted
-manage-agents update                                                      # pull and move to the new versions
+manage-agents version                # inspect version, channel, and bundle hash (--json supported)
+manage-agents self-update --check    # check for newer v* releases without modifying disk
+manage-agents self-update            # verify SHA-256 + bundleHash (+ Ed25519 sig), update, and reconcile router
 ```
 
-Run `manage-agents` (or `npm start`) anywhere: inside a local catalog it opens that workspace; outside one it opens
-your active registered source (or the **Data Sources** screen to sign in with `gh` and attach a GitHub repository or
-local directory). Pass `--workspace <dir>` or `--source <name>` to pick one explicitly.
+---
 
-## Concepts
+## Quick Start & Common Workflows
 
-- **Source**: a directory or git repository holding packs (`packs/<name>/opencode-pack.json`, or packs at any depth).
-  Registered in `$XDG_CONFIG_HOME/manage-agents/sources.json`; git checkouts live in
-  `$XDG_CACHE_HOME/manage-agents/sources/<name>` and are never edited.
-- **Target**: an OpenCode config directory, by default `$XDG_CONFIG_HOME/opencode` (`~/.config/opencode`). Its
-  state is in `<target>/.manage-agents/`: `desired.json` (what you asked for), `lock.json` (exact resolution:
-  source, version, revision, hashes) and `installed.json` (files and config entries the engine owns).
-- **Workspace**: the catalog (a directory with `packs/<name>/opencode-pack.json`) or the single pack that the TUI and
-  the agent commands (`create`, `lint`, `fix-names`, `audit`, `tune`, `bridge`) edit. It is `--workspace <dir>`,
-  `$MANAGE_AGENTS_WORKSPACE`, or the nearest catalog or pack above the current directory.
-- **Archetype pack**: a pack whose primary agents (`archetype.callers`) delegate to its subagents, with
-  `routingDefaults` that pick the subagents' models from the caller's model. The engine installs its own router
-  plugin, `plugins/manage-agents-router`, and generates its `routing.json` at every reconcile.
-- **User settings**: `$XDG_CONFIG_HOME/manage-agents/routing.json` (model routing) and `overrides.json` (frontmatter
-  patches) apply at reconcile, globally or per target, and are never written into packs, so they also work with
-  read-only git sources.
+### 1. Attach a Source, Install, and Update Packs
 
-## CLI
+```bash
+manage-agents source login                              # optional: authenticate GitHub CLI for private repos
+manage-agents source add lorecanc/agents --pull         # GitHub owner/repo[#ref], git URL, or local directory
+manage-agents pack list                                 # list available packs (including virtual .md folders)
+manage-agents install flow pipeline                     # transactional install into ~/.config/opencode
+manage-agents status                                    # prints "In sync." when target matches lock.json
+manage-agents update                                    # pull Git sources and upgrade within SemVer ranges
+```
 
-Without a command the TUI opens on the workspace, active source, or Data Sources screen. Every command has `--help`.
+### 2. Onboard, Validate, and Maintain a Pack
 
-Packs, sources and targets:
+```bash
+manage-agents pack onboard ./my-agents --authoring-kit  # migrate V1->V2, infer archetype, add skill + CI workflow
+manage-agents pack validate ./my-agents --git           # enforce Contract 1.1 + stricter git-source rules
+manage-agents pack doctor ./my-agents --fix --bump minor
+manage-agents pack add agent mypack-reviewer --dir ./my-agents --mode subagent
+```
 
-* `pack validate <pack-dir>... [--json] [--git]` — check directories against the contract: layout, manifest,
-  namespaces, `opencode.json` keys, references between files and packs, archetype declarations. Reports the pack's
-  IDs, its executable surface (plugins, tool modules, skill scripts, MCP servers, external commands) and what a
-  required pack must provide; exit 1 on errors. `--git` applies the stricter rules for git sources. `pack list
-  [--json]` shows the packs the registered sources offer (including virtual packs synthesized from manifest-free `.md`
-  agent folders). `pack init [<dir>] [--name <slug>] [--version <semver>] [--description <text>] [--no-organize]`
-  scaffolds `opencode-pack.json` and optionally moves loose `.md` agents into `agents/`.
-* `source list|add|remove|pull|login|auth|trust|untrust|prefer` — `add [<name>] <dir|git-url|owner/repo[#ref]> [--ref <ref>] [--trust] [--pull]`
-  registers a directory, a git repository (`https:`, `ssh:`, `git@host:path`) or a GitHub repository (`owner/repo` or
-  `github:owner/repo`; URLs with credentials are refused, and `<name>` is derived when omitted). `login` runs
-  `gh auth login --web` and `auth` checks `gh` status; when `gh` is authenticated on an HTTPS host, `pull` uses
-  `gh auth git-credential` automatically without storing tokens in `sources.json`. Installing executable content from
-  an untrusted source, or a change to executable content from any source, needs confirmation. `prefer <pack> <source>`
-  picks a source when several offer the same pack.
-* `resolve <[source/]pack[@range]>... [--target <dir>] [--json]` — resolve packs and their `requires` without writing:
-  exactly one candidate per pack name (the newest is never picked silently), cycles and missing packs are errors,
-  every selected pack is validated. Prints the install order, the executable surface, the changes against the
-  target's lock and what would need confirmation.
-* `install <[source/]pack[@range]>...`, `uninstall <pack>...`, `update [<pack>...]`, `reconcile`, `status`,
-  `restore <backup-id>` — all with `[--target <dir>]`; `install`/`uninstall`/`update`/`reconcile` with `--dry-run`
-  and `--json`; `install`/`update`/`reconcile` with `--adopt`; `install`/`update` with `--yes`. The managed part of
-  `opencode.json` is regenerated from the packs while your keys stay; config sections the engine empties are
-  removed. Every conflict (the same ID in two packs, files or entries you own, managed files you changed) is
-  reported before anything is written; `--adopt` backs up and replaces, `restore` undoes it. Writes are journaled
-  and rolled back on failure or after a crash; one command at a time per target. Semantics:
-  [`contract/CONTRACT.md` §8](contract/CONTRACT.md#8-installation-semantics-engine-side).
-* `models show|set|unset|callers|rule-set|rule-unset|export-pack|pin|unpin` and `override show|set|unset` (with
-  `[--target <dir>] [--global] [--no-reconcile] [--yes]`) — user settings. `models set <pack> <trigger[,trigger2...]>
-  <agent>=<provider/model[#variant]|inherit>` routes subagents when a caller runs on `<trigger>` (`*`, a provider, or
-  `provider/model`) for any pack (inferring primary agents as callers when `opencode-pack.json` omits `archetype`, or
-  configured explicitly with `models callers <pack> <caller>...`); `models rule-set` adds full `IF / OR` rules with
-  `--model`, `--tool`, `--perm` and `--delegate`; `models export-pack <pack>` writes effective callers and defaults
-  into a local pack's `opencode-pack.json`. `models pin <pack>/<agent> <model>` fixes a subagent's model, `unpin`
-  removes any fixed model, the pack's included. `override set <pack>/<id> steps=30 hidden=true` patches frontmatter
-  (YAML values, `null` removes a field; `--command` for commands). Each edit reconciles the target.
+### 3. Customize Models & Conditional `IF / OR` Flows (Including Read-Only Git Sources)
 
-Workspace (catalog or pack you are editing):
+```bash
+# Route subagents when a caller in `pipeline` runs on anthropic or openai/gpt-5.4
+manage-agents models set pipeline anthropic,openai/gpt-5.4 pipeline-explorer=anthropic/claude-haiku-4-5 pipeline-executor=inherit
 
-* `create` — create an agent in a pack of the workspace (`[family-]<pack>-<role>.md`, V2 frontmatter).
-* `lint` — naming convention report; `fix-names [--dry-run]` renames and updates references.
-* `audit` — permission ordering and risk report.
-* `tune [--steps n] [--temp n] [--variant name|--effort name] [--clear-variant|--clear-effort] [--category <pack>|--all]`
-  — update model parameters. Agent-level `temperature` is inert in OpenCode 2.2.5; use model variants.
-* `bridge [--pack <name>] [--target claude|codex] [--output path] [--name name] [--prefix prefix] [--config path]
-  [--model source=target]... [--map-all target] [--no-register] [--no-validate] [--marketplace-name name] [--wizard]`
-  — translate a pack (default: the configured `prefix` without its trailing `-`), with the packs it requires, into a
-  Claude Code plugin or a Codex layer (default output
-  `bridges/<claude-code|codex>/<name>` in the workspace). `bridge check [--pack <name>] [--target claude|codex]`
-  regenerates the committed bridges and compares them byte for byte. See [Bridges](#bridges).
+# Add a conditional IF/OR policy rule narrowing tools, permissions, and delegations
+manage-agents models rule-set pipeline openai/gpt-5.4 --tool webfetch=allow --perm edit=ask --delegate pipeline-fast_lane=deny
 
-Auto-commit is off by default; `--auto-commit`/`--no-auto-commit` (or `AGENT_MANAGER_AUTO_COMMIT=1|0`) turn on or off local, scoped commits of
-workspace edits; see [Safety](#safety).
+# Pin or unpin a subagent's model, or patch frontmatter fields at reconcile time
+manage-agents models pin pipeline/pipeline-security_auditor anthropic/claude-opus-4-6#max
+manage-agents models unpin pipeline/pipeline-explorer
+manage-agents override set pipeline/pipeline-executor steps=30 hidden=true
+```
 
-## TUI keymap
+### 4. Translate Packs to Claude Code & Codex
 
-The agent list is a tree with one folder per pack, all closed at startup; `→`/`l` opens the focused folder and `←`/`h`
-closes it. The search (`/`) hides folders without matches and shows the others expanded; clearing it restores each
-folder's state. The model selector opens with the provider of the current model expanded.
+```bash
+manage-agents bridge --pack flow --target claude        # emits bridges/claude-code/<name>, validates & registers
+manage-agents bridge --pack flow --target codex         # emits bridges/codex/<name> (.codex-plugin + TOML agents)
+manage-agents bridge check --pack flow                  # CI byte-for-byte drift check on committed bridges
+```
 
-Main view: `o` opens Data Sources (attach/switch GitHub or local sources, `gh` login, pull, trust, remove), arrows or
-`j/k` move (on inspector tabs 3–5 with an agent focused they scroll the tab), `/` searches file names (`Enter` keeps
-the filter, `Esc` clears it), `Space` selects the focused agent, `a` toggles every agent of the focused pack, `s` the
-agents of the same pack with the focused agent's model, `m` model (on any pack folder with no selection: its
-conditional `IF / OR` flows), `i` initialize `opencode-pack.json` (on local manifest-free `.md` folders), `v` repair invalid models, `Shift-T` tier, `t` parameters (selection, focused folder or focused agent), `c`
-color, `p` permission preset, `g` delegations, `u` skills, tools and MCP permissions of the focused agent, `r` rename
-(local workspaces only), `b` Claude bridge, `Shift-B` Codex bridge (of the focused pack), `e` install the focused pack
-into OpenCode, `1–5` inspector tabs, `Shift-L` layout, `F` fix permission order (inspector tab 3), `PageUp/PageDown`
-scroll, `Esc` close modals, `Ctrl-C` quit. When the active source is a GitHub/git source, edits in the TUI save to
-`overrides.json` and `routing.json` (and reconcile the installed target) without modifying the cached git checkout.
+---
 
-- **Model selector**: only the arrows navigate; printable keys type into the search (every word must appear in
-  `provider/model`), `Backspace` edits it, `Esc` clears it and then closes, `Enter` toggles a provider or assigns a
-  model, `Ctrl-R` reloads the catalog.
-- **Conditional `IF / OR` flows** (`m` on any pack folder): opens on every pack (including packs without `archetype` in
-  `opencode-pack.json` and virtual `.md` folders). Saves by default to user settings (`routing.json`) and reconciles the
-  target; `C` edits `OR` callers, `Space`/`Tab` in the trigger picker selects multiple `OR` triggers (`*`, provider, or
-  `provider/model`), `U` configures conditional tool/MCP `allow`/`ask`/`deny` policies, `G` configures subagent
-  delegation policies, and `W` on local packs exports callers, `routingDefaults` and `flowDefaults` to
-  `opencode-pack.json`. Note: in OpenCode V2, a static `deny` in an agent's frontmatter cannot be widened at runtime by
-  a plugin; set `allow` or `ask` on the caller and narrow via conditional flows.
-- **Install** (`e`): previews the change with a dry run (packs, files, confirmations needed for executable content)
-  and installs on `Y`. The workspace becomes a local source the first time (named after its directory).
-- **Skills, Tools & MCP** (`u` on an agent): `Space` toggles the agent's `allow`/`deny` for a skill (or `* (All
-  Skills)`), a tool family (`slide_*`), a tool, or an MCP server (`<server>_*`). The list contains what the agent's
-  pack and the packs it requires provide. `Enter` saves the agent file; nothing else is written.
-- **Bridge** (`b`/`Shift-B`): plugin name, prefix and `Map all models to`; `Tab` cycles. The model field sets the
-  `"*"` catch-all for the target (empty keeps the tier mapping).
-- **Layout** (`Shift-L`): arrows/`h/l` adjust the split, `Home`/`End` select bounds, `R` resets, `Enter` saves to
-  `$XDG_CONFIG_HOME/manage-agents/ui.json` (`{ "version": 1, "listShare": 0.6667 }`, 0.60–0.75).
-  `AGENT_MANAGER_UI_CONFIG=<file>` reads another file and makes the layout read-only.
+## Interactive TUI
 
-Inspector tabs: Info, Name, Sec(urity), Graph (delegations), Res(ources). Tab 1 shows the Thinking/Effort
-(`variant`). Tab 5 shows the agent's skills (with dead references), the custom tools of its packs grouped by family,
-and the MCP servers it may use, with their state in the target's `opencode.json`.
+Running `manage-agents` without a subcommand opens the full-screen React 19 + OpenTUI interface. Startup resolves in order:
+1. `--workspace <dir>` or `$MANAGE_AGENTS_WORKSPACE`
+2. `--source <name>` (pulls uncached Git sources automatically and marks `<name>` active)
+3. Nearest catalog (`packs/*/opencode-pack.json`), pack (`opencode-pack.json`), or virtual `.md` pack at or above `cwd`
+4. Active registered source in `sources.json`, or **Sources & Target** if none is attached yet
 
-Parameter tuning (`t`) sets `steps`, `temperature`, `mode`, `hidden` and Thinking/Effort (`variant`; `Space` or
-`←`/`→` cycles `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or type a custom name). Variants are
-defined on the model: see OpenCode's [agent](https://opencode.ai/docs/agents/#additional) and
-[model variants](https://opencode.ai/docs/models/#variants) documentation.
+### Three Switchable Workspaces
 
-## OpenCode V2 compatibility
+Switch workspaces anytime with `Tab` / `Shift+Tab`, clickable top-bar pills, or the Command Palette (`Ctrl+K` / `Ctrl+P`):
 
-Agents are read in both V1 and V2 form and written back in their own form: `max_steps`/`steps`,
-`disable`/`disabled`, `prompt`/`system`, `temperature`/`top_p` under `request.body`, `permission` objects and
-`permissions` arrays (`[{action, resource, effect}]`), and `provider/model#variant`. Agents in `mode/` or `modes/`
-are primary. The model catalog comes from `opencode models`.
+1. **`1 Catalog` (Catalog Tree & 6-Tab Inspector):** Left collapsible pack/agent tree with status badges (`● installed`, `↑ update`, `◌ virtual`, `✎` overrides, `⇄` flows), `/` live filter, and multi-agent batch selection. Right 6-tab inspector: **1 Info** (`Pack`, `Model`, `Variant`, `Mode`, `Steps`), **2 Prompt** (sanitized, cell-accurate Markdown view), **3 Name**, **4 Sec** (permission risk & `"*": "deny"` order), **5 Graph** (inbound/outbound `@subagent` calls), and **6 Res** (skills, custom tool families, MCP server states).
+2. **`2 Flows & Graph`:** Flat pack and agent call-graph explorer paired with a live `Topology & IF/OR Rules` inspector flagging unresolved `@subagent` dead references and opening the interactive `IF / OR` flow editor (`M`) or delegation checklist (`G`).
+3. **`3 Sources & Target`:** Unified source manager (`gh` web login, GitHub repo browser, URL/path attach, Git pull, trust toggle) and live OpenCode target health/drift dashboard with one-key reconcile (`R`) and engine self-update (`Shift+U`).
 
-## Bridges
+**Local vs. Read-Only Git Write Path:** On a local workspace or local source, TUI edits write directly to pack files (with optional scoped Git auto-commits). On a Git/GitHub source, edits save cleanly to `$XDG_CONFIG_HOME/manage-agents/overrides.json` and `routing.json` and immediately reconcile your installed OpenCode target without modifying the cached Git checkout.
 
-A bridge translates one pack of the workspace, with the packs it requires, into a Claude Code plugin or a Codex
-layer: agents, commands as skills, skills, MCP and LSP servers merged from the packs' `opencode.json`. Options live
-in `bridges/translation-config.json` of the workspace (`pluginName`, `prefix`, model tiers and maps, Claude
-settings).
+### Keybindings & Mouse Controls
 
-- **Models.** `--model <source>=<target>` is repeatable and accepts comma lists; `--map-all <target>` is
-  `--model "*=<target>"`. Keys match an agent's model as a full lowercase ID or as the bare ID after the last `/`.
-  Resolution: per-agent overrides, then `modelMap` (full ID, bare ID, `"*"`), then the role tier, then inference,
-  then `defaultTier`. Mappings and the Claude flags given on the command line are saved in the translation config and
-  replayed by later runs. Claude targets must be `fable`, `sonnet`, `opus`, `haiku`, `inherit` or a full `claude-*`
-  ID; Codex targets any non-empty model ID.
-- **Claude plugin.** Emits `.claude-plugin/plugin.json` and a local `marketplace.json`, agents, skills (commands
-  become `skills/<name>/SKILL.md` with `$ARGUMENTS` → `$request`), `.mcp.json`, `.lsp.json` and the engine's plugin
-  icon. Unless disabled (`claude.autoValidate`, `claude.autoRegister`, `--no-validate`, `--no-register`) it then
-  runs `claude plugin validate --strict` and registers the plugin in Claude Code (user scope, once). Each run removes
-  generated files that are no longer produced.
-- **Permissions.** Tool-level only: OpenCode keys map to Claude tools (`shell` → `Bash`, `edit` → `Write`/`Edit`,
-  `task` → `Agent`, MCP keys → `mcp__<server>__*`, ...). Granular patterns (shell allowlists, edit globs, ask states)
-  cannot be carried by plugin agents; each is reported as a warning and listed in the generated README.
-- **What is not translated.** OpenCode plugins and custom tools of the packs are listed in the generated README with
-  their nearest Claude equivalents; prompts that mention OpenCode-only tools get a runtime note saying the documented
-  fallbacks apply. Tool names in prompt bodies are adapted (`todowrite` → `TodoWrite`/`update_plan`, Task tool →
-  `Agent`, ...).
+| Key / Input | Action | Scope |
+|---|---|---|
+| `Ctrl+K` / `Ctrl+P` | Open fuzzy **Command Palette** (workspaces, actions, `Jump to Agent`) | Global |
+| `?` / `Esc` | Open 4-tab **Keyboard & Mouse Guide** / close active modal or filter | Global |
+| `Tab` / `Shift+Tab` | Cycle workspaces (`Catalog` → `Flows & Graph` → `Sources & Target`) | Global |
+| `O` | Jump directly to `Sources & Target` | Catalog / Flows |
+| `↑`/`↓` (`j`/`k`), `PgUp`/`PgDn` | Navigate rows (or scroll focused Inspector pane on tabs `2`, `4`, `5`, `6`) | Global |
+| `←`/`→` (`h`/`l`), `Enter` | Collapse/expand pack folders in Catalog; jump or open flow editor in Flows | Tree / Flows |
+| `[` / `]` | Focus left list pane or right Inspector pane | Catalog |
+| `1` – `6` | Switch Inspector tabs (`Info`, `Prompt`, `Name`, `Sec`, `Graph`, `Res`) | Catalog |
+| `/` | Live-filter Catalog agents (`Enter` keeps filter, `Esc` clears) or focus Source input | Catalog / Sources |
+| `Space` / `A` / `S` | Mark focused agent / all agents in pack / agents sharing focused model in pack | Batch |
+| `M` | Assign LLM model (on agent/batch) or open **Conditional `IF / OR` Flows** (on pack) | Catalog / Flows |
+| `T` | Tune `steps`, Thinking/Effort `variant`, `mode` (`primary`/`subagent`/`all`), `hidden` | Agent / Batch |
+| `P` / `C` / `Shift+T` | Apply safety permission preset / pick badge color / assign bridge translation tier | Agent / Batch |
+| `U` / `G` | Manage allowed/denied skills, tool families & MCP servers / edit `@subagent` delegations | Agent |
+| `V` | Batch-repair missing or invalid catalog models | Pack |
+| `I` | Onboard virtual `.md` folder (or clone & onboard remote Git source) to Contract `1.1` | Virtual Pack |
+| `D` / `N` | Open **Pack Doctor** (`F` fix, `A` authoring kit, `1/2/3` semver bump) / scaffold resource | Local Pack |
+| `R` / `Shift+F` | Rename agent & update references / fix `"*": "deny"` permission order (Tab 4) | Local Pack |
+| `E` | Dry-run preview and install/update focused pack into OpenCode (`Y` confirms) | Catalog / Flows |
+| `B` / `Shift+B` | Open **Claude Code** (`B`) or **Codex** (`Shift+B`) bridge modal with tier preview | Catalog / Flows |
+| `P` / `G` / `T` / `X` | Pull Git source / `gh` web login / toggle source trust / remove source | Sources |
+| `R` / `Ctrl+R` | Reconcile installed OpenCode target now / refresh sources & target drift | Sources |
+| `Shift+L` / `Ctrl+E` | Adjust list/inspector split (`0.60`–`0.75` in `ui.json`) / toggle reduced motion | Global |
+| `Shift+U` / `Ctrl+C` | Check or apply `manage-agents` release self-update / quit TUI | Global |
+| `Click` / `Drag │` / `Wheel` | Click rows, tabs & footer chips / drag center divider to resize / wheel-scroll | Mouse |
 
-## Safety
+> **OpenCode V2 routing note:** A static `deny` in an agent's frontmatter cannot be widened at runtime by a plugin. Keep `allow` or `ask` on the caller in frontmatter and narrow access dynamically via conditional `IF / OR` flows (`U` for tools/MCP, `G` for delegations inside the flow editor; `W` exports local pack flows to `opencode-pack.json`).
 
-- Install, uninstall and update are transactions on the target: planned, checked for conflicts, journaled, applied,
-  and rolled back on failure. Replaced user content goes to `<target>/.manage-agents/backups/<id>/`.
-- Workspace edits are atomic per file and refuse files changed on disk since they were read. With auto-commit on,
-  each edit becomes a local, unsigned, hook-free commit of exactly the paths it touched, after a clean-worktree,
-  identity, branch, lock, symlink and scope check; failures leave the change for manual recovery and never reset your
-  work.
-- Pack content is untrusted: terminal output escapes control characters, git URLs with credentials are refused,
-  symlinks are never followed in managed scopes.
+---
 
-## Development
+## CLI Reference
+
+```bash
+manage-agents [<command>] [options] [--workspace <dir>] [--source <name>] [--auto-commit | --no-auto-commit]
+```
+
+Every command supports `--help` (`-h`). Machine-readable commands emit control-safe JSON with `--json` on `stdout` and write errors to `stderr`.
+
+### Pack, Source & Target Commands
+
+| Command | Summary |
+|---|---|
+| `pack validate <dir>... [--git] [--json]` | Validate layout, `opencode-pack.json`, namespaces, `opencode.json` keys, cross-pack references, archetypes, and executable surface. |
+| `pack list [--json]` | List all packs across registered sources, including synthesized virtual packs and discovery warnings. |
+| `pack init\|onboard [<dir>] [flags]` | Onboard a folder or `--clone-source <name>` into Contract `1.1` (`--name`, `--version`, `--description`, `--layout auto\|root\|subpack`, `--no-organize`, `--authoring-kit`, `--json`). |
+| `pack doctor [<dir>] [flags]` | Diagnose and repair contract drift (`--fix`), install CI/skill kit (`--authoring-kit`), and bump version (`--bump patch\|minor\|major`, `--json`). |
+| `pack add <agent\|skill\|command> <id>` | Scaffold a compliant OpenCode V2 resource (`--dir`, `--description`, `--mode primary\|subagent\|all`, `--json`). |
+| `source list\|add\|remove\|pull\|login\|auth\|trust\|untrust\|prefer` | Manage `$XDG_CONFIG_HOME/manage-agents/sources.json`, `gh` auth, read-only Git cache pulls, source trust, and multi-source `<pack>` preferences. |
+| `resolve <[source/]pack[@range]>...` | Dry-run SemVer dependency resolution, contract validation, lock diff, and confirmation report (`--target <dir>`, `--json`). |
+| `install <[source/]pack[@range]>...` | Transactionally install packs and transitive `requires` into `--target` (`--adopt`, `--yes`, `--dry-run`, `--json`). |
+| `uninstall <pack>...` | Remove root packs from `desired.json` and prune unreferenced dependencies/empty created config sections (`--target`, `--dry-run`, `--json`). |
+| `update [<pack>...]` | Pull Git sources and upgrade installed packs within version ranges (`--target`, `--adopt`, `--yes`, `--dry-run`, `--json`; `--self` aliases `self-update`). |
+| `reconcile` | Rebuild `<target>` from `desired.json`, `lock.json`, `routing.json`, and `overrides.json` (`--target`, `--adopt`, `--dry-run`, `--json`). |
+| `status` | Read-only drift check comparing `<target>` files and `opencode.json` against `lock.json` and `installed.json` (`--target`, `--json`). |
+| `restore <backup-id>` | Restore files and `opencode.json` entries backed up by `--adopt` under `<target>/.manage-agents/backups/<backup-id>/` (`--target`). |
+
+### User Settings, Workspace Editing, Bridges & Release Commands
+
+| Command | Summary |
+|---|---|
+| `models show\|set\|unset\|callers\|rule-set\|rule-unset\|export-pack\|pin\|unpin` | Configure subagent model routes, custom callers, conditional `IF / OR` policy rules, model pins/unpins, or export flows to `opencode-pack.json` (`--target`, `--global`, `--no-reconcile`, `--yes`, `--json`). |
+| `override show\|set\|unset` | Patch installed agent or `--command` YAML frontmatter fields via `<pack>/<id> <field>=<yamlValue>` (`null` deletes a field; `--target`, `--global`, `--no-reconcile`, `--yes`, `--json`). |
+| `create` | Interactive wizard creating `[<family>-]<pack>-<role>.md` with V2 frontmatter and live `opencode models` lookup. |
+| `lint` / `fix-names [--dry-run]` | Audit workspace agent filenames against naming conventions / batch-rename files and rewrite cross-references. |
+| `audit` | Report wildcard `"*": "deny"` ordering errors and classify workspace agents into High / Medium / Low risk tiers. |
+| `tune [flags]` | Batch-update `--steps`, `--variant`/`--effort` (`--clear-variant`), `--mode`, `--hidden`/`--no-hidden` across `--pack <pack>` or `--all`. |
+| `bridge` / `bridge check` | Translate `--pack <name>` + `requires` to `--target claude\|codex` (`--output`, `--name`, `--prefix`, `--config`, `--model src=dst`, `--map-all`, `--no-validate`, `--no-register`, `--wizard`) or verify committed bridges byte-for-byte. |
+| `version` (`--version`, `-v`, `-V`) | Print engine version, channel, dirty state, and bundle hash (`--json`, `--engine-root`, CI `--write-manifest`). |
+| `self-update` | Check (`--check`) or install latest `v*` GitHub Release (`--yes`, `--force`, `--reconcile`/`--no-reconcile`, `--repo`, `--target`, `--json`). |
+| `release keygen\|sign` | Maintainer tooling for Ed25519 key generation (`release-signing.json`) and signed `release-metadata.json` assets. |
+
+**Exit codes:** `0` success / in sync · `1` validation error, drift, conflict, or declined/failed operation · `2` CLI usage / flag syntax error · `128 + N` signal termination.
+
+---
+
+## Bridges & OpenCode V2 Compatibility
+
+### Native OpenCode V2 Normalization
+
+Agents are read in both legacy V1 and native V2 formats and always written back in native OpenCode V2 form:
+- `steps` (from `max_steps`), `disabled` (from `disable`), `system` (from `prompt`), ordered `permissions` arrays (`[{ action, resource, effect }]`), and `provider/model#variant`.
+- Deprecated agent-level sampling keys (`temperature`, `top_p`, `top_k`) are stripped on write; configure sampling on model variants instead. Agents discovered under `mode/` or `modes/` default to `mode: primary`.
+
+### Cross-Harness Translation (`claude` & `codex`)
+
+Bridge settings persist in `bridges/translation-config.json` (or `$XDG_CONFIG_HOME/manage-agents/translations/<source>/translation.json` for read-only Git sources). Models resolve in five steps: per-agent override → `modelMap` (`provider/model`, bare `model`, `"*"`) → capability tier (`planning`, `execution`, `light`, plus Codex `reasoningEffort`) → role inference → `defaultTier`.
+
+| Construct | OpenCode V2 Pack | Claude Code Plugin (`bridges/claude-code/<name>`) | Codex Layer (`bridges/codex/<name>`) |
+|---|---|---|---|
+| **Manifest** | `opencode-pack.json` + `opencode.json(c)` | `.claude-plugin/plugin.json`, local `marketplace.json`, `icon.png` | `.codex-plugin/plugin.json` (`Subagents` + `Skills`) |
+| **Agents** | `agents/<id>.md` (`@pack-role` mentions) | `agents/<kebab>.md` (`maxTurns`, `tools`, `@<plugin>:<kebab>`) | `.codex/agents/<kebab>.toml` (`developer_instructions`, `sandbox_mode`) |
+| **Commands & Skills** | `commands/<id>.md` (`$ARGUMENTS`), `skills/<id>/SKILL.md` | Commands become `skills/<cmd>/SKILL.md` (`$request`); skills copied | Agent workflows emitted as `skills/<agent>/SKILL.md` wrappers |
+| **MCP & LSP** | `mcp.servers`, `lsp` in `opencode.json` | `.mcp.json` (`mcp__<server>__*` grants) and `.lsp.json` | `.mcp.json` (`mcpServers` when enabled) |
+| **Plugins & Custom Tools** | `plugins/*/index.ts`, `tools/<pack>/**` | Documented in generated `README.md` with prompt fallback notes; tool names adapted (`todowrite` → `TodoWrite`, Task → `Agent`) | Prompt runtime notes document CLI/git fallbacks; tool names adapted (`update_plan`, `@subagent`) |
+
+Granular OpenCode permission globs (per-command `shell` patterns, path-scoped `edit` rules, `ask` states) cannot be enforced by plugin frontmatter; bridges fail closed on required server-wide MCP denies and surface granular lossiness as structured warnings in the generated `README.md`.
+
+---
+
+## State Files, Environment Variables & Security
+
+### Persistent Directories & State Files
+
+| Path | Purpose |
+|---|---|
+| `$XDG_CONFIG_HOME/manage-agents/sources.json` | Registered `local` and `git` sources (`0o600`), trust flags, active source, and `prefer` map. |
+| `$XDG_CONFIG_HOME/manage-agents/routing.json` | Global (`default`) and per-target (`targets.<realpath>`) callers, model routes, and `IF / OR` `$rules`. |
+| `$XDG_CONFIG_HOME/manage-agents/overrides.json` | Global and per-target YAML frontmatter overrides (`null` deletes/unpins fields on reconcile). |
+| `$XDG_CONFIG_HOME/manage-agents/ui.json` | TUI horizontal `listShare` (`0.60`–`0.75`) and `reducedMotion` preference (`O_NOFOLLOW` + lockfile guarded). |
+| `$XDG_CACHE_HOME/manage-agents/{sources,revisions,bridges}/` | Read-only detached Git checkouts, immutable commit-pinned snapshots, and Git-source bridge outputs. |
+| `<target>/.manage-agents/{desired,lock,installed}.json` | Requested roots, SHA-256-pinned dependency lock (`contentHash`, `executableHash`), and owned files/config keys. |
+| `<target>/.manage-agents/{journal.json,txn/,backups/,install.lock}` | Crash-recovery swap journal, atomic staging tree, `--adopt` backups (`restore <id>`), and PID concurrency lock. |
+| `<target>/plugins/manage-agents-router/` | Synthesized OpenCode V2 runtime plugin (`index.ts`, `router.js`, compiled `routing.json`) under `:engine` ownership. |
+
+### Environment Variables
+
+| Variable | Default | Effect |
+|---|---|---|
+| `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` | `~/.config` / `~/.cache` | Relocate user settings (`manage-agents/`), default target (`opencode/`), and Git/bridge caches. |
+| `MANAGE_AGENTS_WORKSPACE` | Auto-detected from `cwd` | Default catalog or pack workspace when `--workspace <dir>` is omitted. |
+| `MANAGE_AGENTS_SKIP_AUTO_INSTALL` | Unset (`0`) | Set to `1` to disable automatic `npm`/`bun` dependency synchronization in `manage-agents.mjs`. |
+| `AGENT_MANAGER_AUTO_COMMIT` | `0` | Set to `1` to wrap local workspace mutations in scoped, hook-free Git commits (overridden by `--[no-]auto-commit`). |
+| `AGENT_MANAGER_UI_CONFIG` | `<configDir>/ui.json` | Load TUI layout config from a custom regular file in read-only mode. |
+| `AGENT_MANAGER_REDUCED_MOTION` | `0` (or `ui.json`) | Set to `1` or `true` to disable TUI timeline animations and spinners. |
+| `MANAGE_AGENTS_REPO` / `GITHUB_TOKEN` | `lorecanc/manage-agents` | Override release repository or supply API bearer token during `self-update` HTTP fallback. |
+
+### Security & Target Safety Guarantees
+
+- **Transactional target writes:** `install`, `uninstall`, `update`, and `reconcile` detect conflicts against user-owned files and modified managed files before touching disk, stage writes on the target filesystem, record `journal.json`, and roll back automatically on failure or crash recovery. `--adopt` backs up replaced files/JSONC comments to `.manage-agents/backups/<id>/` for `restore`.
+- **Untrusted pack confinement:** Symlinks are rejected across pack validation, workspace discovery, and target scopes (`lstat` + `O_NOFOLLOW`). Git URLs carrying embedded credentials or query strings are refused.
+- **Executable-surface consent:** Installing executable surfaces (plugins, custom tool modules, skill scripts, MCP servers, formatter/LSP commands) from untrusted sources—or updating any pack whose `executableHash` changed—requires interactive confirmation or `--yes`.
+- **Terminal & JSON sanitization:** External strings pass through `terminalSafeText()` (stripping CSI, OSC, C0, DEL, and 8-bit C1 sequences) and `--json` output escapes `\u007f`–`\u009f` so untrusted metadata cannot hijack terminal emulators.
+- **Hardened Git & signed updates:** Subprocess Git/GitHub calls strip ambient `GIT_*` overrides; `--auto-commit` runs hook-free (`core.hooksPath` isolated, `--no-gpg-sign --only`) after clean-worktree and blob-fingerprint checks; `self-update` verifies SHA-256 archive digests, inner bundle hashes, and Ed25519 signatures (`release-signing.json`) while installing dependencies with `--ignore-scripts`.
+
+---
+
+## Documentation, Development & License
+
+### Deep-Dive Documentation (`wiki/` & `contract/`)
+
+- **Start & Architecture:** [Getting Started](wiki/getting-started.md) · [Project Overview](wiki/overview.md) · [System Architecture](wiki/architecture.md) · [Glossary](wiki/glossary.md)
+- **Reference:** [CLI Command Reference](wiki/api/cli-reference.md) · [Pack Contract `1.1` Reference](wiki/api/pack-contract-reference.md) · [Normative `CONTRACT.md`](contract/CONTRACT.md) · [User Settings, Target State & Env Vars](wiki/config/user-and-target-files.md)
+- **Concepts & TUI:** [Pack Lifecycle & Target Safety](wiki/concepts/pack-lifecycle-and-target-safety.md) · [Conditional Routing & Archetypes](wiki/concepts/conditional-routing-and-archetypes.md) · [Security & Trust Model](wiki/concepts/security-and-trust-model.md) · [Cross-Harness Translation](wiki/concepts/cross-harness-translation.md) · [TUI Shell & Catalog](wiki/components/tui-shell-and-catalog.md) · [Full Wiki Index](wiki/index.md)
+
+### Repository Layout & Contributor Verification
+
+```text
+manage-agents/
+├── manage-agents.mjs                  # Launcher (Node >=26.4.0 FFI bootstrap, dep sync, mtime auto-build)
+├── src/
+│   ├── build.mjs                      # esbuild bundler (src/index.tsx -> dist/index.js)
+│   ├── index.tsx                      # CLI dispatcher (20 commands) & OpenTUI entry
+│   ├── App.tsx                        # Root OpenTUI shell, Catalog tree & 6-tab Inspector
+│   ├── ui/                            # Workspaces (Flows, Sources) & modals (Palette, Help, Onboarding, Doctor, Bridge, Tuning)
+│   └── utils/                         # Engine modules + colocated *.test.ts suites
+├── runtime/plugins/manage-agents-router/ # OpenCode V2 router plugin & *.test.mjs suite
+├── contract/                          # CONTRACT.md (1.1), JSON Schema, minimal-pack, authoring SKILL.md
+├── wiki/                              # Architecture, module, component, API, and config documentation
+└── test/helpers.ts                    # Shared pack/repo fixtures for node:test suites
+```
 
 ```bash
 npm ci
-npm test          # typecheck + node:test (src/utils, runtime)
-npm run build
-npm run validate  # test + build + validation of the example pack
+npm run typecheck   # tsc --noEmit
+npm test            # typecheck + node:test (src/utils/*.test.ts, runtime/**/*.test.mjs)
+npm run build       # esbuild -> dist/index.js
+npm run validate    # full pre-commit gate: test + build + minimal-pack contract validation
 ```
 
-Troubleshooting: set `git config user.name`/`user.email` for auto-commit; a stale `<target>/.manage-agents/install.lock`
-is reclaimed automatically when its process is gone; keep `git` (sources) and `claude` (Claude bridge validation and
-registration) on PATH; on Windows use Node or Bun directly.
+### License
 
-## License
-
-MIT. Third-party dependencies and services keep their own terms.
+MIT. Third-party dependencies and external services retain their own licenses and terms.

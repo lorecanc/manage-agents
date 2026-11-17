@@ -19,11 +19,84 @@ jobs:
         with:
           node-version: 26
           cache: npm
-      - run: npm ci
+      - run: npm ci --ignore-scripts
       - run: npm run validate
       - run: node manage-agents.mjs --help
+      - run: node manage-agents.mjs --version
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-      - run: bun install
+      - run: bun install --ignore-scripts
       - run: bun run typecheck
       - run: bun run build
       - run: bun manage-agents.mjs --help
+
+  release:
+    name: release
+    needs: [test]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+      - name: Verify tag is an ancestor of origin/main
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$TARGET_SHA" refs/remotes/origin/main; then
+            echo "::error::Tag ${TAG_NAME} (${TARGET_SHA}) is not an ancestor of origin/main"
+            exit 1
+          fi
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - name: Package release archive and metadata
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          TARGET_SHA: ${{ github.sha }}
+          REPO_SLUG: ${{ github.repository }}
+          RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.RELEASE_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          pkg_name="manage-agents-${TAG_NAME}"
+          stage_root="artifacts/release-stage"
+          stage_dir="${stage_root}/${pkg_name}"
+          out_dir="artifacts/release-assets"
+          archive_path="${out_dir}/${pkg_name}.tar.gz"
+          rm -rf "$stage_root" "$out_dir" && mkdir -p "$stage_dir" "$out_dir"
+          git archive --format=tar HEAD | tar -xf - -C "$stage_dir"
+          cp -R dist "$stage_dir/dist"
+          node manage-agents.mjs --no-auto-commit version --write-manifest \
+            --ref-type tag \
+            --ref-name "$TAG_NAME" \
+            --sha "$TARGET_SHA" \
+            --engine-root "$stage_dir"
+          touch "$stage_dir/dist/index.js"
+          tar -czf "$archive_path" -C "$stage_root" "$pkg_name"
+          rm -rf "$stage_root"
+          node manage-agents.mjs --no-auto-commit release sign \
+            --tag "$TAG_NAME" \
+            --sha "$TARGET_SHA" \
+            --assets-dir "$out_dir" \
+            --repo "$REPO_SLUG"
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          assets=(
+            "artifacts/release-assets/manage-agents-${TAG_NAME}.tar.gz"
+            "artifacts/release-assets/release-metadata.json"
+          )
+          if [[ -f "artifacts/release-assets/release-metadata.json.sig" ]]; then
+            assets+=("artifacts/release-assets/release-metadata.json.sig")
+          fi
+          gh release create "$TAG_NAME" "${assets[@]}" --verify-tag --generate-notes

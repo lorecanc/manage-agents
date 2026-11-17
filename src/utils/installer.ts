@@ -5,8 +5,9 @@ import path from "node:path"
 import { isDeepStrictEqual } from "node:util"
 import { fileURLToPath } from "node:url"
 import { atomicWriteRestrictedFile } from "./agents.js"
-import { buildLock, confirmationsNeeded, diffLocks, readLock, serializeLock, targetStateDir, type LockChange, type LockedPack, type PackLock } from "./lock.js"
-import { hasErrors, installableFiles, MANIFEST_FILE, parseJsonc, validatePack, type PackValidation } from "./packs.js"
+import { movePathWithRetry, removePathWithRetry } from "./fsWindows.js"
+import { assertSafeTargetSubpath, buildLock, confirmationsNeeded, diffLocks, readLock, serializeLock, type LockChange, type LockedPack, type PackLock } from "./lock.js"
+import { hasErrors, installableFiles, MANIFEST_FILE, MAX_SCANNED_BYTES, parseJsonc, validatePack, type PackValidation } from "./packs.js"
 import { hashFile, orderByRequires, packContent, parsePackRequest, resolvePacks, type ResolveOptions } from "./resolver.js"
 import { discoverAllPacks, findSource, lastFetchedRevision, pullSource, revisionSnapshot, sourceRevision, type GitOptions, type SourceRegistry } from "./sources.js"
 import { own, setOwn } from "./values.js"
@@ -91,8 +92,8 @@ const STALE_LOCK_GRACE_MS = 10_000
 
 const isObject = (value: unknown): value is Record<string, any> => typeof value === "object" && value !== null && !Array.isArray(value)
 const fold = (rel: string) => rel.normalize("NFC").toLowerCase()
-const targetFile = (target: string, rel: string) => path.join(target, ...rel.split("/"))
-const statePath = (target: string, name: string) => path.join(targetStateDir(target), name)
+const targetFile = (target: string, rel: string) => assertSafeTargetSubpath(target, rel, { allowLeafSymlink: !rel.startsWith(".manage-agents/") })
+const statePath = (target: string, name: string) => assertSafeTargetSubpath(target, `.manage-agents/${name}`, { allowLeafSymlink: false })
 
 /** Paths read back from state files are trusted only when they stay inside the target. */
 function isSafeRel(rel: unknown): rel is string {
@@ -139,8 +140,9 @@ export function readInstalled(target: string): InstalledState {
 
 /** Paths installed by the legacy `manage-agents export`; the pack installer may replace them without --adopt. */
 function readLegacyResources(target: string): Set<string> {
+  const file = assertSafeTargetSubpath(target, ".resource-export-manifest.json", { allowLeafSymlink: false })
   try {
-    const raw = readJson(path.join(target, ".resource-export-manifest.json"))
+    const raw = readJson(file)
     return new Set(raw?.owner === "manage-agents" && Array.isArray(raw.resources) ? raw.resources.filter(isSafeRel) : [])
   } catch {
     return new Set()
@@ -186,12 +188,23 @@ export function loadLockedPacks(lock: PackLock, registry: SourceRegistry, env: N
     const validation = isVirtual
       ? validateVirtualPack(dir, { name, sourceKind: source.kind })
       : validatePack(dir, { sourceKind: source.kind })
+    const configRel = validation.files.find(file => PACK_CONFIG_FILES.has(file))
+    const configVirtual = configRel ? validation.virtualFiles?.[configRel] : undefined
+    if (configRel) {
+      const configFull = path.join(dir, ...(configVirtual?.sourceRel ?? configRel).split("/"))
+      const configSize = configVirtual?.content ? configVirtual.content.byteLength : fs.statSync(configFull).size
+      if (configSize > MAX_SCANNED_BYTES) {
+        problems.push(`${name}: ${configRel} exceeds maximum scanned size (${MAX_SCANNED_BYTES} bytes)`)
+        continue
+      }
+    }
     const changed = `${name}: the source changed since the lock; run \`manage-agents update ${name}\``
     if (hasErrors(validation)) { problems.push(`${name}: the pack no longer satisfies the contract; run \`manage-agents pack validate ${dir}\``); continue }
     const currentManifestHash = isVirtual && validation.manifest ? virtualManifestHash(validation.manifest) : hashFile(path.join(dir, MANIFEST_FILE))
     if (currentManifestHash !== locked.manifestHash) { problems.push(changed); continue }
-    const configRel = validation.files.find(file => PACK_CONFIG_FILES.has(file))
-    const configText = configRel ? fs.readFileSync(path.join(dir, configRel), "utf8") : null
+    const configText = configRel
+      ? (configVirtual?.content ? configVirtual.content.toString("utf8") : fs.readFileSync(path.join(dir, ...(configVirtual?.sourceRel ?? configRel).split("/")), "utf8"))
+      : null
     const { fileHashes, contentHash, executableHash } = packContent(validation)
     // The config is read once and checked against the hash that went into the lock, so it cannot change unseen.
     const configMatches = !configRel || crypto.createHash("sha256").update(configText!).digest("hex") === fileHashes[configRel]
@@ -214,6 +227,7 @@ const arrayKey = (section: string, entry: unknown) => section === "plugins" ? pl
  */
 export function packContribution(pack: LoadedPack, target: string, overrides: Required<PackOverrides> = { agents: {}, commands: {} }): { contribution: Contribution; implicitPlugins: Set<string> } {
   const contribution: Contribution = { plugins: [], skills: [], instructions: [], objects: {} }
+  if (pack.configText && Buffer.byteLength(pack.configText, "utf8") > MAX_SCANNED_BYTES) throw new Error(`pack configuration exceeds maximum scanned size (${MAX_SCANNED_BYTES} bytes)`)
   const config = pack.configText !== null ? parseJsonc(pack.configText) as Record<string, any> : {}
   const local = new Map<string, unknown>()
   const packages: unknown[] = []
@@ -276,7 +290,7 @@ function engineRuntimeDir(): string {
 /** Computes what reconcile would do. Reads the target and the sources; never writes. */
 export function planReconcile(target: string, lock: PackLock, registry: SourceRegistry, options: PlanOptions = {}): ReconcilePlan {
   const previous = readInstalled(target)
-  const configFile = fs.existsSync(path.join(target, "opencode.jsonc")) ? "opencode.jsonc" : "opencode.json"
+  const configFile = Boolean(fs.lstatSync(assertSafeTargetSubpath(target, "opencode.jsonc", { allowLeafSymlink: true }), { throwIfNoEntry: false })) ? "opencode.jsonc" : "opencode.json"
   const plan: ReconcilePlan = { target, packs: [], writes: [], deletes: [], released: [], conflicts: [], warnings: [], adopted: { files: [], config: [] }, configFile, configText: null, expected: {}, installed: previous }
   const { packs, problems } = loadLockedPacks(lock, registry, options.env)
   plan.packs = packs.map(pack => pack.name)
@@ -416,7 +430,7 @@ export function planReconcile(target: string, lock: PackLock, registry: SourceRe
 
 function planConfig(target: string, configFile: string, packs: LoadedPack[], previous: InstalledState, legacy: Set<string>, options: PlanOptions, plan: ReconcilePlan, overrides: Map<string, Required<PackOverrides>>, withRouter: boolean): { config: Record<string, Contribution>; createdSections: string[] } {
   const unchangedState = { config: previous.config, createdSections: previous.createdSections ?? [] }
-  const full = path.join(target, configFile)
+  const full = targetFile(target, configFile)
   if (fs.lstatSync(full, { throwIfNoEntry: false })?.isSymbolicLink()) {
     plan.conflicts.push(`${configFile} is a symlink; replace it with a regular file (or install into the directory it points to with --target)`)
     return unchangedState
@@ -564,17 +578,22 @@ function isPlainJson(text: string): boolean {
 }
 
 const journalPath = (target: string) => statePath(target, "journal.json")
-const transactionDir = (target: string, id: string) => path.join(targetStateDir(target), "txn", id)
+const transactionDir = (target: string, id: string) => assertSafeTargetSubpath(target, `.manage-agents/txn/${id}`, { allowLeafSymlink: false })
 
 function removeEmptyParents(target: string, rel: string) {
+  const root = path.resolve(target)
   let dir = path.dirname(targetFile(target, rel))
-  while (dir !== target && dir.startsWith(`${target}${path.sep}`)) {
+  while (dir !== root && dir.startsWith(`${root}${path.sep}`)) {
+    const relative = path.relative(root, dir).split(path.sep).join("/")
+    const safeDir = assertSafeTargetSubpath(target, relative)
+    const stat = fs.lstatSync(safeDir, { throwIfNoEntry: false })
+    if (!stat || stat.isSymbolicLink() || !stat.isDirectory()) return
     try {
-      fs.rmdirSync(dir)
+      fs.rmdirSync(safeDir)
     } catch {
       return
     }
-    dir = path.dirname(dir)
+    dir = path.dirname(safeDir)
   }
 }
 
@@ -588,15 +607,15 @@ export function rollbackInterrupted(target: string): boolean {
   const txn = transactionDir(target, journal.id)
   for (const op of [...journal.ops].reverse()) {
     const full = targetFile(target, op.rel)
-    const previous = path.join(txn, "prev", ...op.rel.split("/"))
+    const previous = assertSafeTargetSubpath(target, `.manage-agents/txn/${journal.id}/prev/${op.rel}`, { allowLeafSymlink: true })
     if (fs.lstatSync(previous, { throwIfNoEntry: false })) {
       if (fs.lstatSync(full, { throwIfNoEntry: false })) fs.unlinkSync(full)
       fs.mkdirSync(path.dirname(full), { recursive: true })
-      fs.renameSync(previous, full)
+      movePathWithRetry(assertSafeTargetSubpath(target, `.manage-agents/txn/${journal.id}/prev/${op.rel}`, { allowLeafSymlink: true }), targetFile(target, op.rel))
     } else if (!op.existed && typeof op.hash === "string" && currentHash(full) === op.hash) fs.unlinkSync(full)
   }
   fs.rmSync(journalPath(target), { force: true })
-  fs.rmSync(txn, { recursive: true, force: true })
+  removePathWithRetry(txn)
   return true
 }
 
@@ -608,11 +627,16 @@ export function applyPlan(plan: ReconcilePlan, state: { desired: DesiredState; l
   if (plan.conflicts.length) throw new Error(`refusing to apply a plan with conflicts: ${plan.conflicts[0]}`)
   const { target } = plan
   const id = `${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomBytes(4).toString("hex")}`
-  const txn = transactionDir(target, id)
+  assertSafeTargetSubpath(target, ".manage-agents", { allowLeafSymlink: false })
+  assertSafeTargetSubpath(target, ".manage-agents/txn", { allowLeafSymlink: false })
   const ops: Array<{ rel: string; staged: string | null; existed: boolean; hash?: string }> = []
   const stage = (rel: string, write: (staged: string) => void, mode: number | null, expectedHash?: string) => {
-    const staged = path.join(txn, "new", ...rel.split("/"))
+    const stagedRel = `.manage-agents/txn/${id}/new/${rel}`
+    let staged = assertSafeTargetSubpath(target, stagedRel, { allowLeafSymlink: true })
+    targetFile(target, rel)
     fs.mkdirSync(path.dirname(staged), { recursive: true })
+    staged = assertSafeTargetSubpath(target, stagedRel, { allowLeafSymlink: true })
+    targetFile(target, rel)
     write(staged)
     if (mode !== null) fs.chmodSync(staged, mode)
     const hash = currentHash(staged)!
@@ -631,29 +655,39 @@ export function applyPlan(plan: ReconcilePlan, state: { desired: DesiredState; l
     stage(".manage-agents/lock.json", staged => fs.writeFileSync(staged, serializeLock(state.lock)), 0o644)
     stage(".manage-agents/desired.json", json({ desiredVersion: 1, roots: [...state.desired.roots].sort() }), 0o644)
   } catch (error) {
-    fs.rmSync(txn, { recursive: true, force: true })
+    fs.rmSync(transactionDir(target, id), { recursive: true, force: true })
     throw error
   }
   for (const rel of plan.deletes) ops.push({ rel, staged: null, existed: true })
   // The target may have changed while the user was reading the confirmation prompt.
   const moved = ops.filter(op => op.rel in plan.expected && currentHash(targetFile(target, op.rel)) !== plan.expected[op.rel])
   if (moved.length) {
-    fs.rmSync(txn, { recursive: true, force: true })
+    fs.rmSync(transactionDir(target, id), { recursive: true, force: true })
     throw new Error(`${moved[0].rel} changed while installing; nothing was written, run the command again`)
   }
 
   let backupId: string | null = null
   if (plan.adopted.files.length || plan.adopted.config.length) {
     backupId = id
-    const dir = path.join(targetStateDir(target), "backups", id)
+    assertSafeTargetSubpath(target, ".manage-agents/backups", { allowLeafSymlink: false })
+    const backupRoot = assertSafeTargetSubpath(target, ".manage-agents/backups", { allowLeafSymlink: false })
+    fs.mkdirSync(backupRoot, { recursive: true })
+    assertSafeTargetSubpath(target, ".manage-agents/backups", { allowLeafSymlink: false })
+    const dir = assertSafeTargetSubpath(target, `.manage-agents/backups/${id}`, { allowLeafSymlink: false })
+    fs.mkdirSync(dir, { recursive: true })
+    assertSafeTargetSubpath(target, `.manage-agents/backups/${id}`, { allowLeafSymlink: false })
     for (const rel of plan.adopted.files) {
-      const destination = path.join(dir, "files", ...rel.split("/"))
+      const backupRel = `.manage-agents/backups/${id}/files/${rel}`
+      let destination = assertSafeTargetSubpath(target, backupRel, { allowLeafSymlink: true })
       fs.mkdirSync(path.dirname(destination), { recursive: true })
+      destination = assertSafeTargetSubpath(target, backupRel, { allowLeafSymlink: true })
       const source = targetFile(target, rel)
       if (fs.lstatSync(source).isSymbolicLink()) fs.symlinkSync(fs.readlinkSync(source), destination)
       else fs.copyFileSync(source, destination)
     }
-    atomicWriteRestrictedFile(path.join(dir, "backup.json"), Buffer.from(`${JSON.stringify({ id, created: new Date().toISOString(), configFile: plan.configFile, files: plan.adopted.files, config: plan.adopted.config }, null, 2)}\n`), 0o644)
+    const backupFile = assertSafeTargetSubpath(target, `.manage-agents/backups/${id}/backup.json`, { allowLeafSymlink: false })
+    assertSafeTargetSubpath(target, `.manage-agents/backups/${id}/backup.json`, { allowLeafSymlink: false })
+    atomicWriteRestrictedFile(backupFile, Buffer.from(`${JSON.stringify({ id, created: new Date().toISOString(), configFile: plan.configFile, files: plan.adopted.files, config: plan.adopted.config }, null, 2)}\n`), 0o644)
   }
 
   atomicWriteRestrictedFile(journalPath(target), Buffer.from(JSON.stringify({ id, ops: ops.map(({ rel, existed, hash }) => ({ rel, existed, ...(hash ? { hash } : {}) })) })), 0o644)
@@ -661,16 +695,18 @@ export function applyPlan(plan: ReconcilePlan, state: { desired: DesiredState; l
     for (const op of ops) {
       const full = targetFile(target, op.rel)
       if (op.existed && fs.lstatSync(full, { throwIfNoEntry: false })) {
-        const previous = path.join(txn, "prev", ...op.rel.split("/"))
+        const previousRel = `.manage-agents/txn/${id}/prev/${op.rel}`
+        let previous = assertSafeTargetSubpath(target, previousRel, { allowLeafSymlink: true })
         fs.mkdirSync(path.dirname(previous), { recursive: true })
-        fs.renameSync(full, previous)
+        previous = assertSafeTargetSubpath(target, previousRel, { allowLeafSymlink: true })
+        movePathWithRetry(full, previous)
         // What was moved aside must be what the plan saw; otherwise the rollback below puts it back untouched.
         if (op.rel in plan.expected && currentHash(previous) !== plan.expected[op.rel]) throw new Error(`${op.rel} changed while installing; nothing was written, run the command again`)
       }
       if (op.staged) {
         fs.mkdirSync(path.dirname(full), { recursive: true })
         if (fs.lstatSync(full, { throwIfNoEntry: false })) throw new Error(`${op.rel} appeared while installing; nothing was written, run the command again`)
-        fs.renameSync(op.staged, full)
+        movePathWithRetry(assertSafeTargetSubpath(target, `.manage-agents/txn/${id}/new/${op.rel}`, { allowLeafSymlink: true }), targetFile(target, op.rel))
       }
     }
   } catch (error) {
@@ -678,7 +714,7 @@ export function applyPlan(plan: ReconcilePlan, state: { desired: DesiredState; l
     throw error
   }
   fs.rmSync(journalPath(target), { force: true })
-  fs.rmSync(txn, { recursive: true, force: true })
+  removePathWithRetry(transactionDir(target, id))
   for (const rel of plan.deletes) removeEmptyParents(target, rel)
   return { backupId }
 }
@@ -696,9 +732,11 @@ function pidAlive(pid: number): boolean {
 export async function withTargetLock<T>(target: string, command: string, fn: () => Promise<T> | T): Promise<T> {
   const file = statePath(target, "install.lock")
   fs.mkdirSync(path.dirname(file), { recursive: true })
+  statePath(target, "install.lock")
   const owner = JSON.stringify({ pid: process.pid, host: os.hostname(), command, started: new Date().toISOString() })
   for (let attempt = 0; ; attempt++) {
     try {
+      statePath(target, "install.lock")
       fs.writeFileSync(file, owner, { flag: "wx" })
       break
     } catch (error) {
@@ -706,9 +744,11 @@ export async function withTargetLock<T>(target: string, command: string, fn: () 
       let raw = ""
       let holder: any = null
       try {
+        statePath(target, "install.lock")
         raw = fs.readFileSync(file, "utf8")
         holder = JSON.parse(raw)
       } catch {
+        statePath(target, "install.lock")
         if (Date.now() - fs.statSync(file).mtimeMs < STALE_LOCK_GRACE_MS) throw new Error(`${target} is being installed by another process`)
       }
       if (holder && (holder.host !== os.hostname() || pidAlive(holder.pid))) {
@@ -716,21 +756,28 @@ export async function withTargetLock<T>(target: string, command: string, fn: () 
       }
       // Move the stale lock aside atomically, then make sure it is the one judged stale: another process may have
       // reclaimed it and taken a fresh lock in between, and that lock must survive.
-      const aside = `${file}.stale-${process.pid}-${crypto.randomBytes(4).toString("hex")}`
+      const staleName = `install.lock.stale-${process.pid}-${crypto.randomBytes(4).toString("hex")}`
+      const aside = statePath(target, staleName)
       try {
+        statePath(target, "install.lock")
+        statePath(target, staleName)
         fs.renameSync(file, aside)
       } catch {
         continue
       }
+      statePath(target, staleName)
       if (fs.readFileSync(aside, "utf8") !== raw) {
         try {
+          statePath(target, "install.lock")
           fs.linkSync(aside, file)
         } catch {
           /* a third process holds the lock now */
         }
+        statePath(target, staleName)
         fs.rmSync(aside, { force: true })
         throw new Error(`${target} is being installed by another process`)
       }
+      statePath(target, staleName)
       fs.rmSync(aside, { force: true })
     }
   }
@@ -738,6 +785,7 @@ export async function withTargetLock<T>(target: string, command: string, fn: () 
     return await fn()
   } finally {
     try {
+      statePath(target, "install.lock")
       if (JSON.parse(fs.readFileSync(file, "utf8")).pid === process.pid) fs.rmSync(file, { force: true })
     } catch {
       /* already gone */
@@ -919,17 +967,19 @@ export function targetStatus(target: string, registry: SourceRegistry, env: Node
 /** Puts back what an --adopt replaced; the restored paths and entries become unmanaged again. */
 export async function restoreBackup(target: string, backupId: string): Promise<{ files: string[]; config: AdoptedConfigEntry[] }> {
   if (!/^[\w-]+$/.test(backupId)) throw new Error(`invalid backup id "${backupId}"`)
-  const dir = path.join(targetStateDir(target), "backups", backupId)
-  const backup = readJson(path.join(dir, "backup.json"))
+  assertSafeTargetSubpath(target, ".manage-agents/backups", { allowLeafSymlink: false })
+  const dir = assertSafeTargetSubpath(target, `.manage-agents/backups/${backupId}`, { allowLeafSymlink: false })
+  const backup = readJson(assertSafeTargetSubpath(target, `.manage-agents/backups/${backupId}/backup.json`, { allowLeafSymlink: false }))
   if (!backup || !Array.isArray(backup.files) || !backup.files.every(isSafeRel) || !Array.isArray(backup.config)) throw new Error(`no usable backup "${backupId}" in ${path.dirname(dir)}`)
+  for (const rel of backup.files) assertSafeTargetSubpath(target, `.manage-agents/backups/${backupId}/files/${rel}`, { allowLeafSymlink: true })
   return withTargetLock(target, "restore", () => {
     rollbackInterrupted(target)
     const installed = readInstalled(target)
     const configFile = typeof backup.configFile === "string" && PACK_CONFIG_FILES.has(backup.configFile) ? backup.configFile : "opencode.json"
-    const configPath = path.join(target, configFile)
+    const configPath = targetFile(target, configFile)
     if (fs.lstatSync(configPath, { throwIfNoEntry: false })?.isSymbolicLink()) throw new Error(`${configFile} is a symlink; restore does not replace it`)
     const fileBackups = (backup.files as string[]).filter(rel => rel !== configFile)
-    const backupPath = (rel: string) => path.join(dir, "files", ...rel.split("/"))
+    const backupPath = (rel: string) => assertSafeTargetSubpath(target, `.manage-agents/backups/${backupId}/files/${rel}`, { allowLeafSymlink: true })
     const plan: ReconcilePlan = { target, packs: [], writes: [], deletes: [], released: [], conflicts: [], warnings: [], adopted: { files: [], config: [] }, configFile, configText: null, expected: {}, installed }
     for (const rel of fileBackups) {
       delete installed.files[rel]
@@ -939,7 +989,7 @@ export async function restoreBackup(target: string, backupId: string): Promise<{
       else plan.writes.push({ rel, from, hash: hashFile(from), mode: fs.statSync(from).mode & 0o777, kind: "update" })
     }
     if ((backup.files as string[]).includes(configFile)) {
-      plan.configText = fs.readFileSync(path.join(dir, "files", configFile), "utf8")
+      plan.configText = fs.readFileSync(backupPath(configFile), "utf8")
       installed.config = {}
       delete installed.createdSections
     } else if (backup.config.length) {

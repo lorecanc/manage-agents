@@ -3,6 +3,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { atomicWriteRestrictedFile } from "./agents.js"
+import { movePathWithRetry, removePathWithRetry } from "./fsWindows.js"
 import { extractHttpsHost, inspectGhAuth, parseGitHubShorthand, type GhRunner } from "./github.js"
 import { DISCOVERY_DEPTH, MANIFEST_FILE, PACK_NAME_RE, readPackManifest, SKIPPED_DIRS, type PackManifest } from "./packs.js"
 import { derivePackSlug, validateVirtualPack } from "./virtualPacks.js"
@@ -60,9 +61,12 @@ export function loadSources(env: NodeJS.ProcessEnv = process.env): SourceRegistr
   if (raw?.schemaVersion !== 1 || !Array.isArray(raw.sources)) throw new Error(`${file}: unsupported sources registry`)
   const names = new Set<string>()
   for (const source of raw.sources) {
+    if (typeof source === "object" && source !== null && source.kind === "git" && typeof source.url === "string" && hasUrlCredentials(source.url)) {
+      throw new Error(`${file}: credentials in source URL are not permitted: "${redactUrlCredentials(source.url)}"`)
+    }
     const valid = typeof source === "object" && source !== null && PACK_NAME_RE.test(source.name) && !names.has(source.name) && typeof source.trusted === "boolean" && (
       source.kind === "local" ? typeof source.path === "string" && path.isAbsolute(source.path)
-        : source.kind === "git" && typeof source.url === "string" && (source.ref === undefined || GIT_REF_RE.test(source.ref)))
+        : source.kind === "git" && typeof source.url === "string" && isGitLocation(source.url, { allowFileUrls: true }) && !hasUrlCredentials(source.url) && (source.ref === undefined || GIT_REF_RE.test(source.ref)))
     if (!valid) throw new Error(`${file}: invalid source entry ${JSON.stringify(source?.name ?? null)}`)
     names.add(source.name)
   }
@@ -88,9 +92,44 @@ function isGitLocation(location: string, options: GitOptions): boolean {
   return GIT_URL_RE.test(location)
 }
 
-/** Credentials or query tokens in a URL would be stored in sources.json and printed by `source list`; use a git credential helper instead. */
-const hasUrlCredentials = (location: string) =>
-  /^https:\/\/[^/]*@/.test(location) || /^ssh:\/\/[^/@]*:[^/@]*@/.test(location) || /^(?:https|ssh):\/\/[^?]*\?/.test(location)
+/** Credentials or query tokens in a URL must stay out of sources.json and terminal output. */
+export function hasUrlCredentials(location: string): boolean {
+  if (/^https?:\/\/[^/?#]*@/i.test(location)) return true
+  const sshUserInfo = location.match(/^ssh:\/\/([^/?#@]*)@/i)?.[1]
+  if (sshUserInfo !== undefined && (sshUserInfo !== "git" || sshUserInfo.includes(":"))) return true
+  if (/^[^/:?#]+:[^/@?#]+@[^/:?#]+:/i.test(location)) return true
+  return /^(?:https?|ssh):\/\/[^#]*\?/i.test(location)
+}
+
+export function redactUrlCredentials(location: string): string {
+  return location
+    .replace(/^(https?:\/\/)[^/?#]*@/i, "$1")
+    .replace(/^(ssh:\/\/[^/:?#]+):[^/@?#]*@/i, "$1@")
+    .replace(/^([^/:?#]+):[^/@?#]+@([^/:?#]+:)/, "$1@$2")
+    .replace(/^((?:https?|ssh):\/\/[^?#]*)\?[^#]*/i, "$1")
+}
+
+export function assertSafeCachePath(cacheRoot: string, targetPath: string): void {
+  const root = path.resolve(cacheRoot)
+  const dest = path.resolve(targetPath)
+  if (dest !== root && !dest.startsWith(root + path.sep)) {
+    throw new Error(`Refusing cache path outside cache directory: ${dest}`)
+  }
+
+  const rootStat = fs.lstatSync(root, { throwIfNoEntry: false })
+  if (rootStat && (rootStat.isSymbolicLink() || !rootStat.isDirectory())) {
+    throw new Error(`Refusing symlinked or non-directory cache path: ${root}`)
+  }
+
+  let current = root
+  for (const component of path.relative(root, dest).split(path.sep).filter(Boolean)) {
+    current = path.join(current, component)
+    const stat = fs.lstatSync(current, { throwIfNoEntry: false })
+    if (stat && (stat.isSymbolicLink() || !stat.isDirectory())) {
+      throw new Error(`Refusing symlinked or non-directory cache path: ${current}`)
+    }
+  }
+}
 
 /** Derives a unique valid source name from a directory, Git URL, or GitHub `owner/repo` spec. */
 export function deriveSourceName(location: string, registry: SourceRegistry): string {
@@ -129,12 +168,12 @@ export function addSource(registry: SourceRegistry, name: string, location: stri
     resolvedRef = resolvedRef ?? inlineRef
   }
   if (resolvedRef !== undefined && !GIT_REF_RE.test(resolvedRef)) throw new Error(`invalid git ref "${resolvedRef}"`)
+  if (hasUrlCredentials(resolvedLocation)) throw new Error("credentials in source URLs are not stored: configure a git credential helper or an SSH key instead")
   let source: Source
   if (isGitLocation(resolvedLocation, options)) {
-    if (hasUrlCredentials(resolvedLocation)) throw new Error("credentials in source URLs are not stored: configure a git credential helper or an SSH key instead")
     source = { name, kind: "git", url: resolvedLocation, ...(resolvedRef ? { ref: resolvedRef } : {}), trusted: settings.trusted === true }
   } else if (/^[a-z][a-z0-9+.-]*:/i.test(resolvedLocation) && !path.win32.isAbsolute(resolvedLocation)) {
-    throw new Error(`unsupported source URL "${location}": use https:, ssh:, git@host:path or owner/repo`)
+    throw new Error(`unsupported source URL "${redactUrlCredentials(location)}": use https:, ssh:, git@host:path or owner/repo`)
   } else {
     const dir = path.resolve(resolvedLocation)
     if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) throw new Error(`${dir} is not a directory`)
@@ -167,7 +206,7 @@ export function sourceRoot(source: Source, env: NodeJS.ProcessEnv = process.env)
 }
 
 function git(args: string[], cwd?: string) {
-  const result = spawnSync("git", cwd ? ["-C", cwd, ...args] : args, { encoding: "utf8", env: cleanGitEnvironment({ GIT_TERMINAL_PROMPT: "0" }), stdio: ["ignore", "pipe", "pipe"] })
+  const result = spawnSync("git", cwd ? ["-C", cwd, ...args] : args, { encoding: "utf8", env: cleanGitEnvironment({ GIT_TERMINAL_PROMPT: "0" }), stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
   if (result.error) throw result.error
   if (result.status !== 0) throw new Error(`git ${args[0]} failed: ${(result.stderr || "").trim().split("\n").slice(-1)[0] || `exit ${result.status}`}`)
   return result.stdout.trim()
@@ -193,8 +232,10 @@ export function ghCredentialArgs(url: string, env: NodeJS.ProcessEnv = process.e
 /** Clones or fetches a git source into the cache and checks out its ref (default: the remote HEAD). Returns the commit. */
 export function pullSource(source: Source, env: NodeJS.ProcessEnv = process.env, options: GitOptions = {}): string | null {
   if (source.kind === "local") return null
-  if (!isGitLocation(source.url, options)) throw new Error(`source "${source.name}": refusing git URL "${source.url}"`)
+  if (hasUrlCredentials(source.url)) throw new Error("credentials in source URLs are not permitted")
+  if (!isGitLocation(source.url, options)) throw new Error(`source "${source.name}": refusing git URL "${redactUrlCredentials(source.url)}"`)
   const dir = sourceRoot(source, env)
+  assertSafeCachePath(engineCacheDir(env), dir)
   const protocol = [...(options.allowFileUrls ? [] : ["-c", "protocol.file.allow=never"]), ...ghCredentialArgs(source.url, env, options)]
   if (!fs.existsSync(path.join(dir, ".git"))) {
     fs.mkdirSync(path.dirname(dir), { recursive: true })
@@ -208,6 +249,65 @@ export function pullSource(source: Source, env: NodeJS.ProcessEnv = process.env,
   if (!commit) throw new Error(`source "${source.name}": ref "${source.ref ?? "HEAD"}" not found`)
   git(["checkout", "--quiet", "--force", "--detach", commit], dir)
   return commit
+}
+
+export function expandUserPath(rawPath: string, env: NodeJS.ProcessEnv = process.env): string {
+  const trimmed = rawPath.trim()
+  if (!trimmed) throw new Error("destination directory cannot be empty")
+  const home = env.HOME || env.USERPROFILE || os.homedir()
+  if (trimmed === "~") return path.resolve(home)
+  if (trimmed.startsWith("~/") || trimmed.startsWith("~\\")) return path.resolve(home, trimmed.slice(2))
+  return path.resolve(trimmed)
+}
+
+/** Clones a git source into a writable working directory for local authoring/onboarding, rejecting symlinks and non-empty destinations. */
+export function cloneSourceToWorkingTree(source: Source, destDir: string, env: NodeJS.ProcessEnv = process.env, options: GitOptions = {}): string {
+  if (source.kind !== "git") throw new Error(`source "${source.name}" is already a local directory`)
+  if (hasUrlCredentials(source.url)) throw new Error("credentials in source URLs are not permitted")
+  if (!isGitLocation(source.url, options)) throw new Error(`source "${source.name}": refusing git URL "${redactUrlCredentials(source.url)}"`)
+  if (source.ref !== undefined && !GIT_REF_RE.test(source.ref)) throw new Error(`invalid git ref "${source.ref}"`)
+
+  const rawDest = expandUserPath(destDir, env)
+  // Normalize OS-level root symlinks (e.g. macOS /var -> /private/var, /tmp -> /private/tmp) while checking every deeper segment with lstat.
+  const parsed = path.parse(rawDest)
+  const segments = rawDest.slice(parsed.root.length).split(path.sep).filter(Boolean)
+  let current = parsed.root
+  for (let i = 0; i < segments.length; i++) {
+    const candidate = path.join(current, segments[i])
+    const st = fs.lstatSync(candidate, { throwIfNoEntry: false })
+    if (!st) {
+      current = candidate
+      continue
+    }
+    if (st.isSymbolicLink()) {
+      if (process.platform === "darwin" && i === 0 && (segments[0] === "var" || segments[0] === "tmp" || segments[0] === "etc")) {
+        current = fs.realpathSync(candidate)
+        continue
+      }
+      throw new Error(`Refusing to clone through symlinked path: ${candidate}`)
+    }
+    if (!st.isDirectory()) {
+      throw new Error(`Cannot clone into "${rawDest}": "${candidate}" is not a directory`)
+    }
+    current = candidate
+  }
+  const resolvedDest = current
+  const existing = fs.lstatSync(resolvedDest, { throwIfNoEntry: false })
+  if (existing) {
+    if (fs.readdirSync(resolvedDest).length > 0) {
+      throw new Error(`Destination directory "${resolvedDest}" already exists and is not empty`)
+    }
+  } else {
+    fs.mkdirSync(path.dirname(resolvedDest), { recursive: true })
+  }
+
+  const realTargetDest = existing ? fs.realpathSync(resolvedDest) : path.join(fs.realpathSync(path.dirname(resolvedDest)), path.basename(resolvedDest))
+  const protocol = [...(options.allowFileUrls ? [] : ["-c", "protocol.file.allow=never"]), ...ghCredentialArgs(source.url, env, options)]
+  git([...protocol, "clone", "--quiet", "--", source.url, realTargetDest])
+  if (source.ref) {
+    git(["checkout", "--quiet", source.ref], realTargetDest)
+  }
+  return fs.realpathSync(realTargetDest)
 }
 
 /** Commit the source's ref points to after the last fetch (no network). */
@@ -227,6 +327,7 @@ function fetchedRevision(source: Source & { kind: "git" }, dir: string): string 
 export function lastFetchedRevision(source: Source, env: NodeJS.ProcessEnv = process.env): string | null {
   if (source.kind === "local") return null
   const dir = sourceRoot(source, env)
+  assertSafeCachePath(engineCacheDir(env), dir)
   return fs.existsSync(path.join(dir, ".git")) ? fetchedRevision(source, dir) ?? null : null
 }
 
@@ -234,6 +335,7 @@ export function lastFetchedRevision(source: Source, env: NodeJS.ProcessEnv = pro
 export function sourceRevision(source: Source, env: NodeJS.ProcessEnv = process.env): string | null {
   if (source.kind === "local") return null
   const dir = sourceRoot(source, env)
+  assertSafeCachePath(engineCacheDir(env), dir)
   if (!fs.existsSync(path.join(dir, ".git"))) return null
   try {
     return git(["rev-parse", "HEAD"], dir)
@@ -247,17 +349,19 @@ export function revisionSnapshot(source: Source, revision: string, env: NodeJS.P
   if (source.kind !== "git") throw new Error(`source "${source.name}" is not a git source`)
   if (!/^[0-9a-f]{40,64}$/.test(revision)) throw new Error(`invalid revision "${revision}"`)
   const dir = path.join(engineCacheDir(env), "revisions", source.name, revision)
-  if (fs.existsSync(path.join(dir, ".git"))) return dir
   const repo = sourceRoot(source, env)
+  assertSafeCachePath(engineCacheDir(env), repo)
+  assertSafeCachePath(engineCacheDir(env), dir)
+  if (fs.existsSync(path.join(dir, ".git"))) return dir
   if (!fs.existsSync(path.join(repo, ".git"))) throw new Error(`source "${source.name}" has not been pulled yet: run \`manage-agents source pull ${source.name}\``)
   fs.mkdirSync(path.dirname(dir), { recursive: true })
   const temporary = `${dir}.tmp-${process.pid}-${Date.now()}`
   try {
     git(["clone", "--quiet", "--shared", "--no-checkout", "--", repo, temporary])
     git(["checkout", "--quiet", "--force", "--detach", revision], temporary)
-    fs.renameSync(temporary, dir)
+    movePathWithRetry(temporary, dir)
   } catch (error) {
-    fs.rmSync(temporary, { recursive: true, force: true })
+    removePathWithRetry(temporary)
     if (!fs.existsSync(path.join(dir, ".git"))) throw new Error(`source "${source.name}": revision ${revision.slice(0, 12)} is not available; run \`manage-agents source pull ${source.name}\` (${(error as Error).message})`)
   }
   return dir
@@ -266,6 +370,7 @@ export function revisionSnapshot(source: Source, revision: string, env: NodeJS.P
 /** Packs inside a source: directories with opencode-pack.json, not nested in another pack. */
 export function discoverPacks(source: Source, env: NodeJS.ProcessEnv = process.env): { candidates: PackCandidate[]; problems: string[] } {
   const root = sourceRoot(source, env)
+  if (source.kind === "git") assertSafeCachePath(engineCacheDir(env), root)
   const candidates: PackCandidate[] = []
   const problems: string[] = []
   if (!fs.existsSync(root)) {

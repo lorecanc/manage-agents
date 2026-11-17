@@ -1,10 +1,11 @@
-import React, { useState, useEffect, useMemo } from "react"
+import React, { useState, useEffect, useMemo, useRef } from "react"
 import fs from "node:fs"
 import path from "node:path"
 import os from "node:os"
 import { isDeepStrictEqual } from "node:util"
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react"
 import {
+  extractFrontmatter,
   findAgentFiles,
   AgentInfo,
   updateAgentsModel,
@@ -15,6 +16,9 @@ import {
   getAgentPermissionSummary,
   SAFETY_PRESETS,
   AGENT_EFFORT_VARIANTS,
+  AGENT_TUNING_MODES,
+  KNOWN_MODEL_VARIANTS,
+  type AgentTuningMode,
   applySafetyPreset,
   updateAgentParams,
   updateAgentDelegations,
@@ -27,10 +31,11 @@ import {
   analyzePermissionOrder,
   fixPermissionOrder,
   type TuningField,
+  resolveAgentSteps,
+  resolveAgentTuningMode,
   inspectTuningTargets,
   buildTuningUpdateParams,
   sanitizeFilename,
-  getCategoryPrefixes,
   type saveAgentFile,
 } from "./utils/agents.js"
 import { loadModelCatalog, suggestModels, collectInvalidModelGroups, modelDisplayValue, getModelVariants, type ModelCatalog } from "./utils/models.js"
@@ -44,7 +49,9 @@ import {
   type UnifiedFlowItem,
 } from "./utils/archetypes.js"
 import { packDir, readManifest } from "./utils/catalog.js"
-import { changeTarget, installChange } from "./utils/installer.js"
+import { changeTarget, installChange, reconcileChange, targetStatus, type TargetStatus } from "./utils/installer.js"
+import { realpathThroughExistingAncestor } from "./utils/pathValidation.js"
+import { effectiveOverrides, loadOverrideSettings } from "./utils/userSettings.js"
 import { addSource, deriveSourceName, engineConfigDir, findSource, loadSources, pullSource, removeSource, saveSources, sourceRevision, sourceRoot, type Source } from "./utils/sources.js"
 import { inspectGhAuthAsync, listGhReposAsync, runGhWebLogin, type GhAuthStatus, type GhRepoSummary } from "./utils/github.js"
 import {
@@ -61,47 +68,139 @@ import {
   sourceTranslationConfigLocation,
   type FlowDraftInput,
 } from "./utils/sourceCustomization.js"
-import { WILDCARD_TRIGGER, type DelegationEffect, type PolicyEffect } from "./utils/values.js"
-import { derivePackSlug, initPackManifest, isVirtualPackRoot } from "./utils/virtualPacks.js"
-import { bridgePack } from "./utils/bridgeWorkspace.js"
+import { own as ownProp, WILDCARD_TRIGGER, type DelegationEffect, type PolicyEffect } from "./utils/values.js"
+import { derivePackSlug, isVirtualPackRoot } from "./utils/virtualPacks.js"
+import {
+  applyPackOnboarding,
+  bumpPackVersion,
+  cloneGitSourceForOnboarding,
+  fixPackDoctor,
+  inspectOnboardingCandidate,
+  inspectPackDoctor,
+  installPackAuthoringKit,
+  resolveEditablePackDir,
+  scaffoldPackResource,
+  suggestCloneDestination,
+  type EffectiveOnboardingLayout,
+  type OnboardingInspection,
+  type PackDoctorReport,
+  type ScaffoldResourceKind,
+  type SemverReleaseKind,
+} from "./utils/packOnboarding.js"
+import { bridgeConfirmationsNeeded, bridgePack, resolveBridgeWorkspaceTrust } from "./utils/bridgeWorkspace.js"
+import {
+  applyBridgeDraftToConfig,
+  buildPackBridgePreview,
+  CLAUDE_TIER_MODEL_PRESETS,
+  cloneBridgeTiers,
+  CODEX_EFFORT_PRESETS,
+  collectBridgeablePacks,
+  comparePackCategories,
+  cycleAgentRoleTier,
+  cyclePresetValue,
+  deriveBridgePrefix,
+  filterBridgePacks,
+  initialBridgeModelCatchAll,
+  reconcileBridgePackQuery,
+  resolveInitialBridgePack,
+  stepBridgeField,
+  stepBridgePackSelection,
+  validateDraftBridgeTiers,
+  type BridgeField,
+} from "./utils/bridgePrompt.js"
 import { describeChangeResult } from "./utils/changeReport.js"
 import { defaultTarget, serializeLock } from "./utils/lock.js"
-import { buildInferenceIndex, loadTranslationConfig, resolveModelTarget, resolveRole, saveTranslationConfig, translationConfigPath, validateClaudeModelName, type TranslationConfig } from "./utils/translationConfig.js"
+import {
+  buildInferenceIndex,
+  DEFAULT_TRANSLATION_CONFIG,
+  loadTranslationConfig,
+  resolveModelTarget,
+  resolveRole,
+  saveTranslationConfig,
+  translationConfigPath,
+  validateClaudeModelName,
+  type TranslationConfig,
+  type TranslationTier,
+} from "./utils/translationConfig.js"
 import { claudeNextSteps } from "./utils/claudeNextSteps.js"
 import { registerPlugin, validatePlugin } from "./utils/claudePluginCli.js"
 import { AUTO_COMMIT_MESSAGES, autoCommitEnabled, repositoryTransaction, type TransactionWarning } from "./utils/repositoryTransaction.js"
-import { adjustListShare, calculateLayout, calculateListColumnBudget, calculatePanelWidths, resetListShare } from "./utils/layout.js"
+import {
+  adjustListShare,
+  calculateLayout,
+  calculateListColumnBudget,
+  calculateModalViewport,
+  calculatePanelWidths,
+  calculateWorkspaceViewports,
+  clampListScroll,
+  computeCatalogJumpState,
+  resetListShare,
+} from "./utils/layout.js"
+import { resolveEngineVersion, type EngineVersionInfo } from "./utils/engineVersion.js"
+import { applyEngineUpdate, checkForEngineUpdate, type EngineUpdateCheckResult } from "./utils/selfUpdate.js"
 import { loadUiConfig, saveUiConfig } from "./utils/uiConfig.js"
 import { displayWidth, middleEllipsis, terminalSafeText } from "./utils/terminalText.js"
+import { buildContextualShortcuts, filterPaletteCommands, type PaletteCommand, type WorkspaceTab } from "./utils/commandPalette.js"
+import { buildPreviewUnifiedDiff, fractionalBar, gaugeBar, lerpColor, sanitizeHexColor, terminalSafeMarkdown, THEME } from "./utils/uiTheme.js"
+import { isReducedMotionPreferred, useAnimatedNumber, useFlashDecay, usePulseLoop } from "./ui/animations.js"
+import { CommandPaletteModal } from "./ui/CommandPaletteModal.js"
+import { HelpModal } from "./ui/HelpModal.js"
+import { ParameterTuningModal } from "./ui/ParameterTuningModal.js"
+import { BridgeModal, calculateBridgeModalLayout } from "./ui/BridgeModal.js"
+import { getOnboardingFieldOrder, PackOnboardingModal, type OnboardingField } from "./ui/PackOnboardingModal.js"
+import { getDoctorMaxFindingRows, getScaffoldFieldOrder, PackDoctorModal, type PackDoctorTab, type ScaffoldField } from "./ui/PackDoctorModal.js"
+import {
+  buildHelpSections,
+  calculateHelpViewport,
+  clampFocusIntoHelpSlice,
+  clampHelpScroll,
+  cycleHelpTab,
+  defaultHelpTabForWorkspace,
+  helpTabByNumber,
+  type HelpShortcutItem,
+  type HelpTabId,
+} from "./utils/helpGuide.js"
+import { ToastOverlay } from "./ui/ToastOverlay.js"
+import { buildFlowsInspectorItems, buildFlowsNavRows, FlowsWorkspace } from "./ui/FlowsWorkspace.js"
+import { calculateTargetInstalledPackRows, SourcesTargetWorkspace, type SourceWorkspaceRow } from "./ui/SourcesTargetWorkspace.js"
+import { WorkspaceTopbar } from "./ui/WorkspaceTopbar.js"
+import {
+  calculatePackFlowsModalLayout,
+  formatTriggerLabel,
+  PackFlowsModal,
+  PERMISSION_POLICY_ROWS,
+} from "./ui/PackFlowsModal.js"
+import { getMarkdownSyntaxStyle } from "./ui/markdownStyle.js"
+import { PromptMarkdownView } from "./ui/PromptMarkdownView.js"
+import { layoutMarkdownDocument } from "./utils/markdownLayout.js"
 
 interface AppProps {
   workspaceRoot?: string
   initialSource?: Source
   startupNotice?: string
   listShare?: number
+  reducedMotion?: boolean
   uiConfigWarning?: string
   configReadOnly?: boolean
   uiConfigRevision?: string
+  initialModelCatalog?: ModelCatalog
 }
 
 type ActiveDataSource =
   | { kind: "workspace"; root: string }
   | { kind: "source"; source: Source; root: string }
 
-type SourceModalRow =
-  | { id: string; kind: "connect-input"; spec: string }
-  | { id: string; kind: "registered"; source: Source; revision: string | null; isActive: boolean }
-  | { id: string; kind: "gh-repo"; repo: GhRepoSummary }
-
 type ViewMode =
   | "main"
-  | "sources"
+  | "command-palette"
+  | "help"
   | "model-selector"
   | "repair-selector"
   | "repair-confirm"
   | "tier-selector"
    | "action-result"
   | "bridge-prompt"
+  | "bridge-confirm"
   | "install-confirm"
   | "color-selector"
   | "rename-prompt"
@@ -117,6 +216,8 @@ type ViewMode =
   | "routing-permissions"
   | "routing-delegations"
   | "pack-init"
+  | "pack-doctor"
+  | "self-update"
 
 interface ActiveItem {
   type: "file" | "folder"
@@ -211,8 +312,42 @@ interface ColorTreeItem {
   value: string
 }
 
-export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNotice, listShare = 2 / 3, uiConfigWarning, configReadOnly = false, uiConfigRevision = "missing" }: AppProps) {
+export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNotice, listShare = 2 / 3, reducedMotion: reducedMotionProp, uiConfigWarning, configReadOnly = false, uiConfigRevision = "missing", initialModelCatalog }: AppProps) {
   const renderer = useRenderer()
+  const [reducedMotionState, setReducedMotionState] = useState<boolean>(() => isReducedMotionPreferred(reducedMotionProp))
+  const [workspaceTab, setWorkspaceTab] = useState<WorkspaceTab>(() => (workspaceRootProp || initialSource ? "catalog" : "sources"))
+  const [activePane, setActivePane] = useState<"list" | "inspector">("list")
+  const initialBanner = startupNotice
+    ? terminalSafeText(startupNotice)
+    : uiConfigWarning
+      ? `⚠ ${terminalSafeText(uiConfigWarning)}`
+      : null
+  const [toastMessage, setToastMessage] = useState<string | null>(() => initialBanner)
+  const [toastId, setToastId] = useState<number>(() => initialBanner ? 1 : 0)
+  const pushToast = (msg: string) => {
+    const clean = terminalSafeText(msg).trim()
+    if (!clean) return
+    setToastMessage(clean)
+    setToastId(id => id + 1)
+  }
+  const [flashTick, setFlashTick] = useState(0)
+  const [flashedPaths, setFlashedPaths] = useState<Set<string>>(new Set())
+  const triggerRowFlash = (paths: string[]) => {
+    setFlashedPaths(new Set(paths))
+    setFlashTick(t => t + 1)
+  }
+  const [isAsyncBusy, setIsAsyncBusy] = useState(false)
+  const [targetStatusInfo, setTargetStatusInfo] = useState<TargetStatus | null>(null)
+  const [flowsFocusIndex, setFlowsFocusIndex] = useState(0)
+  const [flowsScrollOffset, setFlowsScrollOffset] = useState(0)
+  const [flowsInspectorFocus, setFlowsInspectorFocus] = useState(0)
+  const [sourcesInspectorScroll, setSourcesInspectorScroll] = useState(0)
+  const [paletteQuery, setPaletteQuery] = useState("")
+  const [paletteFocusIndex, setPaletteFocusIndex] = useState(0)
+  const [paletteScrollOffset, setPaletteScrollOffset] = useState(0)
+  const [helpTab, setHelpTab] = useState<HelpTabId>("catalog")
+  const [helpFocusIndex, setHelpFocusIndex] = useState(0)
+  const [helpScrollOffset, setHelpScrollOffset] = useState(0)
   const [activeDataSource, setActiveDataSource] = useState<ActiveDataSource | null>(() => {
     if (workspaceRootProp) return { kind: "workspace", root: workspaceRootProp }
     if (initialSource) return { kind: "source", source: initialSource, root: sourceRoot(initialSource) }
@@ -228,8 +363,8 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     repositoryTransaction(workspaceRoot, paths, AUTO_COMMIT_MESSAGES[operation], fn)
   // Data State
   const [agents, setAgents] = useState<AgentInfo[]>([])
-  const [models, setModels] = useState<string[]>([])
-  const [modelCatalog, setModelCatalog] = useState<ModelCatalog>({ status: "unavailable", models: [] })
+  const [models, setModels] = useState<string[]>(() => (initialModelCatalog?.status === "verified" ? initialModelCatalog.models : []))
+  const [modelCatalog, setModelCatalog] = useState<ModelCatalog>(() => initialModelCatalog ?? { status: "unavailable", models: [] })
   const [repairGroupKey, setRepairGroupKey] = useState<string | null>(null)
   const [repairMappings, setRepairMappings] = useState<Record<string, string>>({})
   const [selectedAgentPaths, setSelectedAgentPaths] = useState<Set<string>>(new Set())
@@ -245,7 +380,15 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   const [scrollOffset, setScrollOffset] = useState(0)
 
   // Modal / Action State
-  const [viewMode, setViewMode] = useState<ViewMode>(() => (workspaceRootProp || initialSource ? "main" : "sources"))
+  const [viewMode, setViewMode] = useState<ViewMode>("main")
+  const installPreviewReqIdRef = useRef(0)
+  const pendingJumpIndexRef = useRef<number | null>(null)
+  useEffect(() => {
+    installPreviewReqIdRef.current += 1
+  }, [workspaceTab, activeDataSource, viewMode])
+  useEffect(() => {
+    if (workspaceTab !== "catalog" || viewMode !== "main") setIsSearching(false)
+  }, [workspaceTab, viewMode])
   const [registeredSources, setRegisteredSources] = useState<Source[]>([])
   const [sourceRevisions, setSourceRevisions] = useState<Record<string, string | null>>({})
   const [activeSourceName, setActiveSourceName] = useState<string | undefined>(initialSource?.name)
@@ -273,7 +416,9 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   // Conditional IF/OR flows of a pack (M on any pack folder): list -> editor -> callers/triggers/models/tools/delegations.
   const [routingArchetype, setRoutingArchetype] = useState<string | null>(null)
   const [routingFocus, setRoutingFocus] = useState(0)
+  const [routingScroll, setRoutingScroll] = useState(0)
   const [routingEditorFocus, setRoutingEditorFocus] = useState(0)
+  const [routingEditorScroll, setRoutingEditorScroll] = useState(0)
   type RoutingDraftState = FlowDraftInput & { previousKey?: string }
   const [routingDraft, setRoutingDraft] = useState<RoutingDraftState | null>(null)
   type RoutingPick = { kind: "trigger" } | { kind: "roles"; roles: string[] }
@@ -285,15 +430,40 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   const [routingRevision, setRoutingRevision] = useState(0)
   const [callerDraftSet, setCallerDraftSet] = useState<Set<string>>(new Set())
   const [callerFocus, setCallerFocus] = useState(0)
+  const [callerScroll, setCallerScroll] = useState(0)
   const [flowSubFocus, setFlowSubFocus] = useState(0)
   const [flowSubScroll, setFlowSubScroll] = useState(0)
 
-  // Guided opencode-pack.json initializer for virtual .md folders ([I] key)
+  const [engineVersionInfo, setEngineVersionInfo] = useState<EngineVersionInfo | null>(() => {
+    try { return resolveEngineVersion() } catch { return null }
+  })
+  const [selfUpdateCheck, setSelfUpdateCheck] = useState<EngineUpdateCheckResult | null>(null)
+  const [selfUpdateStatus, setSelfUpdateStatus] = useState("")
+  const [selfUpdateBusy, setSelfUpdateBusy] = useState(false)
+
+  // Guided Contract 1.1 onboarding wizard ([I] key & proactive prompt on virtual sources)
+  const promptedVirtualRootsRef = useRef<Set<string>>(new Set())
+  const [initInspection, setInitInspection] = useState<OnboardingInspection | null>(null)
+  const [initCloneDest, setInitCloneDest] = useState("")
   const [initPackName, setInitPackName] = useState("")
   const [initPackVersion, setInitPackVersion] = useState("0.1.0")
   const [initPackDesc, setInitPackDesc] = useState("")
+  const [initPackLayout, setInitPackLayout] = useState<EffectiveOnboardingLayout>("root")
   const [initPackOrganize, setInitPackOrganize] = useState(true)
-  const [initPackField, setInitPackField] = useState<"name" | "version" | "desc" | "organize">("name")
+  const [initPackKit, setInitPackKit] = useState(true)
+  const [initPackField, setInitPackField] = useState<OnboardingField>("name")
+
+  // Pack Doctor & Resource Scaffolding ([D] / [N] on initialized local packs)
+  const [doctorTab, setDoctorTab] = useState<PackDoctorTab>("doctor")
+  const [doctorPackDir, setDoctorPackDir] = useState<string>("")
+  const [doctorReport, setDoctorReport] = useState<PackDoctorReport | null>(null)
+  const [doctorScrollOffset, setDoctorScrollOffset] = useState(0)
+  const [doctorStatusMessage, setDoctorStatusMessage] = useState<string | null>(null)
+  const [scaffoldField, setScaffoldField] = useState<ScaffoldField>("id")
+  const [scaffoldKind, setScaffoldKind] = useState<ScaffoldResourceKind>("agent")
+  const [scaffoldId, setScaffoldId] = useState("")
+  const [scaffoldDesc, setScaffoldDesc] = useState("")
+  const [scaffoldMode, setScaffoldMode] = useState<"primary" | "subagent" | "all">("subagent")
 
   const [actionResultTitle, setRawActionResultTitle] = useState("")
   const [actionResultLines, setRawActionResultLines] = useState<string[]>([])
@@ -309,6 +479,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     setActionResultLines(warning
       ? [`⚠ AUTO-COMMIT: ${warning.message}`, `  ${warning.recovery}`, "", ...lines]
       : lines)
+    pushToast(warning ? `⚠ ${title} (auto-commit warning)` : `✓ ${title}`)
   }
   const [actionResultScrollOffset, setActionResultScrollOffset] = useState(0)
 
@@ -316,10 +487,22 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
 
   // Bridge State
   const [bridgePluginName, setBridgePluginName] = useState("")
-  const [bridgePipelinePrefix, setBridgePipelinePrefix] = useState("")
+  const [bridgeSelectedPack, setBridgeSelectedPack] = useState("")
+  const [bridgePackSuggested, setBridgePackSuggested] = useState("")
+  const [bridgePackQuery, setBridgePackQuery] = useState("")
   const [bridgeTarget, setBridgeTarget] = useState<"claude" | "codex">("claude")
   const [bridgeModelTarget, setBridgeModelTarget] = useState("")
-  const [bridgeFocusedField, setBridgeFocusedField] = useState<"name" | "prefix" | "model">("name")
+  const bridgeModelTargetDirtyRef = useRef(false)
+  const [bridgeConfirmReasons, setBridgeConfirmReasons] = useState<string[]>([])
+  const [bridgeFocusedField, setBridgeFocusedField] = useState<BridgeField>("name")
+  const [bridgeDraftTiers, setBridgeDraftTiers] = useState<Record<string, TranslationTier>>(() => cloneBridgeTiers(DEFAULT_TRANSLATION_CONFIG.tiers))
+  const [bridgeDraftRoles, setBridgeDraftRoles] = useState<Record<string, string>>(() => ({ ...DEFAULT_TRANSLATION_CONFIG.roles }))
+  const [bridgeTiersDirty, setBridgeTiersDirty] = useState(false)
+  const [bridgeTierIndex, setBridgeTierIndex] = useState(0)
+  const [bridgeTierScrollOffset, setBridgeTierScrollOffset] = useState(0)
+  const [bridgeAgentIndex, setBridgeAgentIndex] = useState(0)
+  const [bridgeAgentScrollOffset, setBridgeAgentScrollOffset] = useState(0)
+  const [bridgeClaudeTierTyping, setBridgeClaudeTierTyping] = useState(false)
   const loadTranslationFor = (ds: ActiveDataSource | null): TranslationConfig | null => {
     if (!ds) return null
     try {
@@ -334,6 +517,11 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     }
   }
   const [translationConfig, setTranslationConfig] = useState<TranslationConfig | null>(() => loadTranslationFor(activeDataSource))
+  useEffect(() => {
+    if (viewMode === "bridge-prompt" && !bridgeModelTargetDirtyRef.current) {
+      setBridgeModelTarget(initialBridgeModelCatchAll(translationConfig, bridgeTarget))
+    }
+  }, [bridgeTarget, translationConfig, viewMode])
 
   // Color Selector State
   const [focusedColorIndex, setFocusedColorIndex] = useState(0)
@@ -368,12 +556,12 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
 
   // Parameter Tuning State
   const [tuningSteps, setTuningSteps] = useState("50")
-  const [tuningTemp, setTuningTemp] = useState("0.2")
   const [tuningVariant, setTuningVariant] = useState("")
+  const [tuningVariantTyping, setTuningVariantTyping] = useState(false)
   const [tuningDirtyFields, setTuningDirtyFields] = useState<Set<TuningField>>(new Set())
-  const [tuningMode, setTuningMode] = useState<"subagent" | "primary">("subagent")
+  const [tuningMode, setTuningMode] = useState<AgentTuningMode>("subagent")
   const [tuningHidden, setTuningHidden] = useState(false)
-  const [tuningFocusedField, setTuningFocusedField] = useState<"steps" | "temp" | "variant" | "mode" | "hidden">("steps")
+  const [tuningFocusedField, setTuningFocusedField] = useState<TuningField>("steps")
   const [tuningTargetPaths, setTuningTargetPaths] = useState<string[]>([])
   const markTuningDirty = (field: TuningField) => setTuningDirtyFields(prev => {
     if (prev.has(field)) return prev
@@ -383,27 +571,76 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   })
 
   // Inspector Tab State
-  const [inspectorTab, setInspectorTab] = useState<"overview" | "naming" | "security" | "delegations" | "resources">("overview")
+  const INSPECTOR_TABS = ["overview", "prompt", "naming", "security", "delegations", "resources"] as const
+  const [inspectorTab, setInspectorTab] = useState<"overview" | "prompt" | "naming" | "security" | "delegations" | "resources">("overview")
+  const [overviewScrollOffset, setOverviewScrollOffset] = useState(0)
+  const [promptScrollOffset, setPromptScrollOffset] = useState(0)
   const [graphScrollOffset, setGraphScrollOffset] = useState(0)
+  const [catalogDelFocus, setCatalogDelFocus] = useState(0)
   const [resourceScrollIndex, setResourceScrollIndex] = useState(0)
 
   const allAgentFilenames = useMemo(() => agents.map(a => a.filename), [agents])
-  const bridgePrefixSuggestions = useMemo(() => [
-    { prefix: "", count: agents.length },
-    ...getCategoryPrefixes(allAgentFilenames)
-  ], [allAgentFilenames, agents.length])
-  const filteredBridgePrefixSuggestions = useMemo(() => {
-    const query = bridgePipelinePrefix.toLowerCase()
-    return bridgePrefixSuggestions.filter(({ prefix }) => !query || prefix.toLowerCase().includes(query))
-  }, [bridgePipelinePrefix, bridgePrefixSuggestions])
-   const [bridgeSuggestionIndex, setBridgeSuggestionIndex] = useState(0)
-   const [bridgeSuggestionScrollOffset, setBridgeSuggestionScrollOffset] = useState(0)
-  useEffect(() => {
-    setBridgeSuggestionIndex(index => Math.min(index, Math.max(0, filteredBridgePrefixSuggestions.length - 1)))
-    setBridgeSuggestionScrollOffset(offset => Math.min(offset, Math.max(0, filteredBridgePrefixSuggestions.length - 5)))
-  }, [filteredBridgePrefixSuggestions.length])
+  const bridgeablePacks = useMemo(
+    () => workspaceRoot ? collectBridgeablePacks(agents, pack => Boolean(packDir(workspaceRoot, pack))) : [],
+    [agents, workspaceRoot],
+  )
+  const filteredBridgePacks = useMemo(
+    () => filterBridgePacks(bridgeablePacks, bridgePackQuery),
+    [bridgeablePacks, bridgePackQuery],
+  )
+  const [bridgePackIndex, setBridgePackIndex] = useState(0)
+  const [bridgePackScrollOffset, setBridgePackScrollOffset] = useState(0)
+
+  const refreshTargetStatus = () => {
+    try {
+      const target = realpathThroughExistingAncestor(path.resolve(defaultTarget()))
+      const registry = loadSources()
+      setTargetStatusInfo(targetStatus(target, registry))
+    } catch {
+      setTargetStatusInfo(null)
+    }
+  }
+
+  const runTargetReconcile = () => {
+    setIsAsyncBusy(true)
+    void (async () => {
+      try {
+        const target = realpathThroughExistingAncestor(path.resolve(defaultTarget()))
+        const registry = loadSources()
+        const result = await changeTarget(target, "reconcile", registry, reconcileChange)
+        refreshTargetStatus()
+        const summary = describeChangeResult(target, result)
+        pushToast(result.status === "failed" ? `✗ ${summary[0] || "Reconcile failed"}` : `✓ ${summary[0] || "Target reconciled"}`)
+        if (result.status === "failed") {
+          setActionResultTitle("Reconcile Failed")
+          setActionResultLines(summary)
+          setViewMode("action-result")
+        }
+      } catch (error: any) {
+        pushToast(`✗ Reconcile failed: ${terminalSafeText(error?.message || error)}`)
+      } finally {
+        setIsAsyncBusy(false)
+        renderer.requestRender()
+      }
+    })()
+  }
+
+  const toggleReducedMotion = () => {
+    const next = !reducedMotionState
+    setReducedMotionState(next)
+    if (!configReadOnly) {
+      try {
+        const rev = saveUiConfig(engineConfigDir(), appliedShare, uiConfigRevisionState, { reducedMotion: next })
+        setUiConfigRevision(rev)
+      } catch {
+        // Session toggle still takes effect even if persisting is temporarily locked.
+      }
+    }
+    pushToast(next ? "Animations set to Reduced Motion" : "✓ Smooth 60fps animations enabled")
+  }
 
   const refreshSourcesView = (preserveStatus = false) => {
+    refreshTargetStatus()
     try {
       const registry = loadSources()
       setRegisteredSources(registry.sources)
@@ -444,15 +681,18 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         setActionResultLines([`An error occurred:`, `  ${(e as any)?.message || e}`])
         setViewMode("action-result")
       }
+      refreshSourcesView(true)
     } else {
       refreshSourcesView(Boolean(startupNotice))
     }
-    try {
-       const catalog = loadModelCatalog(true)
-       setModelCatalog(catalog)
-       setModels(catalog.status === "verified" ? catalog.models : [])
-    } catch (e) {
-      // Ignore
+    if (!initialModelCatalog) {
+      try {
+        const catalog = loadModelCatalog(true)
+        setModelCatalog(catalog)
+        setModels(catalog.status === "verified" ? catalog.models : [])
+      } catch (e) {
+        // Ignore
+      }
     }
     renderer.requestRender()
   }, [])
@@ -461,16 +701,18 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
 
   // Terminal dimensions are also the source of truth for the main screen budget.
   const { width: termWidth = 80, height: termHeight = 24 } = useTerminalDimensions() || {}
-  const statusMessages = [
-    uiConfigWarning ? `⚠ ${terminalSafeText(uiConfigWarning)}` : "",
-    modelCatalog.status === "unavailable" ? "⚠ Model catalog unavailable — press M, then Y to retry." : "",
-    modelCatalog.status === "verified" && invalidModelGroups.length > 0 ? `⚠ ${invalidModelGroups.length} invalid model group(s) — [V] Repair; [M] Choose a model.` : "",
-    layoutStatus
-  ].filter(Boolean)
-  const statusMessage = statusMessages.join(" | ")
-  const layout = calculateLayout(termWidth, termHeight, statusMessages.length > 0)
+  useEffect(() => {
+    if (layoutStatus) pushToast(layoutStatus)
+  }, [layoutStatus])
+  // Floating toasts avoid vertical layout shifts, so main screen keeps full height budget.
+  const layout = calculateLayout(termWidth, termHeight, false)
+  const effectivePane: "list" | "inspector" = layout.showInspector ? activePane : "list"
+  const animatedShare = useAnimatedNumber(appliedShare, { duration: 150, ease: "outExpo", reducedMotion: reducedMotionState })
+  const focusPaneBlend = useAnimatedNumber(effectivePane === "inspector" ? 1 : 0, { duration: 140, ease: "outQuad", reducedMotion: reducedMotionState })
+  const mutationFlash = useFlashDecay(flashTick, reducedMotionState)
+  const pulse = usePulseLoop(isAsyncBusy || (workspaceTab === "sources" && ghAuth === null), reducedMotionState)
   // Keep the table's integer cell widths independent from percentage rounding.
-  const panelWidths = calculatePanelWidths(termWidth, layout.mode, appliedShare)
+  const panelWidths = calculatePanelWidths(termWidth, layout.mode, animatedShare)
   const listPanelWidth = panelWidths.list
   const listContentWidth = Math.max(0, listPanelWidth - 4)
   const footerFirstWidth = Math.floor(listContentWidth / 2)
@@ -478,7 +720,6 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   const listColumns = calculateListColumnBudget(listContentWidth, "compact")
   const columnWidth = (index: number) => listColumns.widths[index] || 0
   const gutter = (key: string) => <text key={key} width={listColumns.gutters[0] || 0}> </text>
-  const headerTitle = "★ OPENCODE AGENT MANAGER"
   const formatDisplayPath = (p: string) =>
     p === os.homedir() || p.startsWith(`${os.homedir()}${path.sep}`) ? `~${p.slice(os.homedir().length)}` : p
   const fullCommitLabel = isReadOnlyGitSource ? "Mode: OVERRIDES" : `Commit: ${autoCommitEnabled() ? "ON" : "OFF"}`
@@ -490,26 +731,144 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       : activeDataSource.source.kind === "git"
         ? `GitHub: ${activeDataSource.source.url.replace(/^https?:\/\/github\.com\//i, "").replace(/\.git$/i, "")}${activeDataSource.source.ref ? `#${activeDataSource.source.ref}` : ""}${activeRevision ? `@${activeRevision.slice(0, 7)}` : ""}`
         : `Source: ${activeDataSource.source.name} (${formatDisplayPath(activeDataSource.source.path)})`
-  const headerSeparator = " | "
-  const statusMessageWidth = Math.max(1, termWidth - 2)
-  const headerContentWidth = Math.max(0, termWidth - 2 - 2 - 4)
-  const headerTitleWidth = Math.max(1, Math.min(displayWidth(headerTitle), headerContentWidth - (termWidth >= 40 ? displayWidth(compactCommitLabel) + 1 : 0)))
-  const headerMetaWidth = Math.max(0, headerContentWidth - headerTitleWidth - 1)
-  const commitLabel = headerMetaWidth >= displayWidth(fullCommitLabel) ? fullCommitLabel : compactCommitLabel
-  const commitWidth = displayWidth(commitLabel)
-  const separatorWidth = displayWidth(headerSeparator)
-  const showCommit = termWidth >= 40 && headerMetaWidth >= commitWidth
-  const workspaceWidth = showCommit ? Math.max(0, headerMetaWidth - commitWidth - separatorWidth) : 0
-  const visibleWorkspaceWidth = Math.min(workspaceWidth, displayWidth(workspaceLabel))
-  const visibleMetaWidth = showCommit ? commitWidth + (visibleWorkspaceWidth > 0 ? separatorWidth + visibleWorkspaceWidth : 0) : 0
-  const headerGroupWidth = Math.min(headerContentWidth, headerTitleWidth + 1 + visibleMetaWidth)
-  const maxVisibleItems = layout.listRows
-  const maxVisibleModels = Math.max(0, Math.floor(termHeight * 0.7) - 10)
-  const maxVisibleTiers = Math.max(0, Math.floor(termHeight * 0.9) - 9)
-  const maxVisibleColors = Math.max(0, Math.floor(termHeight * 0.7) - 9)
-  const maxVisibleActionResultLines = Math.max(0, Math.floor(termHeight * 0.7) - 8)
-  const modelModalInnerWidth = Math.max(1, Math.floor(termWidth * 0.7) - 6)
-  const repairConfirmContentWidth = Math.max(1, Math.floor(termWidth * 0.76) - 6)
+  const commitLabel = termWidth >= 124 ? fullCommitLabel : compactCommitLabel
+  const wsViewports = calculateWorkspaceViewports(termHeight, { hasSourcesStatus: Boolean(sourcesStatus) })
+  const maxVisibleItems = wsViewports.catalogRows
+  const isRepairSuggestionsVisible = viewMode === "repair-selector" && Boolean(invalidModelGroups[Number(repairGroupKey)])
+  const modelViewport = calculateModalViewport("model-selector", termWidth, termHeight, isRepairSuggestionsVisible ? 2 : 0)
+  const delegationViewport = calculateModalViewport("delegation-manager", termWidth, termHeight)
+  const resourceViewport = calculateModalViewport("resource-manager", termWidth, termHeight)
+  const tierViewport = calculateModalViewport("tier-selector", termWidth, termHeight)
+  const colorViewport = calculateModalViewport("color-selector", termWidth, termHeight)
+  const actionResultViewport = calculateModalViewport("action-result", termWidth, termHeight)
+  const paletteViewport = calculateModalViewport("command-palette", termWidth, termHeight)
+  const selfUpdateViewport = calculateModalViewport("self-update", termWidth, termHeight)
+  const maxVisibleModels = modelViewport.viewportRows
+  const maxVisibleDelegations = delegationViewport.viewportRows
+  const maxVisibleTiers = tierViewport.viewportRows
+  const maxVisibleColors = colorViewport.viewportRows
+  const maxVisibleActionResultLines = actionResultViewport.viewportRows
+  const modelModalInnerWidth = modelViewport.innerWidth
+  const bridgeTierNames = useMemo(() => Object.keys(bridgeDraftTiers), [bridgeDraftTiers])
+  const bridgeModalLayout = calculateBridgeModalLayout(termWidth, termHeight, {
+    packExpanded: bridgeFocusedField === "pack",
+    tierCount: bridgeTierNames.length,
+  })
+  const bridgePackViewportRows = bridgeModalLayout.packViewportRows
+  const bridgePreview = useMemo(
+    () => (viewMode === "bridge-prompt" || viewMode === "bridge-confirm")
+      ? buildPackBridgePreview(agents, translationConfig, {
+          target: bridgeTarget,
+          pack: bridgeSelectedPack,
+          tiers: bridgeDraftTiers,
+          roles: bridgeDraftRoles,
+          modelCatchAll: bridgeModelTarget,
+        })
+      : { items: [], tierCounts: {} },
+    [viewMode, agents, translationConfig, bridgeTarget, bridgeSelectedPack, bridgeDraftTiers, bridgeDraftRoles, bridgeModelTarget],
+  )
+
+  useEffect(() => {
+    if (filteredBridgePacks.length === 0) {
+      setBridgePackIndex(0)
+      setBridgePackScrollOffset(0)
+      return
+    }
+    setBridgePackIndex(index => {
+      const clamped = Math.max(0, Math.min(filteredBridgePacks.length - 1, index))
+      setBridgePackScrollOffset(offset => clampListScroll(clamped, filteredBridgePacks.length, offset, bridgePackViewportRows))
+      return clamped
+    })
+  }, [filteredBridgePacks.length, bridgePackViewportRows])
+
+  useEffect(() => {
+    if (bridgeTierNames.length === 0) {
+      setBridgeTierIndex(0)
+      setBridgeTierScrollOffset(0)
+      return
+    }
+    setBridgeTierIndex(index => {
+      const clamped = Math.max(0, Math.min(bridgeTierNames.length - 1, index))
+      setBridgeTierScrollOffset(offset => clampListScroll(clamped, bridgeTierNames.length, offset, bridgeModalLayout.tierViewportRows))
+      return clamped
+    })
+  }, [bridgeTierNames.length, bridgeModalLayout.tierViewportRows])
+
+  useEffect(() => {
+    if (bridgePreview.items.length === 0) {
+      setBridgeAgentIndex(0)
+      setBridgeAgentScrollOffset(0)
+      return
+    }
+    setBridgeAgentIndex(index => {
+      const clamped = Math.max(0, Math.min(bridgePreview.items.length - 1, index))
+      setBridgeAgentScrollOffset(offset => clampListScroll(clamped, bridgePreview.items.length, offset, bridgeModalLayout.agentViewportRows))
+      return clamped
+    })
+  }, [bridgePreview.items.length, bridgeModalLayout.agentViewportRows])
+
+  const runSelfUpdateCheck = () => {
+    setSelfUpdateBusy(true)
+    setSelfUpdateStatus("Checking latest GitHub release...")
+    void (async () => {
+      try {
+        setEngineVersionInfo(resolveEngineVersion())
+        const res = await checkForEngineUpdate(undefined, {
+          onProgress: msg => {
+            setSelfUpdateStatus(msg)
+            renderer.requestRender()
+          },
+        })
+        setSelfUpdateCheck(res)
+        setSelfUpdateStatus("")
+      } catch (err: any) {
+        setSelfUpdateCheck(null)
+        setSelfUpdateStatus(`Error: ${terminalSafeText(err?.message || err)}`)
+      } finally {
+        setSelfUpdateBusy(false)
+        renderer.requestRender()
+      }
+    })()
+  }
+
+  const openSelfUpdateModal = () => {
+    setViewMode("self-update")
+    runSelfUpdateCheck()
+  }
+
+  const runSelfUpdateApply = (force = false) => {
+    if (selfUpdateBusy) return
+    setSelfUpdateBusy(true)
+    setSelfUpdateStatus("Downloading and applying engine update...")
+    void (async () => {
+      try {
+        const res = await applyEngineUpdate(undefined, {
+          force,
+          checkResult: selfUpdateCheck ?? undefined,
+          onProgress: msg => {
+            setSelfUpdateStatus(msg)
+            renderer.requestRender()
+          },
+        })
+        setEngineVersionInfo(res.versionInfo)
+        refreshTargetStatus()
+        setSelfUpdateBusy(false)
+        setActionResultTitle("Engine Updated Successfully")
+        setActionResultLines([
+          `manage-agents updated: ${res.checkResult.currentVersion.displayVersion} -> ${res.versionInfo.displayVersion}`,
+          ...(res.dependenciesInstalled ? ["Dependencies synchronized."] : []),
+          ...(res.reconcileResult ? [`OpenCode target reconciled (${res.reconcileResult.status}).`] : []),
+          "",
+          "Restart manage-agents to load the newly installed bundle in this session.",
+        ])
+        setViewMode("action-result")
+      } catch (err: any) {
+        setSelfUpdateBusy(false)
+        setSelfUpdateStatus(`Error: ${terminalSafeText(err?.message || err)}`)
+        renderer.requestRender()
+      }
+    })()
+  }
 
   const refreshModelCatalog = () => {
     const catalog = loadModelCatalog(undefined, true)
@@ -523,18 +882,19 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
 
   useEffect(() => {
     setGraphScrollOffset(0)
+    setCatalogDelFocus(0)
+    setOverviewScrollOffset(0)
   }, [focusedIndex])
 
   useEffect(() => {
-    setResourceScrollIndex(0)
-  }, [focusedIndex, inspectorTab])
+    setFlowsInspectorFocus(0)
+  }, [flowsFocusIndex])
 
   useEffect(() => {
-    if (viewMode === "bridge-prompt") {
-      setBridgeSuggestionIndex(0)
-      setBridgeSuggestionScrollOffset(0)
-    }
-  }, [viewMode])
+    setResourceScrollIndex(0)
+    setPromptScrollOffset(0)
+    setOverviewScrollOffset(0)
+  }, [focusedIndex, inspectorTab])
 
   useEffect(() => {
     const maxOffset = Math.max(0, actionResultLines.length - maxVisibleActionResultLines)
@@ -559,7 +919,29 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     setSourcesFocusIndex(0)
     setSourcesScrollOffset(0)
     if (!preserveStatus) setSourcesStatus("")
-    setViewMode("sources")
+    setWorkspaceTab("sources")
+    setViewMode("main")
+  }
+
+  const prepareOnboardingWizard = (targetRoot: string, gitSource: Source | null) => {
+    const fallbackRaw = gitSource ? gitSource.name : path.basename(path.resolve(targetRoot))
+    const slug = derivePackSlug(fallbackRaw)
+    let inspection: OnboardingInspection | null = null
+    try {
+      inspection = inspectOnboardingCandidate(targetRoot, { name: slug })
+    } catch {
+      inspection = null
+    }
+    setInitInspection(inspection)
+    setInitCloneDest(gitSource ? suggestCloneDestination(gitSource) : "")
+    setInitPackName(inspection?.suggestedName || slug)
+    setInitPackVersion("0.1.0")
+    setInitPackDesc(`Agent pack ${inspection?.suggestedName || slug}`)
+    setInitPackLayout(inspection?.recommendedLayout ?? "root")
+    setInitPackOrganize(true)
+    setInitPackKit(true)
+    setInitPackField(gitSource ? "cloneDest" : "name")
+    setViewMode("pack-init")
   }
 
   const switchToDataSource = (next: ActiveDataSource) => {
@@ -576,10 +958,21 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     setExpandedCategories(new Set())
     setFocusedIndex(0)
     setScrollOffset(0)
+    setFlowsFocusIndex(0)
+    setFlowsScrollOffset(0)
     setSearchQuery("")
     setIsSearching(false)
     setLayoutStatus("")
-    setViewMode("main")
+    setWorkspaceTab("catalog")
+    refreshTargetStatus()
+    const isNextVirtual = Boolean(next.root && isVirtualPackRoot(next.root))
+    if (isNextVirtual && !promptedVirtualRootsRef.current.has(next.root)) {
+      promptedVirtualRootsRef.current.add(next.root)
+      prepareOnboardingWizard(next.root, next.kind === "source" && next.source.kind === "git" ? next.source : null)
+    } else {
+      setViewMode("main")
+    }
+    pushToast(`✓ Activated ${next.kind === "source" ? next.source.name : path.basename(next.root)} (${loadedAgents.length} agents)`)
   }
 
   const activateRegisteredSource = (source: Source) => {
@@ -648,21 +1041,39 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       const tx = mutate(paths, "tune", () => fn(undefined))
       try { refreshData() } catch (error) { setMutationRefreshFailure(error, tx.warning); setViewMode("action-result"); return }
       setSelectedAgentPaths(new Set())
+      triggerRowFlash(paths)
+      refreshTargetStatus()
       setMutationSuccess(title, lines, tx.warning)
       setViewMode("action-result")
       return
     }
+    setIsAsyncBusy(true)
     void (async () => {
+      let overrideSaved = false
       try {
         runWithOverrideWriter(workspaceRoot, writer => fn(writer))
+        overrideSaved = true
         refreshData()
         setSelectedAgentPaths(new Set())
+        triggerRowFlash(paths)
         const outcome = await reconcileTargetIfInstalled("override")
+        refreshTargetStatus()
         setActionResultTitle(title)
         setActionResultLines([...lines, "", ...formatReconcileLines(outcome)])
+        pushToast(`✓ ${title}`)
       } catch (error: any) {
-        setActionResultTitle(`Error: ${title}`)
-        setActionResultLines([`An error occurred:`, `  ${error?.message || error}`])
+        try { refreshData() } catch {}
+        if (overrideSaved) {
+          setActionResultTitle(`${title} (Reconcile Failed)`)
+          setActionResultLines([...lines, "", `⚠ Saved in overrides.json, but target reconcile failed:`, `  ${error?.message || error}`])
+          pushToast(`⚠ Saved override; reconcile failed`)
+        } else {
+          setActionResultTitle(`Error: ${title}`)
+          setActionResultLines([`An error occurred:`, `  ${error?.message || error}`])
+          pushToast(`✗ ${title} failed`)
+        }
+      } finally {
+        setIsAsyncBusy(false)
       }
       setViewMode("action-result")
     })()
@@ -720,11 +1131,13 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       setLayoutStatus(`${pack} is not a pack of this workspace.`)
       return
     }
-    const target = defaultTarget()
+    const reqId = ++installPreviewReqIdRef.current
+    const target = realpathThroughExistingAncestor(path.resolve(defaultTarget()))
     void (async () => {
       try {
         const { registry, added, request, sourceName } = installRequest(pack)
         const result = await changeTarget(target, "install", registry, installChange(registry, [request]), { dryRun: true })
+        if (installPreviewReqIdRef.current !== reqId) return
         setInstallPreview({
           pack, target,
           lines: [...(added ? [`This workspace will be registered as source "${sourceName}".`, ""] : []), ...describeChangeResult(target, result)],
@@ -734,6 +1147,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         })
         setViewMode("install-confirm")
       } catch (error: any) {
+        if (installPreviewReqIdRef.current !== reqId) return
         setActionResultTitle("Install Preview Failed")
         setActionResultLines([`An error occurred:`, `  ${terminalSafeText(error?.message || error)}`])
         setViewMode("action-result")
@@ -745,13 +1159,16 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     const fail = (error: any) => {
       setActionResultTitle("Install Failed")
       setActionResultLines([`An error occurred:`, `  ${terminalSafeText(error?.message || error)}`])
+      pushToast(`✗ Install failed for ${preview.pack}`)
     }
+    setIsAsyncBusy(true)
     void (async () => {
       let prepared: ReturnType<typeof installRequest>
       try {
         prepared = installRequest(preview.pack)
       } catch (error) {
         fail(error)
+        setIsAsyncBusy(false)
         setViewMode("action-result")
         return
       }
@@ -769,8 +1186,11 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
             : { ...change, problems: ["the packs changed since the preview; press e again to review the new version"] }
         }, { confirm: async reasons => isDeepStrictEqual([...reasons].sort(), [...preview.confirmations].sort()) })
         succeeded = result.status === "applied" || result.status === "unchanged"
+        refreshTargetStatus()
+        refreshSourcesView(true)
         setActionResultTitle(succeeded ? "Install Complete" : "Install Failed")
         setActionResultLines(describeChangeResult(preview.target, result))
+        pushToast(succeeded ? `✓ Installed pack ${preview.pack}` : `✗ Install failed for ${preview.pack}`)
       } catch (error) {
         fail(error)
       }
@@ -785,6 +1205,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
           // The source registration only made the failed install possible; leaving it is harmless.
         }
       }
+      setIsAsyncBusy(false)
       setViewMode("action-result")
     })()
   }
@@ -807,46 +1228,158 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     return new Map(agents.map(agent => [agent.currentPath, resolveModelTarget(agent, inferenceIndex, translationConfig, "claude")]))
   }, [agents, inferenceIndex, translationConfig])
 
-  const generateBridge = () => {
-    if (!bridgePluginName || !activeDataSource) return
-    try {
-      const bridgeConfig = loadTranslationFor(activeDataSource) ?? loadTranslationConfig(workspaceRoot, undefined, { persistMigration: false })
-      const modelTarget = bridgeModelTarget.trim()
-      const modelMap = bridgeConfig[bridgeTarget].modelMap
-      if (modelTarget) {
-        // Claude aliases need validation; Codex model ids are validated as non-empty strings on save.
-        if (bridgeTarget === "claude") validateClaudeModelName(modelTarget)
-        const nextModelMap = { ...modelMap, "*": modelTarget }
-        if (bridgeTarget === "codex") bridgeConfig.codex.modelMap = nextModelMap
-        else bridgeConfig.claude.modelMap = nextModelMap
-      } else if (modelMap) {
-        delete modelMap["*"]
+  const updateBridgeTierModel = (tierName: string, model: string) => {
+    setBridgeDraftTiers(prev => {
+      const existing = prev[tierName]
+      if (!existing) return prev
+      return {
+        ...prev,
+        [tierName]: {
+          ...existing,
+          [bridgeTarget]: {
+            ...existing[bridgeTarget],
+            model,
+          },
+        },
       }
-      const pack = activeItems[focusedIndex]?.category || ""
-      if (!packDir(workspaceRoot, pack)) {
-        setActionResultTitle("No Pack to Bridge")
-        setActionResultLines(["Focus an agent or a pack folder: the bridge translates a whole pack."])
-        setViewMode("action-result")
+    })
+    setBridgeTiersDirty(true)
+  }
+
+  const updateBridgeTierEffort = (tierName: string, effort: string) => {
+    setBridgeDraftTiers(prev => {
+      const existing = prev[tierName]
+      if (!existing) return prev
+      return {
+        ...prev,
+        [tierName]: {
+          ...existing,
+          codex: {
+            ...existing.codex,
+            reasoningEffort: effort,
+          },
+        },
+      }
+    })
+    setBridgeTiersDirty(true)
+  }
+
+  const cycleBridgeAgentTierAt = (index: number, delta: 1 | -1) => {
+    const item = bridgePreview.items[index]
+    if (!item || bridgeTierNames.length === 0) return
+    const next = cycleAgentRoleTier(bridgeDraftRoles, item.role, bridgeTierNames, item.tier, delta)
+    setBridgeDraftRoles(next.roles)
+    setBridgeTiersDirty(true)
+  }
+
+  const saveBridgeTiersOnly = () => {
+    if (!activeDataSource) return
+    try {
+      validateDraftBridgeTiers(bridgeDraftTiers, bridgeTarget)
+      const baseCfg = loadTranslationFor(activeDataSource) ?? loadTranslationConfig(workspaceRoot, undefined, { persistMigration: false })
+      const nextConfig = applyBridgeDraftToConfig(baseCfg, {
+        target: bridgeTarget,
+        tiers: bridgeDraftTiers,
+        roles: bridgeDraftRoles,
+      })
+      let txWarning: TransactionWarning | undefined
+      if (activeDataSource.kind === "source" && activeDataSource.source.kind === "git") {
+        const loc = sourceTranslationConfigLocation(activeDataSource.source.name, workspaceRoot)
+        saveTranslationConfig(loc.configRoot, nextConfig, loc.configPath)
+      } else {
+        const tx = mutate([translationConfigPath(workspaceRoot)], "config", () => saveTranslationConfig(workspaceRoot, nextConfig))
+        txWarning = tx.warning
+      }
+      const reloaded = loadTranslationFor(activeDataSource)
+      setTranslationConfig(reloaded)
+      if (reloaded) {
+        setBridgeDraftTiers(cloneBridgeTiers(reloaded.tiers))
+        setBridgeDraftRoles({ ...reloaded.roles })
+      }
+      setBridgeTiersDirty(false)
+      setBridgeClaudeTierTyping(false)
+      pushToast(txWarning ? "⚠ Tiers saved (auto-commit warning)" : "✓ Saved bridge tier configuration")
+    } catch (error: any) {
+      pushToast(`✗ ${terminalSafeText(error?.message || error)}`)
+    }
+  }
+
+  const generateBridge = (confirmedUntrusted = false) => {
+    if (!activeDataSource) return
+    const trimmedName = bridgePluginName.trim()
+    if (!trimmedName) {
+      setBridgeFocusedField("name")
+      pushToast("⚠ Insert a plugin name first")
+      return
+    }
+    const pack = bridgeSelectedPack.trim()
+    if (!pack || !packDir(workspaceRoot, pack)) {
+      setBridgeFocusedField("pack")
+      pushToast("⚠ Select a valid pack to bridge")
+      return
+    }
+    try {
+      validateDraftBridgeTiers(bridgeDraftTiers, bridgeTarget)
+    } catch (error: any) {
+      setBridgeFocusedField("tiers")
+      pushToast(`✗ ${terminalSafeText(error?.message || error)}`)
+      return
+    }
+    const modelTarget = bridgeModelTarget.trim()
+    if (modelTarget && bridgeTarget === "claude") {
+      try {
+        validateClaudeModelName(modelTarget)
+      } catch (error: any) {
+        setBridgeFocusedField("model")
+        pushToast(`✗ ${terminalSafeText(error?.message || error)}`)
         return
       }
-      const safePluginName = sanitizeFilename(bridgePluginName)
-      const config = { ...bridgeConfig, pluginName: bridgePluginName, prefix: bridgePipelinePrefix }
+    }
+    try {
+      const trusted = activeDataSource.kind === "source"
+        ? activeDataSource.source.trusted
+        : resolveBridgeWorkspaceTrust(workspaceRoot).trusted
+      const reasons = bridgeConfirmationsNeeded(
+        workspaceRoot,
+        pack,
+        trusted,
+        activeDataSource.kind === "source" ? activeDataSource.source.name : undefined,
+      )
+      if (reasons.length > 0 && !confirmedUntrusted) {
+        setBridgeConfirmReasons(reasons)
+        setViewMode("bridge-confirm")
+        return
+      }
+      setBridgeConfirmReasons([])
+      const bridgeConfig = loadTranslationFor(activeDataSource) ?? loadTranslationConfig(workspaceRoot, undefined, { persistMigration: false })
+      const safePluginName = sanitizeFilename(trimmedName)
+      const prefix = deriveBridgePrefix(pack)
+      const config = applyBridgeDraftToConfig(bridgeConfig, {
+        target: bridgeTarget,
+        tiers: bridgeDraftTiers,
+        roles: bridgeDraftRoles,
+        pack,
+        pluginName: trimmedName,
+        modelCatchAll: bridgeModelTarget,
+      })
       let result: ReturnType<typeof bridgePack>
       let txWarning: TransactionWarning | undefined
       if (activeDataSource.kind === "source" && activeDataSource.source.kind === "git") {
         const loc = sourceTranslationConfigLocation(activeDataSource.source.name, workspaceRoot)
         const outputDir = sourceBridgeOutputDir(activeDataSource.source.name, bridgeTarget, safePluginName)
         saveTranslationConfig(loc.configRoot, config, loc.configPath)
-        result = bridgePack({ workspaceRoot, pack, target: bridgeTarget, outputDir, config, pluginName: bridgePluginName, prefix: bridgePipelinePrefix })
+        result = bridgePack({ workspaceRoot, pack, target: bridgeTarget, outputDir, config, pluginName: trimmedName, prefix, trusted, allowUntrustedExecutable: true })
       } else {
         const outputDir = path.join(workspaceRoot, "bridges", bridgeTarget === "codex" ? "codex" : "claude-code", safePluginName)
         const tx = mutate([translationConfigPath(workspaceRoot), outputDir], "bridge", () => {
           saveTranslationConfig(workspaceRoot, config)
-          return bridgePack({ workspaceRoot, pack, target: bridgeTarget, outputDir, config, pluginName: bridgePluginName, prefix: bridgePipelinePrefix })
+          return bridgePack({ workspaceRoot, pack, target: bridgeTarget, outputDir, config, pluginName: trimmedName, prefix, trusted, allowUntrustedExecutable: true })
         })
         result = tx.value
         txWarning = tx.warning
       }
+      setBridgeTiersDirty(false)
+      setBridgeClaudeTierTyping(false)
       setTranslationConfig(loadTranslationFor(activeDataSource))
        setSelectedAgentPaths(new Set())
       setActionResultTitle(`Bridge to ${bridgeTarget === "codex" ? "Codex" : "Claude Code"} Complete`)
@@ -940,11 +1473,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     // Get unique categories dynamically from the parsed agents
     const categoriesSet = new Set<string>()
     agents.forEach((a) => categoriesSet.add(a.category))
-    const categoriesList = Array.from(categoriesSet).sort((a, b) => {
-      if (a === "general") return 1
-      if (b === "general") return -1
-      return a.localeCompare(b)
-    })
+    const categoriesList = Array.from(categoriesSet).sort(comparePackCategories)
     categoriesList.forEach((cat) => {
       const catAgents = filtered.filter((a) => a.category === cat)
       if (catAgents.length === 0) return
@@ -983,9 +1512,19 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
 
   // Clamp focusedIndex and scrollOffset when list size changes
   useEffect(() => {
+    if (pendingJumpIndexRef.current !== null && searchQuery === "") return
     setFocusedIndex(0)
     setScrollOffset(0)
   }, [searchQuery])
+
+  useEffect(() => {
+    const pendingIndex = pendingJumpIndexRef.current
+    if (pendingIndex === null || workspaceTab !== "catalog" || viewMode !== "main") return
+    const index = Math.max(0, Math.min(Math.max(0, activeItems.length - 1), pendingIndex))
+    setFocusedIndex(index)
+    setScrollOffset(offset => clampListScroll(index, activeItems.length, offset, maxVisibleItems))
+    pendingJumpIndexRef.current = null
+  }, [activeItems.length, expandedCategories, maxVisibleItems, searchQuery, viewMode, workspaceTab])
 
   useEffect(() => {
     if (focusedIndex < 0 || focusedIndex >= activeItems.length) {
@@ -1043,7 +1582,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     }
     if (viewMode === "model-selector" && routingPick?.kind === "trigger") {
       if (matches("* any model provider wildcard")) {
-        const mark = pendingTriggers.has(WILDCARD_TRIGGER) ? "[x]" : "[ ]"
+        const mark = pendingTriggers.has(WILDCARD_TRIGGER) ? "[X]" : "[ ]"
         items.push({ type: "model", id: WILDCARD_TRIGGER, label: `${mark} ★ * (any model / provider)`, provider: "wildcard" })
       }
     }
@@ -1062,12 +1601,12 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       if (isExpanded) {
         // A configuration can trigger on one or more providers/models in OR; exact model wins over provider, then *.
         if (viewMode === "model-selector" && routingPick?.kind === "trigger") {
-          const mark = pendingTriggers.has(prov) ? "[x]" : "[ ]"
+          const mark = pendingTriggers.has(prov) ? "[X]" : "[ ]"
           items.push({ type: "model", id: prov, label: `  ${mark} ★ any ${prov} model`, provider: prov })
         }
         providers[prov].forEach(model => {
           const prefix = viewMode === "model-selector" && routingPick?.kind === "trigger"
-            ? `${pendingTriggers.has(model) ? "[x]" : "[ ]"} `
+            ? `${pendingTriggers.has(model) ? "[X]" : "[ ]"} `
             : ""
           items.push({
             type: "model",
@@ -1084,9 +1623,9 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     if (viewMode !== "model-selector" && viewMode !== "repair-selector") setModelFilter("")
   }, [viewMode])
 
-  const sourceModalRows = useMemo<SourceModalRow[]>(() => {
+  const sourceModalRows = useMemo<SourceWorkspaceRow[]>(() => {
     const query = sourcesQuery.trim().toLowerCase()
-    const rows: SourceModalRow[] = []
+    const rows: SourceWorkspaceRow[] = []
     const registeredGitUrls = new Set(
       registeredSources
         .filter((s): s is Source & { kind: "git" } => s.kind === "git")
@@ -1114,13 +1653,11 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     return rows
   }, [registeredSources, sourceRevisions, ghRepos, sourcesQuery, activeDataSource, activeSourceName])
 
-  const maxVisibleSourceRows = Math.max(2, Math.floor(termHeight * 0.78) - 11)
+  const maxVisibleSourceRows = wsViewports.sourcesRows
   useEffect(() => {
-    if (sourcesFocusIndex >= sourceModalRows.length) {
-      const next = Math.max(0, sourceModalRows.length - 1)
-      setSourcesFocusIndex(next)
-      setSourcesScrollOffset(offset => Math.min(offset, Math.max(0, sourceModalRows.length - maxVisibleSourceRows)))
-    }
+    const clampedFocus = sourceModalRows.length ? Math.min(sourcesFocusIndex, sourceModalRows.length - 1) : 0
+    if (clampedFocus !== sourcesFocusIndex) setSourcesFocusIndex(clampedFocus)
+    setSourcesScrollOffset(offset => clampListScroll(clampedFocus, sourceModalRows.length, offset, maxVisibleSourceRows))
   }, [sourceModalRows.length, maxVisibleSourceRows])
 
   const routingLoad = useMemo((): { view: ReturnType<typeof describeConfiguredPackFlows>; error: string } => {
@@ -1143,34 +1680,21 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     const base = model.split("#")[0]
     return variant && routingVariantChoices(base).includes(variant) ? `${base}#${variant}` : base
   }
-  const summarizeUnifiedFlow = (flow: Pick<UnifiedFlowItem, "roles" | "tools" | "permissions" | "delegations">, related: ArchetypeAgent[]) => {
-    const parts: string[] = []
-    if (related.length > 0) {
-      const groups = new Map<string, string[]>()
-      for (const agent of related) {
-        const model = flow.roles[agent.role] ?? INHERIT
-        groups.set(model, [...(groups.get(model) ?? []), agent.role])
-      }
-      const modelSummary = [...groups]
-        .map(([model, names]) => model === INHERIT ? `${names.join(", ")} ${names.length === 1 ? "inherits" : "inherit"}` : `${names.join(", ")} → ${model}`)
-        .join(" · ")
-      if (modelSummary) parts.push(modelSummary)
-    }
-    const toolEntries = Object.entries(flow.tools)
-    if (toolEntries.length > 0) parts.push(`tools: ${toolEntries.map(([k, v]) => `${k}=${v}`).join(", ")}`)
-    const permEntries = Object.entries(flow.permissions)
-    if (permEntries.length > 0) parts.push(`perms: ${permEntries.map(([k, v]) => `${k}=${v}`).join(", ")}`)
-    const delEntries = Object.entries(flow.delegations)
-    if (delEntries.length > 0) parts.push(`delegations: ${delEntries.map(([k, v]) => `${k}=${v}`).join(", ")}`)
-    return parts.join("  |  ") || "no overrides"
-  }
-  const formatTriggerLabel = (triggers: string[]) =>
-    triggers.map(t => t === WILDCARD_TRIGGER ? "* (any model)" : t.includes("/") ? t : `${t} (any model)`).join(" OR ")
 
   const isWorkspaceVirtualPack = useMemo(
-    () => Boolean(workspaceRoot && !isReadOnlyGitSource && isVirtualPackRoot(workspaceRoot)),
-    [workspaceRoot, isReadOnlyGitSource, agents],
+    () => Boolean(workspaceRoot && isVirtualPackRoot(workspaceRoot)),
+    [workspaceRoot, agents],
   )
+
+  useEffect(() => {
+    if (workspaceRoot && isWorkspaceVirtualPack && viewMode === "main" && !promptedVirtualRootsRef.current.has(workspaceRoot)) {
+      promptedVirtualRootsRef.current.add(workspaceRoot)
+      prepareOnboardingWizard(
+        workspaceRoot,
+        activeDataSource?.kind === "source" && activeDataSource.source.kind === "git" ? activeDataSource.source : null,
+      )
+    }
+  }, [workspaceRoot, isWorkspaceVirtualPack])
   const saveFlowDraft = (draft: FlowDraftInput | null, previousKey?: string): { ok: boolean; savedKey?: string | null } => {
     if (!routingArchetype) return { ok: false }
     try {
@@ -1220,13 +1744,157 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     }
   }
   const openInitPackModal = () => {
-    const slug = derivePackSlug(path.basename(path.resolve(workspaceRoot)))
-    setInitPackName(slug)
-    setInitPackVersion("0.1.0")
-    setInitPackDesc(`Agent pack ${slug}`)
-    setInitPackOrganize(true)
-    setInitPackField("name")
-    setViewMode("pack-init")
+    prepareOnboardingWizard(
+      workspaceRoot,
+      activeDataSource?.kind === "source" && activeDataSource.source.kind === "git" ? activeDataSource.source : null,
+    )
+  }
+
+  const submitPackOnboarding = () => {
+    try {
+      let targetRepoRoot = workspaceRoot
+      let clonedFromSource: string | null = null
+      let activatedLocalSource: Source | null = null
+
+      if (isReadOnlyGitSource && activeDataSource?.kind === "source" && activeDataSource.source.kind === "git") {
+        const registry = loadSources()
+        const cloned = cloneGitSourceForOnboarding({
+          source: activeDataSource.source,
+          destDir: initCloneDest,
+          registry,
+        })
+        targetRepoRoot = cloned.localRoot
+        clonedFromSource = activeDataSource.source.name
+        activatedLocalSource = cloned.localSource
+        promptedVirtualRootsRef.current.add(targetRepoRoot)
+      }
+
+      const res = applyPackOnboarding(targetRepoRoot, {
+        name: initPackName,
+        version: initPackVersion,
+        description: initPackDesc,
+        layout: initPackLayout,
+        organize: initPackOrganize,
+        authoringKit: initPackKit,
+      })
+
+      if (activatedLocalSource) {
+        refreshSourcesView(true)
+        switchToDataSource({ kind: "source", source: activatedLocalSource, root: targetRepoRoot })
+      } else {
+        refreshData()
+      }
+      setRoutingArchetype(null)
+      setActionResultTitle(clonedFromSource ? "Cloned & Onboarded OpenCode Pack" : "OpenCode Pack Onboarded")
+      setActionResultLines([
+        ...(clonedFromSource ? [`Cloned ${clonedFromSource} -> ${targetRepoRoot} (active source: ${activatedLocalSource?.name ?? "local"})`] : []),
+        `Created ${res.manifestPath}`,
+        `Pack: ${res.manifest.name}@${res.manifest.version} (contract ${res.manifest.contract}, layout: ${res.layout})`,
+        ...(res.manifest.archetype ? [`Archetype: ${res.manifest.archetype.callers.join(", ")} (ref: ${res.manifest.archetype.reference})`] : []),
+        ...(res.movedAgents.length ? ["", "Organized agents:", ...res.movedAgents.map(m => `  ${m.from} -> ${m.to}`)] : []),
+        ...(res.movedResources.length ? ["", "Organized resources:", ...res.movedResources.map(m => `  ${m.from} -> ${m.to}`)] : []),
+        ...(res.strippedConfigKeys.length ? ["", `Separated user config keys into .opencode/opencode.user-backup.json: ${res.strippedConfigKeys.join(", ")}`] : []),
+        ...(res.kitFiles.length ? ["", "Installed authoring kit:", ...res.kitFiles.map(f => `  ${f}`)] : []),
+        ...(res.warnings.length ? ["", "Validation notes:", ...res.warnings.map(w => `  ${w}`)] : ["", "✓ Pack satisfies OpenCode Contract 1.1 with zero warnings."]),
+      ])
+      setViewMode("action-result")
+    } catch (err: any) {
+      setActionResultTitle("Pack Onboarding Failed")
+      setActionResultLines([`Error: ${terminalSafeText(err?.message || err)}`])
+      setViewMode("action-result")
+    }
+  }
+
+  const openPackDoctorModal = (initialTab: PackDoctorTab = "doctor") => {
+    if (isWorkspaceVirtualPack) {
+      openInitPackModal()
+      return
+    }
+    if (isReadOnlyGitSource) {
+      pushToast("⚠ Pack Doctor edits local pack files; clone this Git source locally first")
+      return
+    }
+    const preferredCategory = workspaceTab === "flows"
+      ? flowsNav.rows[flowsFocusIndex]?.pack
+      : activeItems[focusedIndex]?.category
+    const resolvedPack = workspaceRoot ? resolveEditablePackDir(workspaceRoot, preferredCategory) : null
+    if (!resolvedPack) {
+      pushToast("⚠ No editable OpenCode pack manifest found in workspace")
+      return
+    }
+    try {
+      const rep = inspectPackDoctor(resolvedPack, workspaceRoot)
+      setDoctorPackDir(resolvedPack)
+      setDoctorReport(rep)
+      setDoctorTab(initialTab)
+      setDoctorScrollOffset(0)
+      setDoctorStatusMessage(null)
+      setScaffoldField("id")
+      setScaffoldId("")
+      setScaffoldDesc("")
+      setViewMode("pack-doctor")
+    } catch (err: any) {
+      pushToast(`⚠ Doctor failed: ${terminalSafeText(err?.message || err)}`)
+    }
+  }
+
+  const runPackDoctorAutoFix = () => {
+    if (!doctorPackDir) return
+    try {
+      const res = fixPackDoctor(doctorPackDir, { repoRoot: workspaceRoot })
+      setDoctorReport(res.report)
+      setDoctorScrollOffset(0)
+      refreshData()
+      setDoctorStatusMessage(
+        res.appliedFixes.length > 0
+          ? `Applied ${res.appliedFixes.length} fix(es): ${res.appliedFixes[0]}`
+          : "Nothing to fix — pack is already clean",
+      )
+    } catch (err: any) {
+      setDoctorStatusMessage(`Fix error: ${terminalSafeText(err?.message || err)}`)
+    }
+  }
+
+  const runPackDoctorAuthoringKit = () => {
+    if (!doctorPackDir || !doctorReport?.manifest) return
+    try {
+      const files = installPackAuthoringKit(workspaceRoot || doctorPackDir, doctorPackDir, doctorReport.manifest)
+      setDoctorReport(inspectPackDoctor(doctorPackDir, workspaceRoot))
+      setDoctorStatusMessage(files.length > 0 ? `Installed authoring kit (${files.join(", ")})` : "Authoring kit refreshed")
+    } catch (err: any) {
+      setDoctorStatusMessage(`Kit error: ${terminalSafeText(err?.message || err)}`)
+    }
+  }
+
+  const runPackDoctorBump = (release: SemverReleaseKind) => {
+    if (!doctorPackDir) return
+    try {
+      const res = bumpPackVersion(doctorPackDir, release)
+      setDoctorReport(inspectPackDoctor(doctorPackDir, workspaceRoot))
+      refreshData()
+      setDoctorStatusMessage(`Bumped version ${res.previousVersion} -> ${res.nextVersion}`)
+    } catch (err: any) {
+      setDoctorStatusMessage(`Version bump failed: ${terminalSafeText(err?.message || err)}`)
+    }
+  }
+
+  const submitPackScaffold = () => {
+    if (!doctorPackDir) return
+    try {
+      const res = scaffoldPackResource(doctorPackDir, {
+        kind: scaffoldKind,
+        id: scaffoldId,
+        description: scaffoldDesc,
+        mode: scaffoldMode,
+      })
+      refreshData()
+      setDoctorReport(inspectPackDoctor(doctorPackDir, workspaceRoot))
+      setScaffoldId("")
+      setScaffoldDesc("")
+      setDoctorStatusMessage(`Created ${res.relativePath}`)
+    } catch (err: any) {
+      setDoctorStatusMessage(`Error: ${terminalSafeText(err?.message || err)}`)
+    }
   }
   const openRoutingPicker = (pick: RoutingPick, current?: string | string[]) => {
     if (modelCatalog.status !== "verified" && !(pick.kind === "trigger" && models.length === 0)) {
@@ -1247,14 +1915,913 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     setViewMode("model-selector")
   }
 
-  // Clamp model index on layout tree size updates
   useEffect(() => {
-    if (focusedModelIndex >= modelTreeItems.length) {
-      const nextIndex = Math.max(0, modelTreeItems.length - 1)
-      setFocusedModelIndex(nextIndex)
-      updateModelScroll(nextIndex)
+    const clamped = modelTreeItems.length ? Math.min(focusedModelIndex, modelTreeItems.length - 1) : 0
+    if (clamped !== focusedModelIndex) setFocusedModelIndex(clamped)
+    setModelScrollOffset(offset => clampListScroll(clamped, modelTreeItems.length, offset, maxVisibleModels))
+  }, [modelTreeItems.length, maxVisibleModels])
+
+  useEffect(() => {
+    const clamped = colorTreeItems.length ? Math.min(focusedColorIndex, colorTreeItems.length - 1) : 0
+    if (clamped !== focusedColorIndex) setFocusedColorIndex(clamped)
+    setColorScrollOffset(offset => clampListScroll(clamped, colorTreeItems.length, offset, maxVisibleColors))
+  }, [colorTreeItems.length, maxVisibleColors])
+
+  useEffect(() => {
+    const clamped = delegationItems.length ? Math.min(focusedDelegationIndex, delegationItems.length - 1) : 0
+    if (clamped !== focusedDelegationIndex) setFocusedDelegationIndex(clamped)
+    setDelegationScrollOffset(offset => clampListScroll(clamped, delegationItems.length, offset, maxVisibleDelegations))
+  }, [delegationItems.length, maxVisibleDelegations])
+
+  const packFlowsByCategory = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof describeConfiguredPackFlows>>()
+    if (!workspaceRoot) return map
+    const cats = new Set<string>(agents.map(a => a.category))
+    for (const cat of cats) {
+      try {
+        map.set(cat, describeConfiguredPackFlows(workspaceRoot, cat, { applySourceOverrides: isReadOnlyGitSource }))
+      } catch {
+        map.set(cat, null)
+      }
     }
-  }, [modelTreeItems.length])
+    return map
+  }, [workspaceRoot, agents, isReadOnlyGitSource, routingRevision])
+
+  const userOverridesSummary = useMemo(() => {
+    const countsByPack = new Map<string, number>()
+    const overriddenAgents = new Set<string>()
+    try {
+      const target = realpathThroughExistingAncestor(path.resolve(defaultTarget()))
+      const settings = loadOverrideSettings()
+      const cats = new Set<string>(agents.map(a => a.category))
+      for (const cat of cats) {
+        const eff = effectiveOverrides(settings, target, cat)
+        const ids = Object.keys(eff.agents).filter(id => Object.keys(ownProp(eff.agents, id) ?? {}).length > 0)
+        if (ids.length > 0) countsByPack.set(cat, ids.length)
+        for (const id of ids) overriddenAgents.add(`${cat}/${id}`)
+      }
+    } catch {
+      // Ignore unreadable override settings in status badges
+    }
+    return { countsByPack, overriddenAgents }
+  }, [agents, flashTick, routingRevision])
+
+  const resolveAgentHexColor = (rawCol: unknown): string => {
+    if (typeof rawCol !== "string" || !rawCol.trim()) return THEME.accentBlue
+    if (rawCol.startsWith("#")) return sanitizeHexColor(rawCol, THEME.accentBlue)
+    for (const group of COLOR_PALETTE) {
+      for (const c of group.colors) {
+        if (c.value === rawCol) return c.hex
+      }
+    }
+    return THEME.accentBlue
+  }
+
+  const categoryAgentCounts = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const ag of agents) counts.set(ag.category, (counts.get(ag.category) ?? 0) + 1)
+    return counts
+  }, [agents])
+
+  const flowsNav = useMemo(() => buildFlowsNavRows(agents, packFlowsByCategory), [agents, packFlowsByCategory])
+
+  useEffect(() => {
+    const flowBudget = wsViewports.flowsRows
+    const clamped = flowsNav.rows.length ? Math.min(flowsFocusIndex, flowsNav.rows.length - 1) : 0
+    if (clamped !== flowsFocusIndex) setFlowsFocusIndex(clamped)
+    setFlowsScrollOffset(off => clampListScroll(clamped, flowsNav.rows.length, off, flowBudget))
+  }, [flowsNav.rows.length, wsViewports.flowsRows])
+
+  const openPackFlowsModal = (pack: string, initialFlowIndex = 0) => {
+    if (!workspaceRoot || !isConfigurablePack(workspaceRoot, pack)) {
+      pushToast(`⚠ Pack "${pack}" has no configurable callers or agents.`)
+      return
+    }
+    setRoutingArchetype(pack)
+    setRoutingFocus(Math.max(0, initialFlowIndex))
+    setRoutingScroll(0)
+    setRoutingConfirmDelete(false)
+    setRoutingStatus("")
+    setViewMode("routing-configs")
+  }
+
+  const openRoutingBranchAtIndex = (index: number) => {
+    if (!routingView) return
+    const focusedFlow = routingView.flows[index]
+    const initialFocus = focusedFlow ? (routingView.related.length > 0 ? 1 : 2) : 0
+    setRoutingFocus(index)
+    setRoutingConfirmDelete(false)
+    setRoutingEditorFocus(initialFocus)
+    setRoutingEditorScroll(0)
+    setRoutingSelected(new Set())
+    setRoutingStatus("")
+    if (focusedFlow) {
+      setRoutingDraft({
+        previousKey: focusedFlow.key,
+        ...(focusedFlow.callers ? { callers: [...focusedFlow.callers] } : {}),
+        triggers: [...focusedFlow.triggers],
+        roles: { ...focusedFlow.roles },
+        tools: { ...focusedFlow.tools },
+        permissions: { ...focusedFlow.permissions },
+        delegations: { ...focusedFlow.delegations },
+      })
+      setViewMode("routing-editor")
+    } else {
+      setRoutingDraft({ triggers: [], roles: {}, tools: {}, permissions: {}, delegations: {} })
+      openRoutingPicker({ kind: "trigger" })
+    }
+  }
+
+  const openRoutingCallersModal = () => {
+    if (!routingView) return
+    setRoutingConfirmDelete(false)
+    setCallerDraftSet(new Set(routingView.callers.map(c => c.name)))
+    setCallerFocus(0)
+    setCallerScroll(0)
+    setRoutingStatus("")
+    setViewMode("routing-callers")
+  }
+
+  const saveCallersDraftAction = () => {
+    if (!routingArchetype) return
+    try {
+      const nextCallers = [...callerDraftSet]
+      saveUserPackCallers(workspaceRoot, routingArchetype, nextCallers, { applySourceOverrides: isReadOnlyGitSource })
+      setRoutingRevision(r => r + 1)
+      setRoutingStatus(`Updated callers (OR): ${nextCallers.join(", ")}; reconciling target...`)
+      void reconcileTargetIfInstalled("models").then(outcome => {
+        setRoutingStatus(`Updated callers (OR): ${nextCallers.join(", ")}. ${formatReconcileLines(outcome)[0]}`)
+      }).catch(error => {
+        setRoutingStatus(`Updated callers in routing.json; reconcile failed: ${terminalSafeText(error?.message || error)}`)
+      })
+      setViewMode("routing-configs")
+    } catch (err: any) {
+      setRoutingStatus(`Error: ${terminalSafeText(err?.message || err)}`)
+    }
+  }
+
+  const resetCallersToDefaultsAction = () => {
+    if (!routingArchetype) return
+    try {
+      saveUserPackCallers(workspaceRoot, routingArchetype, null, { applySourceOverrides: isReadOnlyGitSource })
+      setRoutingRevision(r => r + 1)
+      setRoutingStatus("Reset callers to pack / inferred defaults; reconciling target...")
+      void reconcileTargetIfInstalled("models").then(outcome => {
+        setRoutingStatus(`Reset callers to pack / inferred defaults. ${formatReconcileLines(outcome)[0]}`)
+      }).catch(error => {
+        setRoutingStatus(`Reset callers in routing.json; reconcile failed: ${terminalSafeText(error?.message || error)}`)
+      })
+      setViewMode("routing-configs")
+    } catch (err: any) {
+      setRoutingStatus(`Error: ${terminalSafeText(err?.message || err)}`)
+    }
+  }
+
+  const activateRoutingEditorRow = (rowIndex: number, modelShortcutOnly = false) => {
+    if (!routingView || !routingDraft) return
+    const related = routingView.related
+    const toolsRowIdx = related.length + 1
+    const permsRowIdx = related.length + 2
+    const delegationsRowIdx = related.length + 3
+    const focusedAgent = rowIndex > 0 && rowIndex <= related.length ? related[rowIndex - 1] : undefined
+    const targets = routingSelected.size > 0
+      ? related.filter(agent => routingSelected.has(agent.role)).map(agent => agent.role)
+      : focusedAgent
+        ? [focusedAgent.role]
+        : []
+
+    if (rowIndex === 0) openRoutingPicker({ kind: "trigger" }, routingDraft.triggers)
+    else if (rowIndex === toolsRowIdx && !modelShortcutOnly) {
+      setFlowSubFocus(0)
+      setFlowSubScroll(0)
+      setViewMode("routing-tools")
+    } else if (rowIndex === permsRowIdx && !modelShortcutOnly) {
+      setFlowSubFocus(0)
+      setFlowSubScroll(0)
+      setViewMode("routing-permissions")
+    } else if (rowIndex === delegationsRowIdx && !modelShortcutOnly) {
+      setFlowSubFocus(0)
+      setFlowSubScroll(0)
+      setViewMode("routing-delegations")
+    } else if (targets.length > 0) {
+      openRoutingPicker({ kind: "roles", roles: targets }, routingDraft.roles[targets[0]])
+    }
+  }
+
+  const cycleRoutingSubPolicyAt = (index: number, delta: 1 | -1 = 1) => {
+    if (!routingDraft || !routingView) return
+    if (viewMode === "routing-tools") {
+      const toolRows = [{ key: "*" }, ...routingView.availableTools]
+      const row = toolRows[index]
+      if (!row) return
+      const cycle: Array<PolicyEffect | undefined> = [undefined, "deny", "ask", "allow"]
+      const current = routingDraft.tools[row.key]
+      const nextEffect = cycle[(cycle.indexOf(current) + delta + cycle.length) % cycle.length]
+      const tools = { ...routingDraft.tools }
+      if (nextEffect === undefined) delete tools[row.key]
+      else tools[row.key] = nextEffect
+      applyRoutingDraft({ ...routingDraft, tools })
+    } else if (viewMode === "routing-permissions") {
+      const row = PERMISSION_POLICY_ROWS[index]
+      if (!row) return
+      const cycle: Array<PolicyEffect | undefined> = [undefined, "deny", "ask", "allow"]
+      const current = routingDraft.permissions[row.key]
+      const nextEffect = cycle[(cycle.indexOf(current) + delta + cycle.length) % cycle.length]
+      const permissions = { ...routingDraft.permissions }
+      if (nextEffect === undefined) delete permissions[row.key]
+      else permissions[row.key] = nextEffect
+      applyRoutingDraft({ ...routingDraft, permissions })
+    } else if (viewMode === "routing-delegations") {
+      const delRows = [{ name: "*" }, ...routingView.subagents]
+      const row = delRows[index]
+      if (!row) return
+      const cycle: Array<DelegationEffect | undefined> = [undefined, "deny", "allow"]
+      const current = routingDraft.delegations[row.name]
+      const nextEffect = cycle[(cycle.indexOf(current) + delta + cycle.length) % cycle.length]
+      const delegations = { ...routingDraft.delegations }
+      if (nextEffect === undefined) delete delegations[row.name]
+      else delegations[row.name] = nextEffect
+      applyRoutingDraft({ ...routingDraft, delegations })
+    }
+  }
+
+  const jumpToCatalogAgent = (agentPath: string) => {
+    const jump = computeCatalogJumpState(agents, expandedCategories, agentPath, scrollOffset, maxVisibleItems, comparePackCategories)
+    if (!jump) return
+    pendingJumpIndexRef.current = jump.foundIndex
+    setWorkspaceTab("catalog")
+    setSearchQuery("")
+    setIsSearching(false)
+    setExpandedCategories(jump.expandedCategories)
+    setFocusedIndex(jump.foundIndex)
+    setScrollOffset(jump.scrollOffset)
+  }
+
+  const pullSelectedOrActiveSource = () => {
+    const row = sourceModalRows[sourcesFocusIndex]
+    const targetSource = row?.kind === "registered"
+      ? row.source
+      : activeDataSource?.kind === "source"
+        ? activeDataSource.source
+        : null
+    if (targetSource && targetSource.kind === "git") {
+      try {
+        const commit = pullSource(targetSource)
+        refreshSourcesView(true)
+        if (activeDataSource?.kind === "source" && activeDataSource.source.name === targetSource.name) {
+          setActiveRevision(commit)
+          refreshData(activeDataSource)
+        }
+        const msg = `✓ Pulled ${targetSource.name}: ${commit?.slice(0, 12) ?? "up to date"}`
+        setSourcesStatus(msg)
+        pushToast(msg)
+      } catch (error: any) {
+        const msg = `✗ Pull failed: ${terminalSafeText(error?.message || error)}`
+        setSourcesStatus(msg)
+        pushToast(msg)
+      }
+    } else {
+      refreshSourcesView(true)
+      setSourcesStatus("Refreshed sources and GitHub repository list.")
+      pushToast("✓ Refreshed sources & target status")
+    }
+  }
+
+  const activateSourceRowAtIndex = (index: number) => {
+    const row = sourceModalRows[index]
+    if (row?.kind === "registered") activateRegisteredSource(row.source)
+    else if (row?.kind === "gh-repo") attachNewSourceSpec(`github:${row.repo.nameWithOwner}`)
+    else if (row?.kind === "connect-input") attachNewSourceSpec(row.spec)
+    else if (sourcesQuery.trim()) attachNewSourceSpec(sourcesQuery.trim())
+  }
+
+  const openModelOrFlowsAction = () => {
+    const focusedFolder = activeItems[focusedIndex]
+    if (selectedAgentPaths.size === 0 && focusedFolder?.type === "folder" && isConfigurablePack(workspaceRoot, focusedFolder.category)) {
+      openPackFlowsModal(focusedFolder.category)
+      return
+    }
+    if (modelCatalog.status !== "verified") {
+      setActionResultTitle("Model Catalog Unavailable")
+      setActionResultLines(["Models are not present in the loaded catalog.", "No model writes or suggestions are available.", "Press Y to retry refreshing the model catalog."])
+      setViewMode("action-result")
+      return
+    }
+    if (activeItems.length === 0 || (!activeItems[focusedIndex]?.agent && selectedAgentPaths.size === 0)) {
+      setActionResultTitle("No Agent Focused")
+      setActionResultLines([
+        "Mark at least one agent (SPACE) to change its model,",
+        "or focus a pack folder and press M to configure conditional IF/OR flows."
+      ])
+      setViewMode("action-result")
+    } else {
+      const current = activeItems[focusedIndex]?.agent?.frontmatter?.model
+      if (typeof current === "string" && current.includes("/")) setExpandedProviders(previous => new Set([...previous, current.split("/")[0]]))
+      setFocusedModelIndex(0)
+      setModelScrollOffset(0)
+      setViewMode("model-selector")
+    }
+  }
+
+  const openBridgeModalAction = (target: "claude" | "codex") => {
+    if (agents.length > 0 && activeDataSource) {
+      if (bridgeablePacks.length === 0) {
+        setActionResultTitle("No Pack to Bridge")
+        setActionResultLines(["No valid pack was found in the active workspace."])
+        setViewMode("action-result")
+        return
+      }
+      let loadedConfig = translationConfig
+      try {
+        loadedConfig = loadTranslationFor(activeDataSource)
+        setTranslationConfig(loadedConfig)
+      } catch {
+        // Keep the in-memory config; generateBridge surfaces the load error on submit.
+      }
+      const baseCfg = loadedConfig ?? DEFAULT_TRANSLATION_CONFIG
+      const nextTiers = cloneBridgeTiers(baseCfg.tiers)
+      const nextRoles = { ...baseCfg.roles }
+      const focusedPack = workspaceTab === "flows"
+        ? flowsNav.rows[flowsFocusIndex]?.pack
+        : activeItems[focusedIndex]?.category
+      const initialLayout = calculateBridgeModalLayout(termWidth, termHeight, {
+        packExpanded: false,
+        tierCount: Object.keys(nextTiers).length,
+      })
+      const initialPack = resolveInitialBridgePack(bridgeablePacks, focusedPack, initialLayout.packViewportRows)
+      bridgeModelTargetDirtyRef.current = false
+      setBridgeConfirmReasons([])
+      setBridgeTarget(target)
+      setBridgePluginName("")
+      setBridgeModelTarget(initialBridgeModelCatchAll(baseCfg, target))
+      setBridgeDraftTiers(nextTiers)
+      setBridgeDraftRoles(nextRoles)
+      setBridgeTiersDirty(false)
+      setBridgeTierIndex(0)
+      setBridgeTierScrollOffset(0)
+      setBridgeAgentIndex(0)
+      setBridgeAgentScrollOffset(0)
+      setBridgeClaudeTierTyping(false)
+      setBridgePackSuggested(initialPack.selectedPack)
+      setBridgeSelectedPack(initialPack.selectedPack)
+      setBridgePackQuery(initialPack.query)
+      setBridgePackIndex(initialPack.index)
+      setBridgePackScrollOffset(initialPack.scrollOffset)
+      setBridgeFocusedField("name")
+      setViewMode("bridge-prompt")
+    }
+  }
+
+  const adjustTuningSteps = (delta: number) => {
+    const parsedFallback = Number.parseInt(tuningSummary.steps.value, 10)
+    const fallback = Number.isFinite(parsedFallback) ? parsedFallback : 50
+    const parsedDraft = Number.parseInt(tuningSteps, 10)
+    const current =
+      !tuningDirtyFields.has("steps") && tuningSummary.steps.mixed
+        ? fallback
+        : Number.isFinite(parsedDraft)
+          ? parsedDraft
+          : fallback
+    setTuningSteps(String(Math.max(1, current + delta)))
+    markTuningDirty("steps")
+  }
+
+  const submitTuningModal = () => {
+    const targetAgents = tuningTargetPaths.length > 0
+      ? agents.filter((a) => tuningTargetPaths.includes(a.currentPath))
+      : []
+    if (tuningDirtyFields.size === 0) {
+      setViewMode("main")
+      pushToast("No parameters modified — left all agents unchanged.")
+      return
+    }
+    if (targetAgents.length === 0) return
+
+    try {
+      const params = buildTuningUpdateParams(
+        { steps: tuningSteps, variant: tuningVariant, mode: tuningMode, hidden: tuningHidden },
+        tuningDirtyFields,
+        modelVariants && modelVariants.length > 0 ? modelVariants : undefined
+      )
+      applyAgentMutation(
+        targetAgents.map(a => a.currentPath),
+        writer => updateAgentParams(targetAgents, params, writer),
+        "Parameters Updated Successfully",
+        [
+          `Successfully tuned parameters for ${targetAgents.length} agents:`,
+          `  * Steps:      ${tuningDirtyFields.has("steps") ? params.steps : "unchanged"}`,
+          `  * Variant:    ${tuningDirtyFields.has("variant") ? (params.variant ?? "default (unset)") : "unchanged"}`,
+          `  * Mode:       ${tuningDirtyFields.has("mode") ? tuningMode : "unchanged"}`,
+          `  * Visibility: ${tuningDirtyFields.has("hidden") ? (tuningHidden ? "hidden" : "visible") : "unchanged"}`
+        ]
+      )
+    } catch (error: any) {
+      pushToast(`✗ ${terminalSafeText(error.message || String(error))}`)
+    }
+  }
+
+  const openTuningModalAction = () => {
+    if (activeItems.length === 0) return
+    const focusedItem = activeItems[focusedIndex]
+    const targetAgents = selectedAgentPaths.size > 0
+      ? agents.filter(a => selectedAgentPaths.has(a.currentPath))
+      : focusedItem?.type === "folder"
+        ? agents.filter(a => a.category === focusedItem.category)
+        : focusedItem?.agent ? [focusedItem.agent] : []
+    if (targetAgents.length === 0) return
+    const summary = inspectTuningTargets(targetAgents)
+    setTuningTargetPaths(targetAgents.map((a) => a.currentPath))
+    setTuningSteps(summary.steps.value)
+    setTuningVariant(summary.variant.value)
+    setTuningVariantTyping(false)
+    setTuningMode(summary.mode.value)
+    setTuningHidden(summary.hidden.value)
+    setTuningDirtyFields(new Set())
+    setTuningFocusedField("steps")
+    setViewMode("parameter-tuning")
+  }
+
+  const toggleFolderAtFocused = () => {
+    const item = activeItems[focusedIndex]
+    if (item?.type === "folder") {
+      setExpandedCategories(prev => {
+        const next = new Set(prev)
+        if (next.has(item.id)) next.delete(item.id)
+        else next.add(item.id)
+        return next
+      })
+    }
+  }
+
+  const toggleSelectionAtPath = (agentPath: string) => {
+    setSelectedAgentPaths(prev => {
+      const next = new Set(prev)
+      if (next.has(agentPath)) next.delete(agentPath)
+      else next.add(agentPath)
+      return next
+    })
+  }
+
+  const openCommandPalette = () => {
+    setPaletteQuery("")
+    setPaletteFocusIndex(0)
+    setPaletteScrollOffset(0)
+    setViewMode("command-palette")
+  }
+
+  const openHelpGuide = (preferredTab?: HelpTabId) => {
+    setHelpTab(preferredTab ?? defaultHelpTabForWorkspace(workspaceTab))
+    setHelpFocusIndex(0)
+    setHelpScrollOffset(0)
+    setViewMode("help")
+  }
+
+  const selectHelpTab = (nextTab: HelpTabId) => {
+    setHelpTab(nextTab)
+    setHelpFocusIndex(0)
+    setHelpScrollOffset(0)
+  }
+
+  const activateHelpItem = (item: HelpShortcutItem) => {
+    if (!item.actionId) {
+      pushToast(`● [${item.keyLabel}] ${item.title}`)
+      return
+    }
+    if (item.disabled) {
+      if (item.actionId === "repair-models") {
+        pushToast("✓ All agent models are already valid")
+      } else if (item.actionId === "pack-init") {
+        pushToast("⚠ Current workspace already has an opencode-pack.json manifest")
+      } else if (item.actionId === "pack-doctor" || item.actionId === "pack-scaffold") {
+        pushToast(isWorkspaceVirtualPack ? "⚠ Press [I] to onboard this virtual pack first" : "⚠ Requires a writable local pack workspace")
+      } else if (isReadOnlyGitSource && (item.actionId === "agent-rename" || item.actionId === "fix-permission-order")) {
+        pushToast("⚠ Requires a writable local pack workspace")
+      } else {
+        pushToast("⚠ Connect or activate a pack source with agents first")
+      }
+      return
+    }
+    executeActionById(item.actionId)
+  }
+
+  const toggleFocusedSourceTrust = () => {
+    const row = sourceModalRows[sourcesFocusIndex]
+    if (row?.kind !== "registered") {
+      pushToast("⚠ Focus a registered source row to toggle trust")
+      return
+    }
+    try {
+      const registry = loadSources()
+      const target = findSource(registry, row.source.name)
+      target.trusted = !target.trusted
+      saveSources(registry)
+      if (activeDataSource?.kind === "source" && activeDataSource.source.name === target.name) {
+        setActiveDataSource({ ...activeDataSource, source: { ...target } })
+      }
+      refreshSourcesView(true)
+      const msg = `Source "${target.name}" is now ${target.trusted ? "trusted" : "untrusted"}.`
+      setSourcesStatus(msg)
+      pushToast(`✓ ${msg}`)
+    } catch (error: any) {
+      setSourcesStatus(terminalSafeText(error?.message || error))
+    }
+  }
+
+  const removeFocusedSource = () => {
+    const row = sourceModalRows[sourcesFocusIndex]
+    if (row?.kind !== "registered") {
+      pushToast("⚠ Focus a registered source row to remove it")
+      return
+    }
+    try {
+      const registry = loadSources()
+      removeSource(registry, row.source.name)
+      saveSources(registry)
+      if (activeDataSource?.kind === "source" && activeDataSource.source.name === row.source.name) {
+        const fallback = registry.sources[0]
+        if (fallback) {
+          try {
+            switchToDataSource({ kind: "source", source: fallback, root: sourceRoot(fallback) })
+            openSourcesModal(true)
+          } catch {
+            setActiveDataSource(null)
+            setAgents([])
+          }
+        } else {
+          setActiveDataSource(null)
+          setAgents([])
+        }
+      }
+      refreshSourcesView(true)
+      setSourcesStatus(`Removed source "${row.source.name}".`)
+      pushToast(`✓ Removed source "${row.source.name}"`)
+    } catch (error: any) {
+      setSourcesStatus(terminalSafeText(error?.message || error))
+    }
+  }
+
+  const executeActionById = (actionId: string) => {
+    if (actionId.startsWith("jump:")) {
+      setViewMode("main")
+      jumpToCatalogAgent(actionId.slice("jump:".length))
+      return
+    }
+    setViewMode("main")
+    switch (actionId) {
+      case "palette":
+        openCommandPalette()
+        break
+      case "help":
+        openHelpGuide()
+        break
+      case "ws-catalog":
+        setWorkspaceTab("catalog")
+        break
+      case "ws-flows":
+        setWorkspaceTab("flows")
+        break
+      case "ws-sources":
+        openSourcesModal()
+        break
+      case "ws-next":
+        if (workspaceTab === "catalog") setWorkspaceTab("flows")
+        else if (workspaceTab === "flows") openSourcesModal()
+        else setWorkspaceTab("catalog")
+        break
+      case "pane-toggle":
+        if (!layout.showInspector) {
+          pushToast("⚠ Widen terminal (>=100 cols) to display the right sidebar")
+        } else {
+          setActivePane(prev => (prev === "inspector" ? "list" : "inspector"))
+        }
+        break
+      case "pane-list":
+        setActivePane("list")
+        break
+      case "pane-inspector":
+        if (layout.showInspector) setActivePane("inspector")
+        break
+      case "folder-toggle":
+        toggleFolderAtFocused()
+        break
+      case "select-toggle": {
+        const item = activeItems[focusedIndex]
+        if (item?.type === "file" && item.agent) toggleSelectionAtPath(item.agent.currentPath)
+        else pushToast("⚠ Focus an agent file to mark or unmark it")
+        break
+      }
+      case "select-category": {
+        const item = activeItems[focusedIndex]
+        if (item) {
+          const folderPaths = agents.filter(a => a.category === item.category).map(a => a.currentPath)
+          setSelectedAgentPaths(prev => {
+            const next = new Set(prev)
+            const allSelected = folderPaths.every(p => next.has(p))
+            folderPaths.forEach(p => allSelected ? next.delete(p) : next.add(p))
+            return next
+          })
+        }
+        break
+      }
+      case "select-same-model": {
+        const item = activeItems[focusedIndex]
+        if (item?.type === "file" && item.agent) {
+          const targetModel = item.agent.model
+          const targetCategory = item.category
+          const matchingAgentPaths = agents
+            .filter(a => a.model === targetModel && a.category === targetCategory)
+            .map(a => a.currentPath)
+          setSelectedAgentPaths(prev => {
+            const next = new Set(prev)
+            const allSelected = matchingAgentPaths.every(p => next.has(p))
+            matchingAgentPaths.forEach(p => allSelected ? next.delete(p) : next.add(p))
+            return next
+          })
+        } else {
+          pushToast("⚠ Focus an agent file to mark same-model peers")
+        }
+        break
+      }
+      case "catalog-search":
+        setWorkspaceTab("catalog")
+        setIsSearching(true)
+        break
+      case "agent-model":
+        openModelOrFlowsAction()
+        break
+      case "pack-flows": {
+        const pack = workspaceTab === "flows"
+          ? flowsNav.rows[flowsFocusIndex]?.pack
+          : activeItems[focusedIndex]?.category
+        if (pack) openPackFlowsModal(pack)
+        break
+      }
+      case "flow-jump": {
+        if (workspaceTab !== "flows") {
+          setWorkspaceTab("flows")
+          pushToast("● Switched to Flows — focus a row and press Enter")
+          break
+        }
+        const row = flowsNav.rows[flowsFocusIndex]
+        if (row?.kind === "pack") openPackFlowsModal(row.pack)
+        else if (row?.agent) jumpToCatalogAgent(row.agent.currentPath)
+        break
+      }
+      case "pack-install": {
+        const pack = workspaceTab === "flows"
+          ? flowsNav.rows[flowsFocusIndex]?.pack
+          : activeItems[focusedIndex]?.category
+        if (pack) previewInstall(pack)
+        break
+      }
+      case "pack-init":
+        if (isWorkspaceVirtualPack) openInitPackModal()
+        else pushToast("⚠ Current workspace already has an opencode-pack.json manifest")
+        break
+      case "pack-doctor":
+        openPackDoctorModal("doctor")
+        break
+      case "pack-scaffold":
+        openPackDoctorModal("scaffold")
+        break
+      case "repair-models":
+        if (modelCatalog.status === "verified" && invalidModelGroups.length > 0) {
+          setRepairMappings({})
+          setRepairGroupKey("0")
+          setFocusedModelIndex(0)
+          setModelScrollOffset(0)
+          setViewMode("repair-selector")
+        } else {
+          pushToast("✓ No invalid or missing models detected")
+        }
+        break
+      case "agent-tune":
+        openTuningModalAction()
+        break
+      case "agent-tier":
+        if (activeItems[focusedIndex]?.agent) {
+          setFocusedTierIndex(0)
+          setTierScrollOffset(0)
+          setViewMode("tier-selector")
+        } else {
+          pushToast("⚠ Focus an agent first to assign a translation tier")
+        }
+        break
+      case "agent-color":
+        if (activeItems[focusedIndex]?.agent || selectedAgentPaths.size > 0) {
+          setFocusedColorIndex(0)
+          setColorScrollOffset(0)
+          setViewMode("color-selector")
+        } else {
+          pushToast("⚠ Focus or mark an agent to change badge color")
+        }
+        break
+      case "agent-rename":
+        if (isReadOnlyGitSource) {
+          pushToast("⚠ Renaming files requires a local pack workspace")
+        } else if (activeItems[focusedIndex]?.agent) {
+          const ag = activeItems[focusedIndex].agent!
+          const analysis = analyzeAgentName(ag.filename, allAgentFilenames)
+          setRenameTargetAgent(ag)
+          setRenameFamily(analysis.family || "")
+          setRenameCategory(analysis.category || "")
+          setRenameRole((analysis.role || "").replace(/[\s-]/g, "_"))
+          setRenameFocusedField("role")
+          setViewMode("rename-prompt")
+        } else {
+          pushToast("⚠ Focus an agent file to rename it")
+        }
+        break
+      case "agent-permissions":
+        if (activeItems[focusedIndex]?.agent || selectedAgentPaths.size > 0) {
+          setFocusedPresetIndex(0)
+          setViewMode("permission-preset")
+        } else {
+          pushToast("⚠ Focus or mark an agent to apply a safety preset")
+        }
+        break
+      case "agent-delegations": {
+        const flowRow = flowsNav.rows[Math.max(0, Math.min(flowsFocusIndex, Math.max(0, flowsNav.rows.length - 1)))] ?? null
+        const target = workspaceTab === "flows"
+          ? buildFlowsInspectorItems(flowRow, agents, packFlowsByCategory, flowsNav.agentByShortName).activeAgent
+          : activeItems[focusedIndex]?.agent
+        if (target) {
+          setDelegationTargetAgent(target)
+          setSelectedDelegations(new Set(target.allowedSubagents || []))
+          setFocusedDelegationIndex(0)
+          setDelegationScrollOffset(0)
+          setViewMode("delegation-manager")
+        } else {
+          pushToast("⚠ Focus an agent to edit its @subagent delegations")
+        }
+        break
+      }
+      case "agent-resources":
+        if (activeItems[focusedIndex]?.agent) openResourceManager(activeItems[focusedIndex].agent!)
+        else pushToast("⚠ Focus an agent to manage Skills, Tools & MCP")
+        break
+      case "bridge-claude":
+        openBridgeModalAction("claude")
+        break
+      case "bridge-codex":
+        openBridgeModalAction("codex")
+        break
+      case "layout-adjust":
+        setLayoutSnapshot(appliedShare)
+        setLayoutDraft(appliedShare)
+        setLayoutError("")
+        setLayoutStatus("")
+        setViewMode("layout")
+        break
+      case "toggle-motion":
+        toggleReducedMotion()
+        break
+      case "source-activate":
+        if (workspaceTab !== "sources") {
+          openSourcesModal(true)
+          pushToast("● Switched to Sources — choose a row and press Enter")
+        } else {
+          activateSourceRowAtIndex(sourcesFocusIndex)
+        }
+        break
+      case "source-trust":
+        if (workspaceTab !== "sources") {
+          openSourcesModal(true)
+          pushToast("● Switched to Sources — focus a registered source to toggle trust")
+        } else {
+          toggleFocusedSourceTrust()
+        }
+        break
+      case "source-remove":
+        if (workspaceTab !== "sources") {
+          openSourcesModal(true)
+          pushToast("● Switched to Sources — focus a registered source to remove it")
+        } else {
+          removeFocusedSource()
+        }
+        break
+      case "source-search":
+        setWorkspaceTab("sources")
+        setSourcesInputFocused(true)
+        break
+      case "source-pull":
+        pullSelectedOrActiveSource()
+        break
+      case "source-gh-auth":
+        runInteractiveGhLogin()
+        break
+      case "target-reconcile":
+        runTargetReconcile()
+        break
+      case "target-refresh":
+        refreshSourcesView(true)
+        pushToast("✓ Refreshed sources & target status")
+        break
+      case "engine-self-update":
+        openSelfUpdateModal()
+        break
+      case "fix-permission-order": {
+        if (isReadOnlyGitSource) {
+          pushToast("⚠ Fixing frontmatter permission order requires a local pack workspace")
+          break
+        }
+        const ag = activeItems[focusedIndex]?.agent
+        if (!ag) {
+          pushToast("⚠ Focus an agent file first")
+          break
+        }
+        setWorkspaceTab("catalog")
+        setInspectorTab("security")
+        if (!analyzePermissionOrder(ag).hasOrderError) {
+          pushToast("✓ Wildcard permission order is already valid")
+          break
+        }
+        try {
+          applyAgentMutation(
+            [ag.currentPath],
+            writer => { fixPermissionOrder(ag, writer) },
+            "Permission Order Fixed",
+            [
+              `Successfully reordered permissions for:`,
+              `  ${ag.filename}`,
+              `Placed wildcard "*": "deny" FIRST to comply with OpenCode spec.`,
+            ],
+          )
+        } catch (error: any) {
+          setActionResultTitle("Error Fixing Permission Order")
+          setActionResultLines([`An error occurred:`, `  ${error.message || error}`])
+          setViewMode("action-result")
+        }
+        break
+      }
+    }
+  }
+
+  const paletteCommands = useMemo<PaletteCommand[]>(() => {
+    const base: PaletteCommand[] = [
+      { id: "ws-catalog", label: "Switch to Catalog & Inspector", category: "Workspace", shortcut: "Tab", keywords: ["agents", "tree", "list"] },
+      { id: "ws-flows", label: "Switch to Flows & Call Graph", category: "Workspace", shortcut: "Tab", keywords: ["routing", "delegations", "topology", "subagents"] },
+      { id: "ws-sources", label: "Switch to Sources & OpenCode Target", category: "Workspace", shortcut: "O", keywords: ["github", "repo", "status", "installed"] },
+      { id: "pane-toggle", label: "Toggle Focus: Main Panel / Right Sidebar", category: "Workspace", shortcut: "⇧← / ⇧→", keywords: ["sidebar", "inspector", "pane", "panel", "focus"], disabled: !layout.showInspector },
+      { id: "agent-model", label: "Assign LLM Model (or Pack Flows)", category: "Agent", shortcut: "M", keywords: ["provider", "claude", "gpt", "gemini"], disabled: agents.length === 0 },
+      { id: "agent-tune", label: "Tune Steps, Thinking Effort, Mode & Visibility", category: "Agent", shortcut: "T", keywords: ["reasoning", "variant", "mode", "hidden"], disabled: agents.length === 0 },
+      { id: "agent-permissions", label: "Apply Security / Safety Preset", category: "Agent", shortcut: "P", keywords: ["sandbox", "bash", "deny", "allow"], disabled: agents.length === 0 },
+      { id: "agent-resources", label: "Manage Skills, Custom Tools & MCP Servers", category: "Agent", shortcut: "U", keywords: ["mcp", "skills", "permissions"], disabled: agents.length === 0 },
+      { id: "agent-delegations", label: "Edit Authorized @subagent Delegations", category: "Agent", shortcut: "G", keywords: ["graph", "call", "subagents"], disabled: agents.length === 0 },
+      { id: "agent-color", label: "Pick Agent Badge Color", category: "Agent", shortcut: "C", keywords: ["theme", "hex", "palette"], disabled: agents.length === 0 },
+      { id: "agent-tier", label: "Assign Bridge Translation Tier", category: "Agent", shortcut: "Shift+T", keywords: ["planning", "execution", "light"], disabled: agents.length === 0 },
+      { id: "agent-rename", label: "Rename Agent File & References", category: "Agent", shortcut: "R", keywords: ["refactor", "filename"], disabled: agents.length === 0 || isReadOnlyGitSource },
+      { id: "repair-models", label: "Batch-Repair Invalid / Missing Models", category: "Pack", shortcut: "V", keywords: ["fix", "broken"], disabled: invalidModelGroups.length === 0 },
+      { id: "pack-flows", label: "Configure Conditional IF/OR Pack Flows", category: "Pack", shortcut: "M", keywords: ["rules", "triggers", "routing"], disabled: agents.length === 0 },
+      { id: "pack-install", label: "Preview & Install Pack into OpenCode", category: "Target & Bridges", shortcut: "E", keywords: ["deploy", "update", "lock"], disabled: agents.length === 0 },
+      { id: "target-reconcile", label: "Reconcile Installed OpenCode Target Now", category: "Target & Bridges", shortcut: "R", keywords: ["sync", "drift", "opencode.json"] },
+      { id: "engine-self-update", label: "Check / Apply manage-agents Engine Release Update", category: "Target & Bridges", shortcut: "Shift+U", keywords: ["self-update", "version", "upgrade", "github", "release"] },
+      { id: "source-pull", label: "Pull Git Source & Refresh GitHub Repos", category: "Target & Bridges", shortcut: "P", keywords: ["fetch", "git", "sync"] },
+      { id: "bridge-claude", label: "Generate Claude Code Plugin Bridge", category: "Target & Bridges", shortcut: "B", keywords: ["anthropic", "marketplace"], disabled: agents.length === 0 },
+      { id: "bridge-codex", label: "Generate OpenAI Codex Bridge", category: "Target & Bridges", shortcut: "Shift+B", keywords: ["codex", "toml"], disabled: agents.length === 0 },
+      { id: "pack-init", label: isReadOnlyGitSource ? "Clone & Onboard Virtual Git Repo into Pack" : "Onboard Virtual Folder into OpenCode Pack (1.1)", category: "Pack", shortcut: "I", keywords: ["virtual", "manifest", "onboard", "clone"], disabled: !isWorkspaceVirtualPack },
+      { id: "pack-doctor", label: "Open Pack Doctor & Auto-Fix Contract Issues", category: "Pack", shortcut: "D", keywords: ["validate", "doctor", "fix", "semver", "bump", "kit"], disabled: isWorkspaceVirtualPack || isReadOnlyGitSource || agents.length === 0 },
+      { id: "pack-scaffold", label: "Create New Pack Agent, Skill or Slash Command", category: "Pack", shortcut: "N", keywords: ["new", "scaffold", "add", "agent", "skill", "command"], disabled: isWorkspaceVirtualPack || isReadOnlyGitSource || agents.length === 0 },
+      { id: "layout-adjust", label: "Adjust List / Inspector Split Width", category: "View & Motion", shortcut: "Shift+L", keywords: ["resize", "columns"] },
+      { id: "toggle-motion", label: reducedMotionState ? "Enable Smooth 60fps Micro-Animations" : "Enable Reduced Motion Mode", category: "View & Motion", shortcut: "Ctrl+E", keywords: ["animation", "motion", "fps"] },
+      { id: "help", label: "Open Keyboard & Mouse Guide", category: "View & Motion", shortcut: "?", keywords: ["shortcuts", "cheatsheet"] },
+    ]
+    for (const ag of agents) {
+      base.push({
+        id: `jump:${ag.currentPath}`,
+        label: ag.filename.replace(/\.md$/, ""),
+        category: "Jump to Agent",
+        hint: `${ag.category} · ${modelDisplayValue(ag, true, modelCatalog)}`,
+        keywords: [ag.category, ag.filename, String(ag.frontmatter.model ?? "")],
+      })
+    }
+    return base
+  }, [agents, isReadOnlyGitSource, invalidModelGroups.length, isWorkspaceVirtualPack, reducedMotionState, modelCatalog, layout.showInspector])
+
+  const filteredPaletteCommands = useMemo(
+    () => filterPaletteCommands(paletteCommands, paletteQuery),
+    [paletteCommands, paletteQuery],
+  )
+  const maxPaletteRows = paletteViewport.viewportRows
+
+  const helpContent = useMemo(
+    () =>
+      buildHelpSections(helpTab, {
+        hasAgents: agents.length > 0,
+        isReadOnlyGitSource,
+        isVirtualPack: isWorkspaceVirtualPack,
+        hasInvalidModels: modelCatalog.status === "verified" && invalidModelGroups.length > 0,
+      }),
+    [helpTab, agents.length, isReadOnlyGitSource, isWorkspaceVirtualPack, modelCatalog.status, invalidModelGroups.length],
+  )
+
+  useEffect(() => {
+    if (viewMode !== "help") return
+    const vpRows = calculateHelpViewport(termWidth, termHeight).viewportRows
+    const clampedFocus = Math.max(0, Math.min(Math.max(0, helpContent.items.length - 1), helpFocusIndex))
+    if (clampedFocus !== helpFocusIndex) setHelpFocusIndex(clampedFocus)
+    setHelpScrollOffset(off => clampHelpScroll(clampedFocus, helpContent.rows, off, vpRows))
+  }, [viewMode, termWidth, termHeight, helpContent.rows, helpContent.items.length])
 
   // Keyboard navigation and actions
   useKeyboard((e) => {
@@ -1266,10 +2833,121 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         : e.name
     const isUppercaseF = key === "f" && (e.sequence === "F" || !!e.shift)
     const isUppercaseL = key === "l" && (e.sequence === "L" || !!e.shift)
+    const isUppercaseU = key === "u" && (e.sequence === "U" || !!e.shift)
+
+    // Global Ctrl+K / Ctrl+P / Cmd+K toggles Command Palette; Ctrl+E toggles motion
+    if ((e.ctrl || e.meta) && (key === "k" || key === "p")) {
+      if (viewMode === "command-palette") setViewMode("main")
+      else openCommandPalette()
+      return
+    }
+    if (e.ctrl && key === "e") {
+      toggleReducedMotion()
+      return
+    }
+    if (viewMode === "self-update") {
+      if (key === "escape" || key === "n") {
+        if (!selfUpdateBusy) setViewMode("main")
+      } else if (key === "r" && !selfUpdateBusy) {
+        runSelfUpdateCheck()
+      } else if ((key === "y" || key === "enter" || key === "return") && !selfUpdateBusy && selfUpdateCheck?.updateAvailable && !selfUpdateCheck.localGitDirty) {
+        runSelfUpdateApply(false)
+      } else if (key === "f" && !selfUpdateBusy && selfUpdateCheck && (selfUpdateCheck.updateAvailable || selfUpdateCheck.downgrade || selfUpdateCheck.localGitDirty)) {
+        runSelfUpdateApply(true)
+      }
+      return
+    }
+
+    if (viewMode === "command-palette") {
+      const clampPaletteScroll = (nextIndex: number, total: number) => {
+        setPaletteScrollOffset(offset => {
+          if (total <= 0) return 0
+          if (nextIndex < offset) return Math.max(0, nextIndex)
+          if (nextIndex >= offset + maxPaletteRows) return Math.max(0, nextIndex - maxPaletteRows + 1)
+          return Math.min(offset, Math.max(0, total - maxPaletteRows))
+        })
+      }
+      if (key === "escape") {
+        setViewMode("main")
+      } else if (key === "up" || key === "down") {
+        if (!filteredPaletteCommands.length) return
+        const delta = key === "up" ? -1 : 1
+        const next = (paletteFocusIndex + delta + filteredPaletteCommands.length) % filteredPaletteCommands.length
+        setPaletteFocusIndex(next)
+        clampPaletteScroll(next, filteredPaletteCommands.length)
+      } else if (key === "pageup" || key === "pagedown") {
+        if (!filteredPaletteCommands.length) return
+        const delta = key === "pageup" ? -maxPaletteRows : maxPaletteRows
+        const next = Math.max(0, Math.min(filteredPaletteCommands.length - 1, paletteFocusIndex + delta))
+        setPaletteFocusIndex(next)
+        clampPaletteScroll(next, filteredPaletteCommands.length)
+      } else if (key === "backspace") {
+        setPaletteQuery(q => q.slice(0, -1))
+        setPaletteFocusIndex(0)
+        setPaletteScrollOffset(0)
+      } else if (key === "enter" || key === "return") {
+        const chosen = filteredPaletteCommands[paletteFocusIndex]
+        if (chosen) executeActionById(chosen.id)
+      } else if (!e.ctrl && !e.meta && /^[\x20-\x7E]$/.test(rawChar)) {
+        setPaletteQuery(q => q + rawChar)
+        setPaletteFocusIndex(0)
+        setPaletteScrollOffset(0)
+      }
+      return
+    }
+
+    if (viewMode === "help") {
+      const vpRows = calculateHelpViewport(termWidth, termHeight).viewportRows
+      const totalItems = helpContent.items.length
+      const numericTab = /^[1-4]$/.test(key) ? helpTabByNumber(Number(key)) : null
+
+      if (key === "escape" || rawChar === "?" || key === "q") {
+        setViewMode("main")
+      } else if (numericTab) {
+        selectHelpTab(numericTab)
+      } else if (key === "tab") {
+        selectHelpTab(cycleHelpTab(helpTab, e.shift ? -1 : 1))
+      } else if (key === "left" || key === "h") {
+        selectHelpTab(cycleHelpTab(helpTab, -1))
+      } else if (key === "right" || (key === "l" && !isUppercaseL)) {
+        selectHelpTab(cycleHelpTab(helpTab, 1))
+      } else if (key === "up" || key === "k" || key === "down" || key === "j") {
+        if (!totalItems) return
+        const delta = key === "up" || key === "k" ? -1 : 1
+        const next = (helpFocusIndex + delta + totalItems) % totalItems
+        setHelpFocusIndex(next)
+        setHelpScrollOffset(off => clampHelpScroll(next, helpContent.rows, off, vpRows))
+      } else if (key === "pageup" || key === "pagedown") {
+        if (!totalItems) return
+        const jump = Math.max(2, vpRows - 2)
+        const delta = key === "pageup" ? -jump : jump
+        const next = Math.max(0, Math.min(totalItems - 1, helpFocusIndex + delta))
+        setHelpFocusIndex(next)
+        setHelpScrollOffset(off => clampHelpScroll(next, helpContent.rows, off, vpRows))
+      } else if (key === "home") {
+        setHelpFocusIndex(0)
+        setHelpScrollOffset(0)
+      } else if (key === "end") {
+        if (!totalItems) return
+        const last = totalItems - 1
+        setHelpFocusIndex(last)
+        setHelpScrollOffset(off => clampHelpScroll(last, helpContent.rows, off, vpRows))
+      } else if (key === "enter" || key === "return") {
+        const chosen = helpContent.items[helpFocusIndex]
+        if (chosen) activateHelpItem(chosen)
+      }
+      return
+    }
 
     // 1. Intercept search input mode
-    if (isSearching) {
-      if (key === "escape") {
+    if (isSearching && viewMode === "main" && workspaceTab === "catalog") {
+      if (e.shift && key === "left") {
+        setIsSearching(false)
+        setActivePane("list")
+      } else if (e.shift && key === "right") {
+        setIsSearching(false)
+        if (layout.showInspector) setActivePane("inspector")
+      } else if (key === "escape") {
         setSearchQuery("")
         setIsSearching(false)
       } else if (key === "enter" || key === "return") {
@@ -1301,11 +2979,9 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
           setLayoutError("Read-only environment override: preview only; Enter does not save.")
         } else {
           try {
-             const revision = saveUiConfig(engineConfigDir(), layoutDraft, uiConfigRevisionState)
+             const revision = saveUiConfig(engineConfigDir(), layoutDraft, uiConfigRevisionState, { reducedMotion: reducedMotionState })
              setUiConfigRevision(revision)
-            setLayoutSnapshot(layoutDraft); setAppliedShare(layoutDraft); setLayoutError(""); setLayoutStatus("Layout saved")
-            setActionResultTitle("Layout saved")
-            setActionResultLines(["List/inspector proportions saved."])
+            setLayoutSnapshot(layoutDraft); setAppliedShare(layoutDraft); setLayoutError(""); setLayoutStatus("✓ Layout proportions saved")
             setViewMode("main")
           } catch (error: any) {
             if (error?.message === "configuration changed; reload and retry") {
@@ -1321,21 +2997,23 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       return
     }
 
-    if (viewMode === "sources") {
+    if (viewMode === "main" && workspaceTab === "sources") {
+      const visibleSourceBudget = wsViewports.sourcesRows
       const clampScroll = (nextIndex: number, total: number) => {
-        setSourcesScrollOffset(offset => {
-          if (total <= 0) return 0
-          if (nextIndex < offset) return Math.max(0, nextIndex)
-          if (nextIndex >= offset + maxVisibleSourceRows) return Math.max(0, nextIndex - maxVisibleSourceRows + 1)
-          return Math.min(offset, Math.max(0, total - maxVisibleSourceRows))
-        })
+        setSourcesScrollOffset(offset => clampListScroll(nextIndex, total, offset, visibleSourceBudget))
       }
       if (key === "g" && e.ctrl) {
         runInteractiveGhLogin()
         return
       }
       if (sourcesInputFocused) {
-        if (key === "escape") {
+        if (e.shift && key === "left") {
+          setSourcesInputFocused(false)
+          setActivePane("list")
+        } else if (e.shift && key === "right") {
+          setSourcesInputFocused(false)
+          if (layout.showInspector) setActivePane("inspector")
+        } else if (key === "escape") {
           setSourcesInputFocused(false)
         } else if (key === "up" || key === "down") {
           if (!sourceModalRows.length) return
@@ -1348,11 +3026,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
           setSourcesFocusIndex(0)
           setSourcesScrollOffset(0)
         } else if (key === "enter" || key === "return") {
-          const row = sourceModalRows[sourcesFocusIndex]
-          if (row?.kind === "registered") activateRegisteredSource(row.source)
-          else if (row?.kind === "gh-repo") attachNewSourceSpec(`github:${row.repo.nameWithOwner}`)
-          else if (row?.kind === "connect-input") attachNewSourceSpec(row.spec)
-          else if (sourcesQuery.trim()) attachNewSourceSpec(sourcesQuery.trim())
+          activateSourceRowAtIndex(sourcesFocusIndex)
         } else if (!e.ctrl && !e.meta && /^[\x20-\x7E]$/.test(rawChar)) {
           setSourcesQuery(q => q + rawChar)
           setSourcesFocusIndex(0)
@@ -1361,21 +3035,48 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         return
       }
 
-      if (key === "escape") {
-        if (sourcesQuery) {
+      if (key === "tab") {
+        setWorkspaceTab(e.shift ? "flows" : "catalog")
+        setViewMode("main")
+      } else if ((e.shift && key === "left") || rawChar === "[") {
+        setActivePane("list")
+      } else if ((e.shift && key === "right") || rawChar === "]") {
+        if (layout.showInspector) setActivePane("inspector")
+      } else if (rawChar === "?") {
+        openHelpGuide("sources")
+      } else if (key === "escape") {
+        if (effectivePane === "inspector") {
+          setActivePane("list")
+        } else if (sourcesQuery) {
           setSourcesQuery("")
           setSourcesFocusIndex(0)
           setSourcesScrollOffset(0)
         } else if (activeDataSource) {
+          setWorkspaceTab("catalog")
           setViewMode("main")
         } else {
           setSourcesStatus("Connect a GitHub repository or local folder first (or press Ctrl+C to quit).")
         }
       } else if (key === "/" || key === "a") {
+        setActivePane("list")
         setSourcesInputFocused(true)
         setSourcesStatus("")
       } else if (key === "g") {
         runInteractiveGhLogin()
+      } else if (isUppercaseU) {
+        openSelfUpdateModal()
+      } else if (key === "r" && !e.ctrl) {
+        runTargetReconcile()
+      } else if (effectivePane === "inspector" && (key === "up" || key === "k" || key === "down" || key === "j" || key === "pageup" || key === "pagedown")) {
+        const installedCount = Object.keys(targetStatusInfo?.lock?.packs ?? {}).length
+        const driftCount = targetStatusInfo?.drift?.length ?? 0
+        const maxPackRows = calculateTargetInstalledPackRows(termHeight, {
+          hasEngineLine: Boolean(engineVersionInfo?.displayVersion),
+          driftCount,
+        })
+        const maxOff = Math.max(0, installedCount - maxPackRows)
+        const step = key === "pageup" ? -maxPackRows : key === "pagedown" ? maxPackRows : key === "up" || key === "k" ? -1 : 1
+        setSourcesInspectorScroll(off => Math.max(0, Math.min(maxOff, off + step)))
       } else if (key === "up" || key === "k" || key === "down" || key === "j") {
         if (!sourceModalRows.length) return
         const delta = key === "up" || key === "k" ? -1 : 1
@@ -1384,113 +3085,200 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         clampScroll(next, sourceModalRows.length)
       } else if (key === "pageup" || key === "pagedown") {
         if (!sourceModalRows.length) return
-        const delta = key === "pageup" ? -maxVisibleSourceRows : maxVisibleSourceRows
+        const delta = key === "pageup" ? -visibleSourceBudget : visibleSourceBudget
         const next = Math.max(0, Math.min(sourceModalRows.length - 1, sourcesFocusIndex + delta))
         setSourcesFocusIndex(next)
         clampScroll(next, sourceModalRows.length)
-      } else if (key === "p" || (key === "r" && e.ctrl)) {
-        const row = sourceModalRows[sourcesFocusIndex]
-        if (row?.kind === "registered" && row.source.kind === "git") {
-          try {
-            const commit = pullSource(row.source)
-            refreshSourcesView(true)
-            if (activeDataSource?.kind === "source" && activeDataSource.source.name === row.source.name) {
-              setActiveRevision(commit)
-              refreshData(activeDataSource)
-            }
-            setSourcesStatus(`Pulled ${row.source.name}: ${commit?.slice(0, 12) ?? "up to date"}.`)
-          } catch (error: any) {
-            setSourcesStatus(`Pull failed: ${terminalSafeText(error?.message || error)}`)
-          }
-        } else {
-          refreshSourcesView(true)
-          setSourcesStatus("Refreshed sources and GitHub repository list.")
-        }
+      } else if (key === "p") {
+        pullSelectedOrActiveSource()
+      } else if (key === "r" && e.ctrl) {
+        refreshSourcesView(true)
+        pushToast("✓ Refreshed sources & target status")
       } else if (key === "t") {
-        const row = sourceModalRows[sourcesFocusIndex]
-        if (row?.kind === "registered") {
-          try {
-            const registry = loadSources()
-            const target = findSource(registry, row.source.name)
-            target.trusted = !target.trusted
-            saveSources(registry)
-            if (activeDataSource?.kind === "source" && activeDataSource.source.name === target.name) {
-              setActiveDataSource({ ...activeDataSource, source: { ...target } })
-            }
-            refreshSourcesView(true)
-            setSourcesStatus(`Source "${target.name}" is now ${target.trusted ? "trusted" : "untrusted"}.`)
-          } catch (error: any) {
-            setSourcesStatus(terminalSafeText(error?.message || error))
-          }
-        }
+        toggleFocusedSourceTrust()
       } else if (key === "x" || key === "delete" || key === "backspace") {
-        const row = sourceModalRows[sourcesFocusIndex]
-        if (row?.kind === "registered") {
-          try {
-            const registry = loadSources()
-            removeSource(registry, row.source.name)
-            saveSources(registry)
-            if (activeDataSource?.kind === "source" && activeDataSource.source.name === row.source.name) {
-              const fallback = registry.sources[0]
-              if (fallback) {
-                try {
-                  switchToDataSource({ kind: "source", source: fallback, root: sourceRoot(fallback) })
-                  openSourcesModal(true)
-                } catch {
-                  setActiveDataSource(null)
-                  setAgents([])
-                }
-              } else {
-                setActiveDataSource(null)
-                setAgents([])
-              }
-            }
-            refreshSourcesView(true)
-            setSourcesStatus(`Removed source "${row.source.name}".`)
-          } catch (error: any) {
-            setSourcesStatus(terminalSafeText(error?.message || error))
-          }
-        }
+        removeFocusedSource()
       } else if (key === "enter" || key === "return") {
-        const row = sourceModalRows[sourcesFocusIndex]
-        if (row?.kind === "registered") activateRegisteredSource(row.source)
-        else if (row?.kind === "gh-repo") attachNewSourceSpec(`github:${row.repo.nameWithOwner}`)
-        else if (row?.kind === "connect-input") attachNewSourceSpec(row.spec)
+        if (effectivePane === "inspector") runTargetReconcile()
+        else activateSourceRowAtIndex(sourcesFocusIndex)
       }
       return
     }
 
-    // 2. Main view mode
-    if (viewMode === "main") {
-      if (key === "o") {
+    if (viewMode === "main" && workspaceTab === "flows") {
+      const flowBudget = wsViewports.flowsRows
+      const clampFlowScroll = (nextIndex: number, total: number) => {
+        setFlowsScrollOffset(offset => clampListScroll(nextIndex, total, offset, flowBudget))
+      }
+      const currentFlowNavRow = flowsNav.rows[Math.max(0, Math.min(flowsFocusIndex, Math.max(0, flowsNav.rows.length - 1)))] ?? null
+      const flowsInsp = buildFlowsInspectorItems(currentFlowNavRow, agents, packFlowsByCategory, flowsNav.agentByShortName)
+      if (key === "tab") {
+        setWorkspaceTab(e.shift ? "catalog" : "sources")
+        if (!e.shift) refreshSourcesView(true)
+      } else if ((e.shift && key === "left") || rawChar === "[") {
+        setActivePane("list")
+      } else if ((e.shift && key === "right") || rawChar === "]") {
+        if (layout.showInspector) setActivePane("inspector")
+      } else if (rawChar === "?") {
+        openHelpGuide("flows")
+      } else if (key === "escape") {
+        if (effectivePane === "inspector") setActivePane("list")
+        else setWorkspaceTab("catalog")
+      } else if (key === "o") {
         openSourcesModal()
+      } else if (isUppercaseU) {
+        openSelfUpdateModal()
       } else if (key === "l" && isUppercaseL) {
-        if (!isSearching) { setLayoutSnapshot(appliedShare); setLayoutDraft(appliedShare); setLayoutError(""); setLayoutStatus(""); setViewMode("layout") }
-      } else if ((key === "up" || key === "k") && (inspectorTab === "security" || inspectorTab === "delegations") && currentItem?.agent) {
+        executeActionById("layout-adjust")
+      } else if (effectivePane === "inspector" && (key === "up" || key === "k" || key === "down" || key === "j" || key === "pageup" || key === "pagedown")) {
+        const total = flowsInsp.items.length
+        if (!total) return
+        const delta = key === "pageup" ? -4 : key === "pagedown" ? 4 : key === "up" || key === "k" ? -1 : 1
+        const next = key === "pageup" || key === "pagedown"
+          ? Math.max(0, Math.min(total - 1, flowsInspectorFocus + delta))
+          : (flowsInspectorFocus + delta + total) % total
+        setFlowsInspectorFocus(next)
+      } else if (key === "up" || key === "k" || key === "down" || key === "j") {
+        if (!flowsNav.rows.length) return
+        const delta = key === "up" || key === "k" ? -1 : 1
+        const next = (flowsFocusIndex + delta + flowsNav.rows.length) % flowsNav.rows.length
+        setFlowsFocusIndex(next)
+        clampFlowScroll(next, flowsNav.rows.length)
+      } else if (key === "pageup" || key === "pagedown") {
+        if (!flowsNav.rows.length) return
+        const delta = key === "pageup" ? -flowBudget : flowBudget
+        const next = Math.max(0, Math.min(flowsNav.rows.length - 1, flowsFocusIndex + delta))
+        setFlowsFocusIndex(next)
+        clampFlowScroll(next, flowsNav.rows.length)
+      } else if (key === "m") {
+        executeActionById("pack-flows")
+      } else if (key === "g") {
+        executeActionById("agent-delegations")
+      } else if (key === "b" && !e.shift) {
+        openBridgeModalAction("claude")
+      } else if (key === "b" && e.shift) {
+        openBridgeModalAction("codex")
+      } else if (key === "e") {
+        executeActionById("pack-install")
+      } else if (key === "i" && isWorkspaceVirtualPack) {
+        openInitPackModal()
+      } else if (key === "d" && !isWorkspaceVirtualPack && !isReadOnlyGitSource) {
+        openPackDoctorModal("doctor")
+      } else if (key === "n" && !isWorkspaceVirtualPack && !isReadOnlyGitSource) {
+        openPackDoctorModal("scaffold")
+      } else if (key === "enter" || key === "return") {
+        if (effectivePane === "inspector") {
+          const item = flowsInsp.items[Math.max(0, Math.min(flowsInspectorFocus, Math.max(0, flowsInsp.items.length - 1)))]
+          if (item?.kind === "flow") {
+            openPackFlowsModal(item.pack, item.flowIndex)
+          } else if (item?.kind === "subagent" && item.targetAgent) {
+            setActivePane("list")
+            jumpToCatalogAgent(item.targetAgent.currentPath)
+          }
+        } else {
+          executeActionById("flow-jump")
+        }
+      }
+      return
+    }
+
+    // 2. Main Catalog view mode
+    if (viewMode === "main") {
+      if (key === "tab") {
+        setWorkspaceTab(e.shift ? "sources" : "flows")
+        if (e.shift) refreshSourcesView(true)
+      } else if ((e.shift && key === "left") || rawChar === "[") {
+        setActivePane("list")
+      } else if ((e.shift && key === "right") || rawChar === "]") {
+        if (layout.showInspector) setActivePane("inspector")
+      } else if (key === "escape" && effectivePane === "inspector") {
+        setActivePane("list")
+      } else if (rawChar === "?") {
+        openHelpGuide("catalog")
+      } else if (key === "o") {
+        openSourcesModal()
+      } else if (isUppercaseU) {
+        openSelfUpdateModal()
+      } else if (key === "l" && isUppercaseL) {
+        if (!isSearching) executeActionById("layout-adjust")
+      } else if (effectivePane === "inspector" && (key === "left" || key === "h") && !e.shift) {
+        const idx = INSPECTOR_TABS.indexOf(inspectorTab)
+        const nextTab = INSPECTOR_TABS[(idx - 1 + INSPECTOR_TABS.length) % INSPECTOR_TABS.length]!
+        setInspectorTab(nextTab)
+        if (nextTab === "security" || nextTab === "delegations") setGraphScrollOffset(0)
+        if (nextTab === "resources") setResourceScrollIndex(0)
+      } else if (effectivePane === "inspector" && (key === "right" || (key === "l" && !isUppercaseL)) && !e.shift) {
+        const idx = INSPECTOR_TABS.indexOf(inspectorTab)
+        const nextTab = INSPECTOR_TABS[(idx + 1) % INSPECTOR_TABS.length]!
+        setInspectorTab(nextTab)
+        if (nextTab === "security" || nextTab === "delegations") setGraphScrollOffset(0)
+        if (nextTab === "resources") setResourceScrollIndex(0)
+      } else if ((key === "up" || key === "k") && effectivePane === "inspector" && inspectorTab === "overview" && currentItem) {
+        setOverviewScrollOffset(offset => Math.max(0, offset - 1))
+      } else if ((key === "down" || key === "j") && effectivePane === "inspector" && inspectorTab === "overview" && currentItem) {
+        const mdText = currentItem.type === "file" && currentItem.agent
+          ? (currentItem.agent.description || "No description provided.")
+          : packDescription(currentItem.category)
+        const total = layoutMarkdownDocument(mdText, Math.max(16, panelWidths.inspector - 8)).length
+        const page = Math.max(2, maxVisibleItems - (currentItem.type === "file" ? 7 : 6))
+        setOverviewScrollOffset(offset => Math.min(Math.max(0, total - page), offset + 1))
+      } else if ((key === "up" || key === "k") && effectivePane === "inspector" && inspectorTab === "prompt" && currentItem?.agent) {
+        setPromptScrollOffset(offset => Math.max(0, offset - 1))
+      } else if ((key === "down" || key === "j") && effectivePane === "inspector" && inspectorTab === "prompt" && currentItem?.agent) {
+        const body = extractFrontmatter(currentItem.agent.rawContent).body.trim() || "*Empty system prompt body.*"
+        const total = layoutMarkdownDocument(body, Math.max(16, panelWidths.inspector - 8)).length
+        const page = Math.max(1, wsViewports.promptRows - 1)
+        setPromptScrollOffset(offset => Math.min(Math.max(0, total - page), offset + 1))
+      } else if ((key === "up" || key === "k") && effectivePane === "inspector" && inspectorTab === "delegations" && currentItem?.agent) {
+        const allowed = currentItem.agent.allowedSubagents || []
+        if (allowed.length > 0) {
+          const next = (catalogDelFocus - 1 + allowed.length) % allowed.length
+          setCatalogDelFocus(next)
+          setGraphScrollOffset(off => clampListScroll(next, allowed.length, off, wsViewports.delegationsInspectorRows))
+        }
+      } else if ((key === "down" || key === "j") && effectivePane === "inspector" && inspectorTab === "delegations" && currentItem?.agent) {
+        const allowed = currentItem.agent.allowedSubagents || []
+        if (allowed.length > 0) {
+          const next = (catalogDelFocus + 1) % allowed.length
+          setCatalogDelFocus(next)
+          setGraphScrollOffset(off => clampListScroll(next, allowed.length, off, wsViewports.delegationsInspectorRows))
+        }
+      } else if ((key === "up" || key === "k") && effectivePane === "inspector" && inspectorTab === "security" && currentItem?.agent) {
         setGraphScrollOffset((offset) => Math.max(0, offset - 1))
-      } else if ((key === "up" || key === "k") && inspectorTab === "resources" && activeItems[focusedIndex]?.agent) {
+      } else if ((key === "up" || key === "k") && effectivePane === "inspector" && inspectorTab === "resources" && activeItems[focusedIndex]?.agent) {
         setResourceScrollIndex((offset) => Math.max(0, offset - 1))
-      } else if ((key === "down" || key === "j") && (inspectorTab === "security" || inspectorTab === "delegations") && currentItem?.agent) {
-        const itemCount = inspectorTab === "security"
-          ? Object.keys(currentItem.agent.frontmatter.permission || {}).filter((key) => key !== "task").length
-          : (currentItem.agent.allowedSubagents || []).length
-        setGraphScrollOffset((offset) => Math.min(Math.max(0, itemCount - Math.max(1, maxVisibleItems - 2)), offset + 1))
-      } else if ((key === "down" || key === "j") && inspectorTab === "resources" && activeItems[focusedIndex]?.agent) {
-        setResourceScrollIndex((offset) => Math.min(Math.max(0, resourceInspectorLines.length - Math.max(1, layout.listRows - 5)), offset + 1))
+      } else if ((key === "down" || key === "j") && effectivePane === "inspector" && inspectorTab === "security" && currentItem?.agent) {
+        const hasErr = analyzePermissionOrder(currentItem.agent).hasOrderError
+        const secViewport = calculateWorkspaceViewports(termHeight, { hasSecurityOrderError: hasErr })
+        const pageSize = secViewport.securityRows
+        const itemCount = Object.keys(currentItem.agent.frontmatter.permission || {}).filter((k) => k !== "task").length
+        setGraphScrollOffset((offset) => Math.min(Math.max(0, itemCount - pageSize), offset + 1))
+      } else if ((key === "down" || key === "j") && effectivePane === "inspector" && inspectorTab === "resources" && activeItems[focusedIndex]?.agent) {
+        setResourceScrollIndex((offset) => Math.min(Math.max(0, resourceInspectorLines.length - wsViewports.resourcesInspectorRows), offset + 1))
       } else if (key === "up" || key === "k") {
         if (activeItems.length === 0) return
-        setFocusedIndex((prev) => {
-          const next = prev > 0 ? prev - 1 : activeItems.length - 1
-          return next
-        })
-        updateScroll(focusedIndex > 0 ? focusedIndex - 1 : activeItems.length - 1)
+        const next = focusedIndex > 0 ? focusedIndex - 1 : activeItems.length - 1
+        setFocusedIndex(next)
+        updateScroll(next)
       } else if (key === "down" || key === "j") {
         if (activeItems.length === 0) return
-        setFocusedIndex((prev) => {
-          const next = prev < activeItems.length - 1 ? prev + 1 : 0
-          return next
-        })
-        updateScroll(focusedIndex < activeItems.length - 1 ? focusedIndex + 1 : 0)
+        const next = focusedIndex < activeItems.length - 1 ? focusedIndex + 1 : 0
+        setFocusedIndex(next)
+        updateScroll(next)
+      } else if (key === "enter" || key === "return") {
+        if (effectivePane === "inspector" && inspectorTab === "delegations" && currentItem?.agent) {
+          const allowed = currentItem.agent.allowedSubagents || []
+          const targetName = allowed[catalogDelFocus]
+          const targetAg = targetName ? agents.find(a => a.filename.replace(/\.md$/, "") === targetName) : undefined
+          if (targetAg) {
+            setActivePane("list")
+            jumpToCatalogAgent(targetAg.currentPath)
+          }
+          return
+        }
+        const item = activeItems[focusedIndex]
+        if (item?.type === "folder") toggleFolderAtFocused()
+        else if (item?.type === "file") openModelOrFlowsAction()
       } else if (key === "left" || key === "h") {
         if (activeItems.length > 0) {
           const item = activeItems[focusedIndex]
@@ -1514,259 +3302,83 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
           }
         }
       } else if (key === "space") {
-        if (activeItems.length > 0) {
-          const item = activeItems[focusedIndex]
-          if (item.type === "file" && item.agent) {
-            const path = item.agent.currentPath
-            setSelectedAgentPaths((prev) => {
-              const next = new Set(prev)
-              if (next.has(path)) {
-                next.delete(path)
-              } else {
-                next.add(path)
-              }
-              return next
-            })
-          }
-        }
+        const item = activeItems[focusedIndex]
+        if (item?.type === "file" && item.agent) toggleSelectionAtPath(item.agent.currentPath)
       } else if (key === "a") {
-        if (activeItems.length > 0) {
-          const item = activeItems[focusedIndex]
-          const folderCategory = item.category
-          const folderAgents = agents.filter((a) => a.category === folderCategory)
-          const folderAgentPaths = folderAgents.map((a) => a.currentPath)
-
-          setSelectedAgentPaths((prev) => {
-            const next = new Set(prev)
-            const allSelected = folderAgentPaths.every((path) => next.has(path))
-            if (allSelected) {
-              folderAgentPaths.forEach((path) => next.delete(path))
-            } else {
-              folderAgentPaths.forEach((path) => next.add(path))
-            }
-            return next
-          })
-        }
+        executeActionById("select-category")
       } else if (key === "s") {
-        if (activeItems.length > 0) {
-          const item = activeItems[focusedIndex]
-          if (item.type === "file" && item.agent) {
-            const targetModel = item.agent.model
-            const targetCategory = item.category
-
-            const matchingAgents = agents.filter((a) => {
-              const modelMatch = a.model === targetModel
-              const categoryMatch = a.category === targetCategory
-              return modelMatch && categoryMatch
-            })
-
-            const matchingAgentPaths = matchingAgents.map((a) => a.currentPath)
-
-            setSelectedAgentPaths((prev) => {
-              const next = new Set(prev)
-              const allSelected = matchingAgentPaths.every((path) => next.has(path))
-              if (allSelected) {
-                matchingAgentPaths.forEach((path) => next.delete(path))
-              } else {
-                matchingAgentPaths.forEach((path) => next.add(path))
-              }
-              return next
-            })
-          }
-        }
+        executeActionById("select-same-model")
       } else if (key === "/") {
         setIsSearching(true)
       } else if (key === "i" && isWorkspaceVirtualPack) {
         openInitPackModal()
+      } else if (key === "d" && !isWorkspaceVirtualPack && !isReadOnlyGitSource) {
+        openPackDoctorModal("doctor")
+      } else if (key === "n" && !isWorkspaceVirtualPack && !isReadOnlyGitSource) {
+        openPackDoctorModal("scaffold")
       } else if (key === "m") {
-        const focusedFolder = activeItems[focusedIndex]
-        if (selectedAgentPaths.size === 0 && focusedFolder?.type === "folder" && isConfigurablePack(workspaceRoot, focusedFolder.category)) {
-          setRoutingArchetype(focusedFolder.category)
-          setRoutingFocus(0)
-          setRoutingConfirmDelete(false)
-          setRoutingStatus("")
-          setViewMode("routing-configs")
-          return
-        }
-        if (modelCatalog.status !== "verified") {
-          setActionResultTitle("Model Catalog Unavailable")
-          setActionResultLines(["Models are not present in the loaded catalog.", "No model writes or suggestions are available.", "Press Y to retry refreshing the model catalog."])
-          setViewMode("action-result")
-          return
-        }
-        if (activeItems.length === 0 || (!activeItems[focusedIndex]?.agent && selectedAgentPaths.size === 0)) {
-          setActionResultTitle("No Agent Focused")
-           setActionResultLines([
-             "Select at least one agent (SPACE) to change its model,",
-             "or focus a pack folder and press M to configure conditional IF/OR flows."
-           ])
-          setViewMode("action-result")
-        } else {
-          const current = activeItems[focusedIndex]?.agent?.frontmatter?.model
-          if (typeof current === "string" && current.includes("/")) setExpandedProviders(previous => new Set([...previous, current.split("/")[0]]))
-          setFocusedModelIndex(0)
-          setModelScrollOffset(0)
-          setViewMode("model-selector")
-        }
+        openModelOrFlowsAction()
       } else if (key === "v") {
-        if (modelCatalog.status === "verified" && invalidModelGroups.length > 0) {
-          setRepairMappings({})
-          setRepairGroupKey("0")
-          setFocusedModelIndex(0)
-          setModelScrollOffset(0)
-          setViewMode("repair-selector")
-        }
+        executeActionById("repair-models")
       } else if (key === "t" && e.shift) {
-        if (activeItems.length === 0 || !activeItems[focusedIndex]?.agent) {
-          setActionResultTitle("No Agent Focused")
-          setActionResultLines(["Please focus an agent (or select agents using SPACE)", "before assigning a tier."])
-          setViewMode("action-result")
-        } else {
-          setFocusedTierIndex(0)
-          setTierScrollOffset(0)
-          setViewMode("tier-selector")
-        }
+        executeActionById("agent-tier")
       } else if (key === "b" && !e.shift) {
-        if (activeItems.length > 0 && activeDataSource) {
-          let config = translationConfig
-          try {
-            config = loadTranslationFor(activeDataSource)
-            setTranslationConfig(config)
-          } catch {
-            // Keep the in-memory config; generateBridge surfaces the load error on submit.
-          }
-          setBridgeTarget("claude")
-          setBridgeModelTarget(config?.claude.modelMap?.["*"] || "")
-          setBridgePluginName(config?.pluginName || "decent-pipeline")
-          setBridgePipelinePrefix(config?.prefix || "")
-          setBridgeFocusedField("name")
-          setViewMode("bridge-prompt")
-        }
+        openBridgeModalAction("claude")
       } else if (key === "b" && e.shift) {
-        if (activeItems.length > 0 && activeDataSource) {
-          let config = translationConfig
-          try {
-            config = loadTranslationFor(activeDataSource)
-            setTranslationConfig(config)
-          } catch {
-            // Keep the in-memory config; generateBridge surfaces the load error on submit.
-          }
-          setBridgeTarget("codex")
-          setBridgeModelTarget(config?.codex.modelMap?.["*"] || "")
-          setBridgePluginName(config?.pluginName || "decent-pipeline")
-          setBridgePipelinePrefix(config?.prefix || "")
-          setBridgeFocusedField("name")
-          setViewMode("bridge-prompt")
-        }
+        openBridgeModalAction("codex")
       } else if (key === "e") {
         const focused = activeItems[focusedIndex]
         if (focused) previewInstall(focused.category)
       } else if (key === "c") {
-        if (activeItems.length === 0 || !activeItems[focusedIndex]?.agent) {
-          setActionResultTitle("No Agent Focused")
-          setActionResultLines([
-            "Please select at least one agent (using SPACE)",
-            "before trying to change the color."
-          ])
-          setViewMode("action-result")
-        } else {
-          setFocusedColorIndex(0)
-          setColorScrollOffset(0)
-          setViewMode("color-selector")
-        }
+        executeActionById("agent-color")
       } else if (key === "r") {
-        if (activeItems.length > 0) {
-          if (isReadOnlyGitSource) {
-            setActionResultTitle("Read-Only GitHub Source")
-            setActionResultLines([
-              "Renaming agent files requires a local pack workspace.",
-              "Model, routing, color, permissions, delegations, resources and parameter changes",
-              "on GitHub sources are saved in user settings (overrides.json / routing.json).",
-            ])
-            setViewMode("action-result")
-          } else {
-            const item = activeItems[focusedIndex]
-            if (item.type === "file" && item.agent) {
-              const analysis = analyzeAgentName(item.agent.filename, allAgentFilenames)
-              setRenameTargetAgent(item.agent)
-              setRenameFamily(analysis.family || "")
-              setRenameCategory(analysis.category || "")
-              setRenameRole((analysis.role || "").replace(/[\s-]/g, "_"))
-              setRenameFocusedField("role")
-              setViewMode("rename-prompt")
-            }
-          }
-        }
+        executeActionById("agent-rename")
       } else if (key === "p") {
-        if (activeItems.length > 0 && activeItems[focusedIndex]?.agent) {
-          setFocusedPresetIndex(0)
-          setViewMode("permission-preset")
-        }
+        executeActionById("agent-permissions")
       } else if (key === "g") {
-        if (activeItems.length > 0 && activeItems[focusedIndex]?.agent) {
-          const target = activeItems[focusedIndex].agent!
-          setDelegationTargetAgent(target)
-          setSelectedDelegations(new Set(target.allowedSubagents || []))
-          setFocusedDelegationIndex(0)
-          setDelegationScrollOffset(0)
-          setViewMode("delegation-manager")
-        }
+        executeActionById("agent-delegations")
       } else if (key === "u") {
-        const target = activeItems[focusedIndex]
-        if (target?.type === "file" && target.agent) openResourceManager(target.agent)
-        else setLayoutStatus("Focus an agent to manage its skills, tools and MCP permissions.")
+        executeActionById("agent-resources")
       } else if (key === "t") {
-        if (activeItems.length > 0) {
-          const focusedItem = activeItems[focusedIndex]
-          const targetAgents = selectedAgentPaths.size > 0
-            ? agents.filter(a => selectedAgentPaths.has(a.currentPath))
-            : focusedItem?.type === "folder"
-              ? agents.filter(a => a.category === focusedItem.category)
-              : focusedItem?.agent ? [focusedItem.agent] : []
-          if (targetAgents.length === 0) return
-          const summary = inspectTuningTargets(targetAgents)
-          setTuningTargetPaths(targetAgents.map((a) => a.currentPath))
-          setTuningSteps(summary.steps.value)
-          setTuningTemp(summary.temp.value)
-          setTuningVariant(summary.variant.value)
-          setTuningMode(summary.mode.value)
-          setTuningHidden(summary.hidden.value)
-          setTuningDirtyFields(new Set())
-          setTuningFocusedField("steps")
-          setViewMode("parameter-tuning")
-        }
+        openTuningModalAction()
       } else if (key === "1") {
         setInspectorTab("overview")
       } else if (key === "2") {
-        setInspectorTab("naming")
+        setInspectorTab("prompt")
       } else if (key === "3") {
+        setInspectorTab("naming")
+      } else if (key === "4") {
         setInspectorTab("security")
         setGraphScrollOffset(0)
-      } else if (key === "4") {
+      } else if (key === "5") {
         setInspectorTab("delegations")
         setGraphScrollOffset(0)
-      } else if (key === "5") {
+      } else if (key === "6") {
         setInspectorTab("resources")
         setResourceScrollIndex(0)
+      } else if (key === "pageup" && inspectorTab === "prompt" && currentItem?.agent) {
+        const page = Math.max(1, wsViewports.promptRows - 1)
+        setPromptScrollOffset(offset => Math.max(0, offset - page))
+      } else if (key === "pagedown" && inspectorTab === "prompt" && currentItem?.agent) {
+        const body = extractFrontmatter(currentItem.agent.rawContent).body.trim() || "*Empty system prompt body.*"
+        const total = layoutMarkdownDocument(body, Math.max(16, panelWidths.inspector - 8)).length
+        const page = Math.max(1, wsViewports.promptRows - 1)
+        setPromptScrollOffset(offset => Math.min(Math.max(0, total - page), offset + page))
       } else if (key === "pageup" && inspectorTab === "resources") {
         setResourceScrollIndex(offset => Math.max(0, offset - resourceInspectorPageSize))
       } else if (key === "pagedown" && inspectorTab === "resources") {
         setResourceScrollIndex(offset => Math.min(Math.max(0, resourceInspectorLines.length - resourceInspectorPageSize), offset + resourceInspectorPageSize))
-      } else if (key === "pageup" && (inspectorTab === "security" || inspectorTab === "delegations")) {
-        const graphPageSize = Math.max(1, maxVisibleItems - 2)
+      } else if ((key === "pageup" || key === "pagedown") && (inspectorTab === "security" || inspectorTab === "delegations")) {
+        const ag = activeItems[focusedIndex]?.agent
+        const hasErr = Boolean(ag && inspectorTab === "security" && analyzePermissionOrder(ag).hasOrderError)
+        const secViewport = calculateWorkspaceViewports(termHeight, { hasSecurityOrderError: hasErr })
+        const graphPageSize = inspectorTab === "security" ? secViewport.securityRows : secViewport.delegationsInspectorRows
         setGraphScrollOffset((offset) => {
           const graphTotal = inspectorTab === "security"
-            ? Object.entries(activeItems[focusedIndex]?.agent?.frontmatter.permission || {}).filter(([key]) => key !== "task").length
-            : activeItems[focusedIndex]?.agent?.allowedSubagents?.length || 0
-          return Math.max(0, Math.min(Math.max(0, graphTotal - graphPageSize), offset - graphPageSize))
-        })
-      } else if (key === "pagedown" && (inspectorTab === "security" || inspectorTab === "delegations")) {
-        const graphPageSize = Math.max(1, maxVisibleItems - 2)
-        setGraphScrollOffset((offset) => {
-          const graphTotal = inspectorTab === "security"
-            ? Object.entries(activeItems[focusedIndex]?.agent?.frontmatter.permission || {}).filter(([key]) => key !== "task").length
-            : activeItems[focusedIndex]?.agent?.allowedSubagents?.length || 0
-          return Math.min(Math.max(0, graphTotal - graphPageSize), offset + graphPageSize)
+            ? Object.entries(ag?.frontmatter.permission || {}).filter(([k]) => k !== "task").length
+            : ag?.allowedSubagents?.length || 0
+          const delta = key === "pageup" ? -graphPageSize : graphPageSize
+          return Math.max(0, Math.min(Math.max(0, graphTotal - graphPageSize), offset + delta))
         })
       } else if (isUppercaseF && inspectorTab === "security" && activeItems[focusedIndex]?.agent) {
         const ag = activeItems[focusedIndex].agent!
@@ -2016,12 +3628,12 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         const direction = key === "up" || key === "k" ? -1 : 1
         const next = (focusedTierIndex + direction + tiers.length) % tiers.length
         setFocusedTierIndex(next)
-        setTierScrollOffset(Math.max(0, Math.min(Math.max(0, tiers.length - maxVisibleTiers), next)))
+        setTierScrollOffset(offset => clampListScroll(next, tiers.length, offset, maxVisibleTiers))
       } else if (key === "pageup" || key === "pagedown") {
         const delta = key === "pageup" ? -maxVisibleTiers : maxVisibleTiers
         const next = Math.max(0, Math.min(Math.max(0, tiers.length - 1), focusedTierIndex + delta))
         setFocusedTierIndex(next)
-        setTierScrollOffset(Math.max(0, Math.min(Math.max(0, tiers.length - maxVisibleTiers), next)))
+        setTierScrollOffset(offset => clampListScroll(next, tiers.length, offset, maxVisibleTiers))
       } else if (key === "enter" || key === "return") {
         const chosenTier = tiers[focusedTierIndex]
         if (!chosenTier || !translationConfig) return
@@ -2055,26 +3667,82 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         setViewMode("main")
       }
     } else if (viewMode === "bridge-prompt") {
-      // 6. Bridge to Claude Code prompt mode
+      // 6. Bridge to Claude Code / Codex modal with inline tier management & live mapping
+      const isNativeInputField =
+        bridgeFocusedField === "name" ||
+        bridgeFocusedField === "pack" ||
+        bridgeFocusedField === "model" ||
+        (bridgeTarget === "codex" && bridgeFocusedField === "tiers")
+
       if (key === "escape") {
+        setBridgeClaudeTierTyping(false)
         setViewMode("main")
+      } else if (e.ctrl && key === "s") {
+        saveBridgeTiersOnly()
+      } else if ((key === "enter" || key === "return") && !isNativeInputField) {
+        generateBridge()
       } else if (key === "tab") {
-        if (bridgeFocusedField === "prefix" && filteredBridgePrefixSuggestions.length > 0) {
-          setBridgePipelinePrefix(filteredBridgePrefixSuggestions[bridgeSuggestionIndex].prefix)
-        }
-        setBridgeFocusedField((prev) => prev === "name" ? "prefix" : prev === "prefix" ? "model" : "name")
+        setBridgeClaudeTierTyping(false)
+        setBridgeFocusedField(prev => stepBridgeField(prev, Boolean(e.shift), bridgeTarget))
       } else if (key === "up" || key === "down") {
-        if (bridgeFocusedField === "prefix" && filteredBridgePrefixSuggestions.length > 0) {
-            setBridgeSuggestionIndex(index => {
-             const delta = key === "down" ? 1 : -1
-             const length = filteredBridgePrefixSuggestions.length
-             const next = (index + delta + length) % length
-             setBridgeSuggestionScrollOffset(offset => next < offset ? next : next >= offset + 5 ? next - 4 : offset)
-             return next
-           })
+        const delta: 1 | -1 = key === "down" ? 1 : -1
+        setBridgeClaudeTierTyping(false)
+        if (bridgeFocusedField === "pack" && filteredBridgePacks.length > 0) {
+          const next = stepBridgePackSelection(
+            filteredBridgePacks,
+            bridgePackIndex,
+            delta,
+            bridgePackScrollOffset,
+            bridgePackViewportRows,
+          )
+          setBridgePackIndex(next.index)
+          setBridgePackScrollOffset(next.scrollOffset)
+          setBridgeSelectedPack(next.selectedPack)
+          setBridgeAgentIndex(0)
+          setBridgeAgentScrollOffset(0)
+        } else if ((bridgeFocusedField === "tiers" || bridgeFocusedField === "effort") && bridgeTierNames.length > 0) {
+          const nextIndex = (bridgeTierIndex + delta + bridgeTierNames.length) % bridgeTierNames.length
+          setBridgeTierIndex(nextIndex)
+          setBridgeTierScrollOffset(off => clampListScroll(nextIndex, bridgeTierNames.length, off, bridgeModalLayout.tierViewportRows))
+        } else if (bridgeFocusedField === "agents" && bridgePreview.items.length > 0) {
+          const nextIndex = (bridgeAgentIndex + delta + bridgePreview.items.length) % bridgePreview.items.length
+          setBridgeAgentIndex(nextIndex)
+          setBridgeAgentScrollOffset(off => clampListScroll(nextIndex, bridgePreview.items.length, off, bridgeModalLayout.agentViewportRows))
         } else {
-          setBridgeFocusedField((prev) => prev === "name" ? "prefix" : prev === "prefix" ? "model" : "name")
+          setBridgeFocusedField(prev => stepBridgeField(prev, key === "up", bridgeTarget))
         }
+      } else if (key === "left" || key === "right" || (key === "space" && !isNativeInputField)) {
+        const delta: 1 | -1 = key === "left" ? -1 : 1
+        if (bridgeFocusedField === "tiers" && bridgeTarget === "claude" && bridgeTierNames.length > 0) {
+          const tierName = bridgeTierNames[bridgeTierIndex]
+          const currentModel = bridgeDraftTiers[tierName]?.claude.model ?? "sonnet"
+          setBridgeClaudeTierTyping(false)
+          updateBridgeTierModel(tierName, cyclePresetValue(CLAUDE_TIER_MODEL_PRESETS, currentModel, delta))
+        } else if (bridgeFocusedField === "effort" && bridgeTarget === "codex" && bridgeTierNames.length > 0) {
+          const tierName = bridgeTierNames[bridgeTierIndex]
+          const currentEffort = bridgeDraftTiers[tierName]?.codex.reasoningEffort || "high"
+          updateBridgeTierEffort(tierName, cyclePresetValue(CODEX_EFFORT_PRESETS, currentEffort, delta))
+        } else if (bridgeFocusedField === "agents" && bridgePreview.items.length > 0) {
+          cycleBridgeAgentTierAt(bridgeAgentIndex, delta)
+        }
+      } else if (bridgeFocusedField === "tiers" && bridgeTarget === "claude" && bridgeTierNames.length > 0) {
+        const tierName = bridgeTierNames[bridgeTierIndex]
+        const currentModel = bridgeDraftTiers[tierName]?.claude.model ?? ""
+        if (key === "backspace" || key === "delete") {
+          setBridgeClaudeTierTyping(true)
+          updateBridgeTierModel(tierName, currentModel.slice(0, -1))
+        } else if (rawChar && /^[a-zA-Z0-9._-]$/.test(rawChar) && !e.ctrl && !e.meta) {
+          const base = bridgeClaudeTierTyping ? currentModel : ""
+          setBridgeClaudeTierTyping(true)
+          updateBridgeTierModel(tierName, `${base}${rawChar.toLowerCase()}`)
+        }
+      }
+    } else if (viewMode === "bridge-confirm") {
+      if (key === "y" || key === "enter" || key === "return") {
+        generateBridge(true)
+      } else if (key === "n" || key === "escape") {
+        setBridgeConfirmReasons([])
+        setViewMode("bridge-prompt")
       }
     } else if (viewMode === "install-confirm") {
       if ((key === "y" || key === "enter" || key === "return") && installPreview && !installPreview.blocked) {
@@ -2085,41 +3753,27 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     } else if (viewMode === "routing-configs") {
       const flows = routingView?.flows ?? []
       const rows = flows.length + 1
+      const modalLayout = calculatePackFlowsModalLayout(termWidth, termHeight, {
+        hasPinned: Boolean(routingView?.pinned.length),
+        hasStatus: Boolean(routingStatus),
+      })
       const focusedFlow = flows[routingFocus]
       if (key === "escape") {
         setRoutingArchetype(null)
         setViewMode("main")
       } else if (key === "up" || key === "k" || key === "down" || key === "j") {
-        setRoutingFocus(focus => (focus + (key === "up" || key === "k" ? -1 : 1) + rows) % rows)
+        const next = (routingFocus + (key === "up" || key === "k" ? -1 : 1) + rows) % rows
+        setRoutingFocus(next)
+        setRoutingScroll(offset => clampListScroll(next, rows, offset, modalLayout.configViewportRows))
         setRoutingConfirmDelete(false)
       } else if (key === "c" && routingView) {
-        setCallerDraftSet(new Set(routingView.callers.map(c => c.name)))
-        setCallerFocus(0)
-        setRoutingStatus("")
-        setViewMode("routing-callers")
+        openRoutingCallersModal()
       } else if (key === "w" && routingView && !isReadOnlyGitSource && routingView.hasManifest) {
         exportRoutingToManifest()
       } else if (key === "i" && routingView && !isReadOnlyGitSource && !routingView.hasManifest) {
         openInitPackModal()
       } else if ((key === "enter" || key === "return") && routingView) {
-        setRoutingEditorFocus(focusedFlow ? (routingView.related.length > 0 ? 1 : 2) : 0)
-        setRoutingSelected(new Set())
-        setRoutingStatus("")
-        if (focusedFlow) {
-          setRoutingDraft({
-            previousKey: focusedFlow.key,
-            ...(focusedFlow.callers ? { callers: [...focusedFlow.callers] } : {}),
-            triggers: [...focusedFlow.triggers],
-            roles: { ...focusedFlow.roles },
-            tools: { ...focusedFlow.tools },
-            permissions: { ...focusedFlow.permissions },
-            delegations: { ...focusedFlow.delegations },
-          })
-          setViewMode("routing-editor")
-        } else {
-          setRoutingDraft({ triggers: [], roles: {}, tools: {}, permissions: {}, delegations: {} })
-          openRoutingPicker({ kind: "trigger" })
-        }
+        openRoutingBranchAtIndex(routingFocus)
       } else if ((key === "d" || key === "delete") && focusedFlow) {
         if (!routingConfirmDelete) {
           setRoutingConfirmDelete(true)
@@ -2131,10 +3785,16 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       }
     } else if (viewMode === "routing-callers") {
       const candidates = routingView?.callerCandidates ?? []
+      const callerViewportRows = calculatePackFlowsModalLayout(termWidth, termHeight, {
+        hasStatus: Boolean(routingStatus),
+      }).subviewViewportRows
       if (key === "escape") {
+        setRoutingConfirmDelete(false)
         setViewMode("routing-configs")
       } else if ((key === "up" || key === "k" || key === "down" || key === "j") && candidates.length > 0) {
-        setCallerFocus(f => (f + (key === "up" || key === "k" ? -1 : 1) + candidates.length) % candidates.length)
+        const next = (callerFocus + (key === "up" || key === "k" ? -1 : 1) + candidates.length) % candidates.length
+        setCallerFocus(next)
+        setCallerScroll(offset => clampListScroll(next, candidates.length, offset, callerViewportRows))
       } else if (key === "space" && candidates[callerFocus]) {
         const name = candidates[callerFocus].name
         setCallerDraftSet(prev => {
@@ -2144,42 +3804,37 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
           return next
         })
       } else if (key === "r" && routingArchetype) {
-        try {
-          saveUserPackCallers(workspaceRoot, routingArchetype, null, { applySourceOverrides: isReadOnlyGitSource })
-          setRoutingRevision(r => r + 1)
-          setRoutingStatus("Reset callers to pack / inferred defaults.")
-          void reconcileTargetIfInstalled("models")
-          setViewMode("routing-configs")
-        } catch (err: any) {
-          setRoutingStatus(`Error: ${terminalSafeText(err?.message || err)}`)
-        }
+        resetCallersToDefaultsAction()
       } else if ((key === "enter" || key === "return") && routingArchetype) {
-        try {
-          saveUserPackCallers(workspaceRoot, routingArchetype, [...callerDraftSet], { applySourceOverrides: isReadOnlyGitSource })
-          setRoutingRevision(r => r + 1)
-          setRoutingStatus(`Updated callers (OR): ${[...callerDraftSet].join(", ")}.`)
-          void reconcileTargetIfInstalled("models")
-          setViewMode("routing-configs")
-        } catch (err: any) {
-          setRoutingStatus(`Error: ${terminalSafeText(err?.message || err)}`)
-        }
+        saveCallersDraftAction()
       }
     } else if (viewMode === "routing-editor") {
       const related = routingView?.related ?? []
-      const toolsRowIdx = related.length + 1
-      const permsRowIdx = related.length + 2
-      const delegationsRowIdx = related.length + 3
       const rows = related.length + 4
+      const hasStaticDenyWarn = Boolean(
+        routingDraft &&
+          routingView &&
+          (Object.entries(routingDraft.tools).some(([k, v]) => v === "allow" && (routingView.staticDeniedTools.has(k) || routingView.staticDeniedTools.has("*"))) ||
+            Object.entries(routingDraft.delegations).some(([k, v]) => v === "allow" && (routingView.staticDeniedDelegations.has(k) || routingView.staticDeniedDelegations.has("*")))),
+      )
+      const editorViewportRows = calculatePackFlowsModalLayout(termWidth, termHeight, {
+        hasPinned: Boolean(routingView?.pinned.length),
+        hasStaticWarn: hasStaticDenyWarn,
+        hasStatus: Boolean(routingStatus),
+      }).editorViewportRows
       const focusedAgent = routingEditorFocus > 0 && routingEditorFocus <= related.length ? related[routingEditorFocus - 1] : undefined
       const targets = routingSelected.size > 0 ? related.filter(agent => routingSelected.has(agent.role)).map(agent => agent.role) : focusedAgent ? [focusedAgent.role] : []
       if (!routingDraft) {
         setViewMode("routing-configs")
       } else if (key === "escape") {
         if (routingSelected.size > 0) { setRoutingSelected(new Set()); return }
+        setRoutingConfirmDelete(false)
         setRoutingDraft(null)
         setViewMode("routing-configs")
       } else if (key === "up" || key === "k" || key === "down" || key === "j") {
-        setRoutingEditorFocus(focus => (focus + (key === "up" || key === "k" ? -1 : 1) + rows) % rows)
+        const next = (routingEditorFocus + (key === "up" || key === "k" ? -1 : 1) + rows) % rows
+        setRoutingEditorFocus(next)
+        setRoutingEditorScroll(offset => clampListScroll(next, rows, offset, editorViewportRows))
       } else if (key === "u") {
         setFlowSubFocus(0)
         setFlowSubScroll(0)
@@ -2202,22 +3857,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       } else if (key === "a" && related.length > 0) {
         setRoutingSelected(previous => previous.size === related.length ? new Set() : new Set(related.map(agent => agent.role)))
       } else if (key === "enter" || key === "return" || key === "m") {
-        if (routingEditorFocus === 0) openRoutingPicker({ kind: "trigger" }, routingDraft.triggers)
-        else if (routingEditorFocus === toolsRowIdx && key !== "m") {
-          setFlowSubFocus(0)
-          setFlowSubScroll(0)
-          setViewMode("routing-tools")
-        } else if (routingEditorFocus === permsRowIdx && key !== "m") {
-          setFlowSubFocus(0)
-          setFlowSubScroll(0)
-          setViewMode("routing-permissions")
-        } else if (routingEditorFocus === delegationsRowIdx && key !== "m") {
-          setFlowSubFocus(0)
-          setFlowSubScroll(0)
-          setViewMode("routing-delegations")
-        } else if (targets.length > 0) {
-          openRoutingPicker({ kind: "roles", roles: targets }, routingDraft.roles[targets[0]])
-        }
+        activateRoutingEditorRow(routingEditorFocus, key === "m")
       } else if ((key === "tab" || key === "left" || key === "right") && targets.length > 0) {
         const withModel = targets.filter(role => routingDraft.roles[role] && routingDraft.roles[role] !== INHERIT)
         if (withModel.length === 0) { setRoutingStatus("Choose a model first: variants belong to a model."); return }
@@ -2233,122 +3873,132 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         if (applyRoutingDraft({ ...routingDraft, roles })) setRoutingSelected(new Set())
       }
     } else if (viewMode === "routing-tools") {
-      const toolRows = [{ key: "*", label: "* (All tools fallback)", group: "builtin" as const, staticallyDeniedByCaller: false }, ...(routingView?.availableTools ?? [])]
-      const visibleCount = Math.max(2, Math.floor(termHeight * 0.72) - 8)
+      const toolRows = [{ key: "*" }, ...(routingView?.availableTools ?? [])]
+      const visibleCount = calculatePackFlowsModalLayout(termWidth, termHeight, { hasStatus: Boolean(routingStatus) }).subviewViewportRows
       if (!routingDraft || key === "escape" || key === "enter" || key === "return") {
         setViewMode("routing-editor")
       } else if ((key === "up" || key === "k" || key === "down" || key === "j") && toolRows.length > 0) {
         const next = (flowSubFocus + (key === "up" || key === "k" ? -1 : 1) + toolRows.length) % toolRows.length
         setFlowSubFocus(next)
-        setFlowSubScroll(offset => next < offset ? next : next >= offset + visibleCount ? next - visibleCount + 1 : offset)
+        setFlowSubScroll(offset => clampListScroll(next, toolRows.length, offset, visibleCount))
       } else if ((key === "space" || key === "left" || key === "right") && toolRows[flowSubFocus]) {
-        const targetKey = toolRows[flowSubFocus].key
-        const cycle: Array<PolicyEffect | undefined> = [undefined, "deny", "ask", "allow"]
-        const current = routingDraft.tools[targetKey]
-        const nextEffect = cycle[(cycle.indexOf(current) + (key === "left" ? -1 : 1) + cycle.length) % cycle.length]
-        const tools = { ...routingDraft.tools }
-        if (nextEffect === undefined) delete tools[targetKey]
-        else tools[targetKey] = nextEffect
-        applyRoutingDraft({ ...routingDraft, tools })
+        cycleRoutingSubPolicyAt(flowSubFocus, key === "left" ? -1 : 1)
       } else if ((key === "backspace" || key === "delete") && toolRows[flowSubFocus]) {
         const tools = { ...routingDraft.tools }
         delete tools[toolRows[flowSubFocus].key]
         applyRoutingDraft({ ...routingDraft, tools })
       }
     } else if (viewMode === "routing-permissions") {
-      const permRows = [
-        { key: "*", label: "* (All permissions fallback)" },
-        { key: "shell", label: "shell / bash (command execution)" },
-        { key: "edit", label: "edit / write (file modifications)" },
-        { key: "read", label: "read (file & directory reads)" },
-        { key: "webfetch", label: "webfetch (HTTP requests)" },
-        { key: "skill", label: "skill (load skills)" },
-        { key: "external_directory", label: "external_directory (outside workspace)" },
-      ]
+      const visiblePermCount = calculatePackFlowsModalLayout(termWidth, termHeight, { hasStatus: Boolean(routingStatus) }).subviewViewportRows
       if (!routingDraft || key === "escape" || key === "enter" || key === "return") {
         setViewMode("routing-editor")
       } else if (key === "up" || key === "k" || key === "down" || key === "j") {
-        setFlowSubFocus(f => (f + (key === "up" || key === "k" ? -1 : 1) + permRows.length) % permRows.length)
-      } else if ((key === "space" || key === "left" || key === "right") && permRows[flowSubFocus]) {
-        const targetKey = permRows[flowSubFocus].key
-        const cycle: Array<PolicyEffect | undefined> = [undefined, "deny", "ask", "allow"]
-        const current = routingDraft.permissions[targetKey]
-        const nextEffect = cycle[(cycle.indexOf(current) + (key === "left" ? -1 : 1) + cycle.length) % cycle.length]
+        const next = (flowSubFocus + (key === "up" || key === "k" ? -1 : 1) + PERMISSION_POLICY_ROWS.length) % PERMISSION_POLICY_ROWS.length
+        setFlowSubFocus(next)
+        setFlowSubScroll(offset => clampListScroll(next, PERMISSION_POLICY_ROWS.length, offset, visiblePermCount))
+      } else if ((key === "space" || key === "left" || key === "right") && PERMISSION_POLICY_ROWS[flowSubFocus]) {
+        cycleRoutingSubPolicyAt(flowSubFocus, key === "left" ? -1 : 1)
+      } else if ((key === "backspace" || key === "delete") && PERMISSION_POLICY_ROWS[flowSubFocus]) {
         const permissions = { ...routingDraft.permissions }
-        if (nextEffect === undefined) delete permissions[targetKey]
-        else permissions[targetKey] = nextEffect
-        applyRoutingDraft({ ...routingDraft, permissions })
-      } else if ((key === "backspace" || key === "delete") && permRows[flowSubFocus]) {
-        const permissions = { ...routingDraft.permissions }
-        delete permissions[permRows[flowSubFocus].key]
+        delete permissions[PERMISSION_POLICY_ROWS[flowSubFocus].key]
         applyRoutingDraft({ ...routingDraft, permissions })
       }
     } else if (viewMode === "routing-delegations") {
-      const delRows = [
-        { name: "*", label: "* (All subagents fallback)" },
-        ...(routingView?.subagents ?? []).map(sub => ({ name: sub.name, label: sub.name })),
-      ]
-      const visibleCount = Math.max(2, Math.floor(termHeight * 0.72) - 8)
+      const delRows = [{ name: "*" }, ...(routingView?.subagents ?? []).map(sub => ({ name: sub.name }))]
+      const visibleCount = calculatePackFlowsModalLayout(termWidth, termHeight, { hasStatus: Boolean(routingStatus) }).subviewViewportRows
       if (!routingDraft || key === "escape" || key === "enter" || key === "return") {
         setViewMode("routing-editor")
       } else if ((key === "up" || key === "k" || key === "down" || key === "j") && delRows.length > 0) {
         const next = (flowSubFocus + (key === "up" || key === "k" ? -1 : 1) + delRows.length) % delRows.length
         setFlowSubFocus(next)
-        setFlowSubScroll(offset => next < offset ? next : next >= offset + visibleCount ? next - visibleCount + 1 : offset)
+        setFlowSubScroll(offset => clampListScroll(next, delRows.length, offset, visibleCount))
       } else if ((key === "space" || key === "left" || key === "right") && delRows[flowSubFocus]) {
-        const targetName = delRows[flowSubFocus].name
-        const cycle: Array<DelegationEffect | undefined> = [undefined, "deny", "allow"]
-        const current = routingDraft.delegations[targetName]
-        const nextEffect = cycle[(cycle.indexOf(current) + (key === "left" ? -1 : 1) + cycle.length) % cycle.length]
-        const delegations = { ...routingDraft.delegations }
-        if (nextEffect === undefined) delete delegations[targetName]
-        else delegations[targetName] = nextEffect
-        applyRoutingDraft({ ...routingDraft, delegations })
+        cycleRoutingSubPolicyAt(flowSubFocus, key === "left" ? -1 : 1)
       } else if ((key === "backspace" || key === "delete") && delRows[flowSubFocus]) {
         const delegations = { ...routingDraft.delegations }
         delete delegations[delRows[flowSubFocus].name]
         applyRoutingDraft({ ...routingDraft, delegations })
       }
     } else if (viewMode === "pack-init") {
-      const fieldOrder: Array<"name" | "version" | "desc" | "organize"> = ["name", "version", "desc", "organize"]
+      const fieldOrder = getOnboardingFieldOrder(isReadOnlyGitSource)
       if (key === "escape") {
         setViewMode(routingArchetype ? "routing-configs" : "main")
       } else if (key === "tab" || key === "up" || key === "down") {
-        const delta = key === "up" ? -1 : 1
-        setInitPackField(f => fieldOrder[(fieldOrder.indexOf(f) + delta + fieldOrder.length) % fieldOrder.length])
-      } else if (key === "space" && initPackField === "organize") {
-        setInitPackOrganize(prev => !prev)
+        const delta = key === "up" || (key === "tab" && e.shift) ? -1 : 1
+        setInitPackField(f => {
+          const idx = Math.max(0, fieldOrder.indexOf(f))
+          return fieldOrder[(idx + delta + fieldOrder.length) % fieldOrder.length]
+        })
+      } else if ((key === "space" || key === "left" || key === "right") && (initPackField === "layout" || initPackField === "organize" || initPackField === "kit")) {
+        if (initPackField === "layout") setInitPackLayout(prev => (prev === "root" ? "subpack" : "root"))
+        else if (initPackField === "organize") setInitPackOrganize(prev => !prev)
+        else if (initPackField === "kit") setInitPackKit(prev => !prev)
       } else if (key === "backspace") {
-        if (initPackField === "name") setInitPackName(s => s.slice(0, -1))
+        if (initPackField === "cloneDest") setInitCloneDest(s => s.slice(0, -1))
+        else if (initPackField === "name") setInitPackName(s => s.slice(0, -1))
         else if (initPackField === "version") setInitPackVersion(s => s.slice(0, -1))
         else if (initPackField === "desc") setInitPackDesc(s => s.slice(0, -1))
       } else if (key === "enter" || key === "return") {
-        try {
-          const res = initPackManifest(workspaceRoot, {
-            name: initPackName,
-            version: initPackVersion,
-            description: initPackDesc,
-            organize: initPackOrganize,
-          })
-          refreshData()
-          setRoutingArchetype(null)
-          setActionResultTitle("Pack Manifest Initialized")
-          setActionResultLines([
-            `Created ${res.manifestPath}`,
-            `Pack: ${res.manifest.name}@${res.manifest.version} (contract ${res.manifest.contract})`,
-            ...(res.movedAgents.length ? ["", "Organized agents:", ...res.movedAgents.map(m => `  ${m.from} -> ${m.to}`)] : []),
-            ...(res.warnings.length ? ["", "Validation notes:", ...res.warnings.map(w => `  ${w}`)] : []),
-          ])
-          setViewMode("action-result")
-        } catch (err: any) {
-          setActionResultTitle("Pack Initialization Failed")
-          setActionResultLines([`Error: ${terminalSafeText(err?.message || err)}`])
-          setViewMode("action-result")
-        }
-      } else if (/^[\x20-\x7E]$/.test(rawChar)) {
-        if (initPackField === "name" && /[a-zA-Z0-9-]/.test(rawChar)) setInitPackName(s => (s + rawChar.toLowerCase()).slice(0, 64))
+        submitPackOnboarding()
+      } else if (!e.ctrl && !e.meta && /^[\x20-\x7E]$/.test(rawChar)) {
+        if (initPackField === "cloneDest") setInitCloneDest(s => s + rawChar)
+        else if (initPackField === "name" && /[a-zA-Z0-9-]/.test(rawChar)) setInitPackName(s => (s + rawChar.toLowerCase()).slice(0, 64))
         else if (initPackField === "version" && rawChar !== " ") setInitPackVersion(s => s + rawChar)
         else if (initPackField === "desc") setInitPackDesc(s => s + rawChar)
+      }
+    } else if (viewMode === "pack-doctor") {
+      if (key === "escape") {
+        setViewMode("main")
+      } else if (doctorTab === "doctor") {
+        const totalFindings = doctorReport?.findings.length ?? 0
+        const maxRows = getDoctorMaxFindingRows(termHeight)
+        if (key === "up" || key === "k") {
+          setDoctorScrollOffset(off => Math.max(0, off - 1))
+        } else if (key === "down" || key === "j") {
+          setDoctorScrollOffset(off => Math.min(Math.max(0, totalFindings - maxRows), off + 1))
+        } else if (key === "f") {
+          runPackDoctorAutoFix()
+        } else if (key === "a") {
+          runPackDoctorAuthoringKit()
+        } else if (key === "n") {
+          setDoctorTab("scaffold")
+          setScaffoldField("id")
+        } else if (key === "1") {
+          runPackDoctorBump("patch")
+        } else if (key === "2") {
+          runPackDoctorBump("minor")
+        } else if (key === "3") {
+          runPackDoctorBump("major")
+        }
+      } else {
+        const scOrder = getScaffoldFieldOrder(scaffoldKind)
+        const isText = scaffoldField === "id" || scaffoldField === "desc"
+        if (key === "tab" || key === "up" || key === "down") {
+          const delta = key === "up" || (key === "tab" && e.shift) ? -1 : 1
+          setScaffoldField(f => {
+            const idx = Math.max(0, scOrder.indexOf(f))
+            return scOrder[(idx + delta + scOrder.length) % scOrder.length]
+          })
+        } else if ((key === "space" || key === "left" || key === "right") && !isText) {
+          const delta = key === "left" ? -1 : 1
+          if (scaffoldField === "kind") {
+            const kinds: ScaffoldResourceKind[] = ["agent", "skill", "command"]
+            setScaffoldKind(prev => kinds[(kinds.indexOf(prev) + delta + kinds.length) % kinds.length])
+          } else if (scaffoldField === "mode") {
+            const modes: Array<"subagent" | "primary" | "all"> = ["subagent", "primary", "all"]
+            setScaffoldMode(prev => modes[(modes.indexOf(prev) + delta + modes.length) % modes.length])
+          }
+        } else if (!isText && key === "d") {
+          setDoctorTab("doctor")
+        } else if (key === "backspace") {
+          if (scaffoldField === "id") setScaffoldId(s => s.slice(0, -1))
+          else if (scaffoldField === "desc") setScaffoldDesc(s => s.slice(0, -1))
+        } else if (key === "enter" || key === "return") {
+          submitPackScaffold()
+        } else if (!e.ctrl && !e.meta && /^[\x20-\x7E]$/.test(rawChar)) {
+          if (scaffoldField === "id" && /[a-zA-Z0-9._/-]/.test(rawChar)) setScaffoldId(s => s + rawChar)
+          else if (scaffoldField === "desc") setScaffoldDesc(s => s + rawChar)
+        }
       }
     } else if (viewMode === "color-selector") {
       // 8. Color selector mode
@@ -2454,7 +4104,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
          updateDelegationScroll(next)
        } else if (key === "pageup" || key === "pagedown") {
          if (delegationItems.length === 0) return
-         const pageSize = Math.max(1, maxVisibleItems)
+         const pageSize = maxVisibleDelegations
          const maxOffset = Math.max(0, delegationItems.length - pageSize)
          setDelegationScrollOffset((offset) => {
            const nextOffset = key === "pageup" ? offset - pageSize : offset + pageSize
@@ -2584,108 +4234,100 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       }
     } else if (viewMode === "parameter-tuning") {
       // 12. Parameter tuning mode
+      const tuningFields: readonly TuningField[] = ["steps", "variant", "mode", "hidden"]
+      const stepVariant = (direction: 1 | -1) => {
+        const choices = tuningVariantChoices
+        const currentIndex = choices.indexOf(tuningVariant)
+        setTuningVariantTyping(false)
+        if (currentIndex < 0 && tuningVariant) {
+          const prefixMatches = choices.filter(c => c !== "" && c.startsWith(tuningVariant))
+          if (prefixMatches.length > 0) {
+            setTuningVariant(direction === 1 ? prefixMatches[0] : prefixMatches[prefixMatches.length - 1])
+            markTuningDirty("variant")
+            return
+          }
+        }
+        const nextIndex = currentIndex < 0
+          ? (direction === 1 ? 0 : choices.length - 1)
+          : (currentIndex + direction + choices.length) % choices.length
+        setTuningVariant(choices[nextIndex])
+        markTuningDirty("variant")
+      }
+
       if (key === "escape") {
         setViewMode("main")
-      } else if (key === "tab" && tuningFocusedField === "variant") {
-        const index = tuningVariantChoices.indexOf(tuningVariant)
-        setTuningVariant(tuningVariantChoices[(index + 1 + tuningVariantChoices.length) % tuningVariantChoices.length])
-        markTuningDirty("variant")
-      } else if (key === "tab" || key === "down") {
-        setTuningFocusedField((prev) =>
-          prev === "steps" ? "temp" : prev === "temp" ? "variant" : prev === "variant" ? "mode" : prev === "mode" ? "hidden" : "steps"
-        )
+      } else if (key === "tab") {
+        const delta = e.shift ? -1 : 1
+        setTuningVariantTyping(false)
+        setTuningFocusedField((prev) => tuningFields[(tuningFields.indexOf(prev) + delta + tuningFields.length) % tuningFields.length])
+      } else if (key === "down") {
+        setTuningVariantTyping(false)
+        setTuningFocusedField((prev) => tuningFields[(tuningFields.indexOf(prev) + 1) % tuningFields.length])
       } else if (key === "up") {
-        setTuningFocusedField((prev) =>
-          prev === "hidden" ? "mode" : prev === "mode" ? "variant" : prev === "variant" ? "temp" : prev === "temp" ? "steps" : "hidden"
-        )
+        setTuningVariantTyping(false)
+        setTuningFocusedField((prev) => tuningFields[(tuningFields.indexOf(prev) - 1 + tuningFields.length) % tuningFields.length])
       } else if (key === "space") {
         if (tuningFocusedField === "variant") {
-          const choices = tuningVariantChoices
-          const currentIndex = choices.indexOf(tuningVariant)
-          setTuningVariant(choices[(currentIndex + 1 + choices.length) % choices.length])
-          markTuningDirty("variant")
+          stepVariant(1)
         } else if (tuningFocusedField === "mode") {
-          setTuningMode((prev) => (prev === "primary" ? "subagent" : "primary"))
+          setTuningMode((prev) => AGENT_TUNING_MODES[(AGENT_TUNING_MODES.indexOf(prev) + 1) % AGENT_TUNING_MODES.length])
           markTuningDirty("mode")
         } else if (tuningFocusedField === "hidden") {
           setTuningHidden((prev) => !prev)
           markTuningDirty("hidden")
+        }
+      } else if (key === "delete" || (e.ctrl && key === "u")) {
+        if (tuningFocusedField === "variant") {
+          setTuningVariant("")
+          setTuningVariantTyping(false)
+          markTuningDirty("variant")
+        } else if (tuningFocusedField === "steps") {
+          setTuningSteps("")
+          markTuningDirty("steps")
         }
       } else if (key === "backspace") {
         if (tuningFocusedField === "steps") {
           if (!tuningDirtyFields.has("steps") && tuningSummary.steps.mixed) setTuningSteps("")
           else setTuningSteps(prev => prev.slice(0, -1))
           markTuningDirty("steps")
-        } else if (tuningFocusedField === "temp") {
-          if (!tuningDirtyFields.has("temp") && tuningSummary.temp.mixed) setTuningTemp("")
-          else setTuningTemp(prev => prev.slice(0, -1))
-          markTuningDirty("temp")
         } else if (tuningFocusedField === "variant") {
-          setTuningVariant((prev) => prev.slice(0, -1))
+          if (!tuningDirtyFields.has("variant") && tuningSummary.variant.mixed) setTuningVariant("")
+          else setTuningVariant((prev) => prev.slice(0, -1))
+          setTuningVariantTyping(true)
           markTuningDirty("variant")
         }
       } else if (key === "enter" || key === "return") {
-        const targetAgents = tuningTargetPaths.length > 0
-          ? agents.filter((a) => tuningTargetPaths.includes(a.currentPath))
-          : []
-        if (tuningDirtyFields.size === 0) {
-          setViewMode("main")
-          setLayoutStatus("No parameters modified — left all agents unchanged.")
-          return
-        }
-        if (targetAgents.length === 0) return
-
-        try {
-          const params = buildTuningUpdateParams(
-            { steps: tuningSteps, temp: tuningTemp, variant: tuningVariant, mode: tuningMode, hidden: tuningHidden },
-            tuningDirtyFields,
-            modelVariants && modelVariants.length > 0 ? modelVariants : undefined
-          )
-          applyAgentMutation(
-            targetAgents.map(a => a.currentPath),
-            writer => updateAgentParams(targetAgents, params, writer),
-            "Parameters Updated Successfully",
-            [
-              `Successfully tuned parameters for ${targetAgents.length} agents:`,
-              `  * Steps:  ${tuningDirtyFields.has("steps") ? tuningSteps : "unchanged"}`,
-              `  * Temp:   ${tuningDirtyFields.has("temp") ? tuningTemp : "unchanged"}`,
-              `  * Variant (Effort): ${tuningDirtyFields.has("variant") ? (tuningVariant.trim() || "cleared (default)") : "unchanged"}`,
-              `  * Mode:   ${tuningDirtyFields.has("mode") ? tuningMode : "unchanged"}`,
-              `  * Hidden: ${tuningDirtyFields.has("hidden") ? tuningHidden : "unchanged"}`
-            ]
-          )
-        } catch (error: any) {
-          setLayoutStatus(error.message || String(error))
-          return
-        }
+        submitTuningModal()
       } else if (/^[\x20-\x7E]$/.test(rawChar) && rawChar !== " ") {
-        if (tuningFocusedField === "steps" && /[0-9]/.test(rawChar)) {
-          if (!tuningDirtyFields.has("steps") && tuningSummary.steps.mixed) setTuningSteps(rawChar)
-          else setTuningSteps(prev => prev + rawChar)
-          markTuningDirty("steps")
-        } else if (tuningFocusedField === "temp" && /[0-9]/.test(rawChar)) {
-          if (!tuningDirtyFields.has("temp") && tuningSummary.temp.mixed) setTuningTemp(rawChar)
-          else setTuningTemp(prev => prev + rawChar)
-          markTuningDirty("temp")
-        } else if (tuningFocusedField === "temp" && rawChar === ".") {
-          if (!tuningDirtyFields.has("temp") && tuningSummary.temp.mixed) setTuningTemp("0.")
-          else setTuningTemp(prev => rawChar === "." && prev.includes(".") ? prev : prev + rawChar)
-          markTuningDirty("temp")
-        } else if (tuningFocusedField === "variant" && /^[a-zA-Z0-9_-]$/.test(rawChar)) {
-          setTuningVariant((prev) => prev + rawChar)
+        if (tuningFocusedField === "steps") {
+          if (/[0-9]/.test(rawChar)) {
+            if (!tuningDirtyFields.has("steps") && tuningSummary.steps.mixed) setTuningSteps(rawChar)
+            else setTuningSteps(prev => prev + rawChar)
+            markTuningDirty("steps")
+          } else if (rawChar === "-" || rawChar === "_") {
+            adjustTuningSteps(-1)
+          } else if (rawChar === "+" || rawChar === "=") {
+            adjustTuningSteps(1)
+          }
+        } else if (tuningFocusedField === "variant" && /^[a-zA-Z0-9._-]$/.test(rawChar)) {
+          const ch = rawChar.toLowerCase()
+          if (!tuningVariantTyping || (!tuningDirtyFields.has("variant") && tuningSummary.variant.mixed)) {
+            setTuningVariant(ch)
+            setTuningVariantTyping(true)
+          } else {
+            setTuningVariant((prev) => prev + ch)
+          }
           markTuningDirty("variant")
         }
       } else if (key === "left" || key === "right") {
-        if (tuningFocusedField === "variant") {
-          const choices = tuningVariantChoices
-          const currentIndex = choices.indexOf(tuningVariant)
-          const nextIndex = currentIndex < 0
-            ? (key === "right" ? 0 : choices.length - 1)
-            : (currentIndex + (key === "right" ? 1 : -1) + choices.length) % choices.length
-          setTuningVariant(choices[nextIndex])
-          markTuningDirty("variant")
+        if (tuningFocusedField === "steps") {
+          const step = e.shift ? 10 : 1
+          adjustTuningSteps(key === "right" ? step : -step)
+        } else if (tuningFocusedField === "variant") {
+          stepVariant(key === "right" ? 1 : -1)
         } else if (tuningFocusedField === "mode") {
-          setTuningMode(prev => prev === "primary" ? "subagent" : "primary")
+          const delta = key === "right" ? 1 : -1
+          setTuningMode(prev => AGENT_TUNING_MODES[(AGENT_TUNING_MODES.indexOf(prev) + delta + AGENT_TUNING_MODES.length) % AGENT_TUNING_MODES.length])
           markTuningDirty("mode")
         } else if (tuningFocusedField === "hidden") {
           setTuningHidden(prev => !prev)
@@ -2723,14 +4365,21 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
             const tx = mutate([renameTargetAgent.currentPath, destination, ...agents.map(a => a.currentPath)], "rename", () => renameAgent(workspaceRoot, renameTargetAgent.currentPath, newFilename, agents))
             const result = tx.value
            try { refreshData() } catch (error) { setMutationRefreshFailure(error, tx.warning); return }
-          setSelectedAgentPaths(new Set())
-           setMutationSuccess("Rename Complete", [
-             `Successfully renamed agent:`,
+           setSelectedAgentPaths(new Set())
+           const renameLines = [
+             result.success ? `Successfully renamed agent:` : `Agent file renamed with reference warnings:`,
              `  ${middleEllipsis(renameTargetAgent.filename, Math.max(1, Math.floor(termWidth * 0.7) - 8))} → ${middleEllipsis(newFilename, Math.max(1, Math.floor(termWidth * 0.7) - 8))}`,
-            ...result.updatedReferences.map((reference) => `  ${reference}`)
-             , ...(result.skipped.length > 0 ? [`Skipped files:`, ...result.skipped.map((file) => `  ${file}`)] : []),
-             ...(result.error ? [``, `⚠ ${result.error}`] : [])
-           ], tx.warning)
+             ...result.updatedReferences.map((reference) => `  ${reference}`),
+             ...(result.skipped.length > 0 ? [`Skipped files:`, ...result.skipped.map((file) => `  ${file}`)] : []),
+             ...(result.error ? [``, `⚠ ${result.error}`] : []),
+           ]
+           if (result.success) {
+             setMutationSuccess("Rename Complete", renameLines, tx.warning)
+           } else {
+             setActionResultTitle("Rename Incomplete")
+             setActionResultLines(tx.warning ? [...renameLines, "", `⚠ Auto-commit warning: ${tx.warning}`] : renameLines)
+             pushToast("⚠ Rename incomplete (reference update failed)")
+           }
           setViewMode("action-result")
         } catch (error: any) {
           setActionResultTitle("Error During Rename")
@@ -2769,35 +4418,19 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   })
 
   const updateScroll = (index: number) => {
-    setScrollOffset((offset) => {
-      if (index < offset) return Math.max(0, index)
-      if (index >= offset + maxVisibleItems) return Math.max(0, index - maxVisibleItems + 1)
-      return Math.max(0, offset)
-    })
+    setScrollOffset(offset => clampListScroll(index, activeItems.length, offset, maxVisibleItems))
   }
 
   const updateDelegationScroll = (index: number) => {
-    setDelegationScrollOffset((offset) => {
-      if (index < offset) return index
-      if (index >= offset + maxVisibleItems) return index - maxVisibleItems + 1
-      return offset
-    })
+    setDelegationScrollOffset(offset => clampListScroll(index, delegationItems.length, offset, maxVisibleDelegations))
   }
 
   const updateModelScroll = (index: number) => {
-    setModelScrollOffset((offset) => {
-      if (index < offset) return index
-      if (index >= offset + maxVisibleModels) return index - maxVisibleModels + 1
-      return offset
-    })
+    setModelScrollOffset(offset => clampListScroll(index, modelTreeItems.length, offset, maxVisibleModels))
   }
 
   const updateColorScroll = (index: number) => {
-    setColorScrollOffset((offset) => {
-      if (index < offset) return index
-      if (index >= offset + maxVisibleColors) return index - maxVisibleColors + 1
-      return offset
-    })
+    setColorScrollOffset(offset => clampListScroll(index, colorTreeItems.length, offset, maxVisibleColors))
   }
 
   // Get active item
@@ -2822,10 +4455,12 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
             : null
         })()
       : null
-  const tuningVariantChoices = modelVariants !== null
-    ? (modelVariants.length > 0 ? ["", ...modelVariants] : [""])
-    : ["", ...AGENT_EFFORT_VARIANTS]
-  if (tuningVariant && !tuningVariantChoices.includes(tuningVariant)) tuningVariantChoices.push(tuningVariant)
+  const tuningVariantChoices = modelVariants !== null && modelVariants.length > 0
+    ? ["", ...modelVariants]
+    : ["", ...KNOWN_MODEL_VARIANTS]
+  if (!tuningSummary.variant.mixed && tuningSummary.variant.value && !tuningVariantChoices.includes(tuningSummary.variant.value)) {
+    tuningVariantChoices.push(tuningSummary.variant.value)
+  }
 
   const resourceInspector = useMemo(() => {
     if (inspectorTab !== "resources" || currentItem?.type !== "file" || !currentItem.agent) return { catalog: null, error: "" }
@@ -2853,15 +4488,15 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   const resourceManagerRows = useMemo<ResourceManagerRow[]>(() => resourceCatalog
     ? [...resourceCatalog.skills, ...resourceCatalog.tools, ...resourceCatalog.mcpServers].map(item => ({ kind: item.kind, item }))
     : [], [resourceCatalog])
-  const maxVisibleResourceRows = Math.max(1, layout.listRows - 7)
+  const maxVisibleResourceRows = resourceViewport.viewportRows
   const visibleResourceRows = resourceManagerRows.slice(resourceModalScrollOffset, resourceModalScrollOffset + maxVisibleResourceRows)
-  const resourceInspectorPageSize = Math.max(1, layout.listRows - 5)
+  const resourceInspectorPageSize = wsViewports.resourcesInspectorRows
 
   // Render viewport lists
   const visibleItems = activeItems.slice(scrollOffset, scrollOffset + maxVisibleItems)
   const visibleModels = modelTreeItems.slice(modelScrollOffset, modelScrollOffset + maxVisibleModels)
   const visibleColors = colorTreeItems.slice(colorScrollOffset, colorScrollOffset + maxVisibleColors)
-  const visibleDelegationItems = delegationItems.slice(delegationScrollOffset, delegationScrollOffset + maxVisibleItems)
+  const visibleDelegationItems = delegationItems.slice(delegationScrollOffset, delegationScrollOffset + maxVisibleDelegations)
   const actionResultMaxOffset = Math.max(0, actionResultLines.length - maxVisibleActionResultLines)
   const visibleActionResultLines = actionResultLines.slice(
     actionResultScrollOffset,
@@ -2869,532 +4504,1433 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   )
 
   if (layout.mode === "too-small") {
-    return <box width="100%" height="100%" padding={1} overflow="hidden" backgroundColor="#1e1e1e"><text style={{ textColor: "yellow" }}>Terminal too small. Please increase terminal size.</text></box>
+    return (
+      <box width="100%" height="100%" padding={1} overflow="hidden" backgroundColor={THEME.bgBase}>
+        <text style={{ textColor: THEME.accentAmber }}>Terminal too small. Please increase terminal size.</text>
+      </box>
+    )
   }
 
+  const hasOverlayModal = viewMode !== "main"
+  const catalogListBorder = lerpColor(THEME.borderFocus, THEME.borderIdle, focusPaneBlend)
+  const catalogInspectorBorder = lerpColor(THEME.borderIdle, THEME.borderInspectorFocus, focusPaneBlend)
+  const activeFocusedPack = currentItem?.category || ""
+  const activeFocusedIsVirtual = Boolean(
+    activeFocusedPack &&
+    packDir(workspaceRoot, activeFocusedPack) &&
+    !fs.existsSync(path.join(packDir(workspaceRoot, activeFocusedPack)!, "opencode-pack.json")),
+  )
+  const contextualChips = buildContextualShortcuts({
+    workspaceTab,
+    itemType: currentItem?.type ?? null,
+    selectedCount: selectedAgentPaths.size,
+    isVirtualPack: activeFocusedIsVirtual || isWorkspaceVirtualPack,
+    isReadOnlyGitSource,
+    hasInvalidModels: modelCatalog.status === "verified" && invalidModelGroups.length > 0,
+    activePane: effectivePane,
+    showInspector: layout.showInspector,
+  })
+
   return (
-     <box
-       width="100%"
+    <box
+      width="100%"
       height="100%"
       minHeight={0}
       overflow="hidden"
       flexDirection="column"
-      backgroundColor="#1e1e1e"
+      backgroundColor={hasOverlayModal ? THEME.bgBaseDimmed : THEME.bgBase}
       padding={1}
     >
-       {/* Header Banner */}
-       <box
-         width="100%"
-         height={3}
-        borderStyle="single"
-        borderColor="#2B5581"
-         justifyContent="center"
-        alignItems="center"
-         paddingLeft={2}
-         paddingRight={2}
-         flexDirection="row"
-        >
-          <box width={headerGroupWidth} height={1} flexShrink={0} flexDirection="row" overflow="hidden">
-            <text width={headerTitleWidth} height={1} wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: "#9ECBFF" }} b>
-              {middleEllipsis(headerTitle, headerTitleWidth)}
-            </text>
-            <text width={1} height={1} wrapMode="none" overflow="hidden" flexShrink={0}> </text>
-           <box width={visibleMetaWidth} height={1} flexShrink={0} flexDirection="row" overflow="hidden">
-              {showCommit && <text width={commitWidth} height={1} wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: autoCommitEnabled() ? "green" : "gray" }}>{commitLabel}</text>}
-              {showCommit && visibleWorkspaceWidth > 0 && <text width={separatorWidth} height={1} wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: "gray" }}>{headerSeparator}</text>}
-              {showCommit && visibleWorkspaceWidth > 0 && <text width={visibleWorkspaceWidth} height={1} wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: "gray" }}>{middleEllipsis(workspaceLabel, visibleWorkspaceWidth)}</text>}
-           </box>
-          </box>
-       </box>
+      {/* Top Browser-Style Workspace Header */}
+      <WorkspaceTopbar
+        activeTab={workspaceTab}
+        termWidth={termWidth}
+        dimmed={hasOverlayModal}
+        spinner={pulse.spinner}
+        workspaceLabel={workspaceLabel}
+        hasActiveSource={Boolean(activeDataSource)}
+        commitLabel={commitLabel}
+        isReadOnlyGitSource={isReadOnlyGitSource}
+        autoCommitOn={autoCommitEnabled()}
+        isWorkspaceVirtualPack={isWorkspaceVirtualPack}
+        onSelectTab={tabKey => {
+          setViewMode("main")
+          setIsSearching(false)
+          if (tabKey === "sources") {
+            if (workspaceTab !== "sources") refreshSourcesView(true)
+            setWorkspaceTab("sources")
+          } else {
+            setWorkspaceTab(tabKey)
+          }
+        }}
+        onOpenSources={() => openSourcesModal(true)}
+        onOpenOnboarding={() => openInitPackModal()}
+        onOpenPalette={() => openCommandPalette()}
+      />
 
-      {statusMessage && (
-        <box height={1} flexShrink={0} overflow="hidden">
-          <text width={statusMessageWidth} height={1} wrapMode="none" overflow="hidden" style={{ textColor: "yellow" }}>
-            {middleEllipsis(statusMessage, statusMessageWidth)}
-          </text>
-        </box>
+      {/* Non-blocking Animated Floating Toast */}
+      <ToastOverlay
+        message={toastMessage}
+        toastId={toastId}
+        termWidth={termWidth}
+        reducedMotion={reducedMotionState}
+        onDismiss={() => setToastMessage(null)}
+      />
+
+      {/* Command Palette Overlay */}
+      {viewMode === "command-palette" && (
+        <CommandPaletteModal
+          query={paletteQuery}
+          commands={filteredPaletteCommands}
+          focusedIndex={paletteFocusIndex}
+          scrollOffset={paletteScrollOffset}
+          maxRows={maxPaletteRows}
+          termWidth={termWidth}
+          termHeight={termHeight}
+          reducedMotion={reducedMotionState}
+          onFocusRow={idx => setPaletteFocusIndex(idx)}
+          onExecute={cmd => executeActionById(cmd.id)}
+          onScrollDelta={delta => {
+            setPaletteScrollOffset(off => Math.max(0, Math.min(Math.max(0, filteredPaletteCommands.length - maxPaletteRows), off + delta)))
+          }}
+          onClose={() => setViewMode("main")}
+        />
       )}
+
+      {/* Keyboard & Mouse Guide Overlay */}
+      {viewMode === "help" && (
+        <HelpModal
+          activeTab={helpTab}
+          content={helpContent}
+          focusedItemIndex={helpFocusIndex}
+          scrollOffset={helpScrollOffset}
+          termWidth={termWidth}
+          termHeight={termHeight}
+          reducedMotion={reducedMotionState}
+          onSelectTab={selectHelpTab}
+          onFocusItem={idx => setHelpFocusIndex(idx)}
+          onActivateItem={activateHelpItem}
+          onScrollDelta={delta => {
+            const vpRows = calculateHelpViewport(termWidth, termHeight).viewportRows
+            const maxOff = Math.max(0, helpContent.rows.length - vpRows)
+            setHelpScrollOffset(off => {
+              const nextOff = Math.max(0, Math.min(maxOff, off + delta))
+              setHelpFocusIndex(idx => clampFocusIntoHelpSlice(idx, helpContent.rows, nextOff, vpRows))
+              return nextOff
+            })
+          }}
+          onToggleReducedMotion={toggleReducedMotion}
+          onClose={() => setViewMode("main")}
+        />
+      )}
+
+      {/* Grouped Model Repair Confirmation with Native Diff Preview */}
       {viewMode === "repair-confirm" && (
-        <box style={{ position: "absolute", left: "12%", top: "15%", width: "76%", height: "65%" }} borderStyle="double" borderColor="yellow" backgroundColor="#1e1e1e" title=" Confirm Grouped Model Repair " padding={1} flexDirection="column">
-          <text style={{ textColor: "yellow" }} b>Review mappings before writing:</text>
-          {invalidModelGroups.map((group, index) => {
-            const agentCount = `${group.agents.length} agents`
-            const separatorWidth = displayWidth(` →  (${agentCount})`)
-            const modelBudget = Math.max(1, Math.floor((repairConfirmContentWidth - separatorWidth) / 2))
-            return <text key={index} width="100%" height={1} flexShrink={0} wrapMode="none" overflow="hidden" style={{ textColor: "white" }}>
-              {`${middleEllipsis(JSON.stringify(group.value), modelBudget)} → ${middleEllipsis(repairMappings[String(index)] || "", modelBudget)} (${agentCount})`}
+        <box
+          style={{ position: "absolute", left: "10%", top: "12%", width: "80%", height: "74%" }}
+          zIndex={45}
+          border={true}
+          borderStyle="rounded"
+          borderColor={THEME.borderWarn}
+          backgroundColor={THEME.bgElevated}
+          title=" Confirm Grouped Model Repair "
+          titleColor={THEME.accentAmber}
+          padding={1}
+          flexDirection="column"
+          justifyContent="space-between"
+          overflow="hidden"
+        >
+          <box flexDirection="column" flexGrow={1} overflow="hidden">
+            <text style={{ textColor: THEME.accentAmber }} b>
+              Review model replacements before writing:
             </text>
-          })}
-          <text style={{ textColor: "gray" }} marginTop={1}>[Y/ENTER] Apply | [N/ESC] Cancel</text>
+            <scrollbox scrollY={true} width="100%" flexGrow={1} contentOptions={{ width: "100%" }} marginTop={1} overflow="hidden">
+              <diff
+                width="100%"
+                view="unified"
+                showLineNumbers={true}
+                syntaxStyle={getMarkdownSyntaxStyle()}
+                diff={buildPreviewUnifiedDiff(
+                  "agent-models.yaml",
+                  invalidModelGroups.map(g => `model: ${JSON.stringify(g.value)}  # ${g.agents.length} agent(s)`),
+                  invalidModelGroups.map((g, i) => `model: "${repairMappings[String(i)] || ""}"  # ${g.agents.length} agent(s)`),
+                )}
+              />
+            </scrollbox>
+          </box>
+          <box
+            borderStyle="single"
+            border={["top"]}
+            borderColor={THEME.borderSubtle}
+            paddingTop={1}
+            flexDirection="row"
+            justifyContent="space-between"
+          >
+            <text style={{ textColor: THEME.accentGreen }} b>
+              [Y / ENTER] Apply Repair
+            </text>
+            <text
+              style={{ textColor: THEME.accentRed }}
+              b
+              onMouseDown={() => setViewMode("main")}
+            >
+              [N / ESC] Cancel
+            </text>
+          </box>
         </box>
       )}
-      {/* Main Panel */}
-      <box width="100%" minHeight={0} flexGrow={1} flexDirection="row" marginTop={1} overflow="hidden">
-        {/* Left Side: Agents List (Wider to prevent filename cut-offs) */}
-         <box
+
+      {/* Workspace 2: Flows & Call Graph */}
+      {workspaceTab === "flows" ? (
+        <FlowsWorkspace
+          agents={agents}
+          navData={flowsNav}
+          packFlowsByCategory={packFlowsByCategory}
+          focusedIndex={flowsFocusIndex}
+          scrollOffset={flowsScrollOffset}
+          listRows={wsViewports.flowsRows}
+          leftWidth={listPanelWidth}
+          rightWidth={panelWidths.inspector}
+          gutterWidth={panelWidths.gutter}
+          showInspector={layout.showInspector}
+          activePane={effectivePane}
+          focusBorderBlend={focusPaneBlend}
+          inspectorFocusIndex={flowsInspectorFocus}
+          onSelectPane={pane => setActivePane(pane)}
+          onFocusIndex={idx => setFlowsFocusIndex(idx)}
+          onScrollDelta={delta => {
+            if (!flowsNav.rows.length) return
+            const page = Math.max(1, wsViewports.flowsRows)
+            const maxOff = Math.max(0, flowsNav.rows.length - page)
+            setFlowsScrollOffset(off => {
+              const nextOff = Math.max(0, Math.min(maxOff, off + delta))
+              setFlowsFocusIndex(idx => Math.max(nextOff, Math.min(Math.min(flowsNav.rows.length - 1, nextOff + page - 1), idx)))
+              return nextOff
+            })
+          }}
+          onFocusInspectorItem={idx => setFlowsInspectorFocus(idx)}
+          onScrollInspectorDelta={delta => {
+            setActivePane("inspector")
+            const currentFlowNavRow = flowsNav.rows[Math.max(0, Math.min(flowsFocusIndex, Math.max(0, flowsNav.rows.length - 1)))] ?? null
+            const flowsInsp = buildFlowsInspectorItems(currentFlowNavRow, agents, packFlowsByCategory, flowsNav.agentByShortName)
+            const total = flowsInsp.items.length
+            if (!total) return
+            setFlowsInspectorFocus(prev => Math.max(0, Math.min(total - 1, prev + delta)))
+          }}
+          onOpenPackFlows={(pack, initialIdx) => openPackFlowsModal(pack, initialIdx ?? 0)}
+          onOpenDelegations={agent => {
+            setDelegationTargetAgent(agent)
+            setSelectedDelegations(new Set(agent.allowedSubagents || []))
+            setFocusedDelegationIndex(0)
+            setDelegationScrollOffset(0)
+            setViewMode("delegation-manager")
+          }}
+          onJumpToCatalogAgent={agentPath => jumpToCatalogAgent(agentPath)}
+        />
+      ) : workspaceTab === "sources" ? (
+        /* Workspace 3: Sources & OpenCode Target */
+        <SourcesTargetWorkspace
+          rows={sourceModalRows}
+          focusedIndex={sourcesFocusIndex}
+          scrollOffset={sourcesScrollOffset}
+          listRows={wsViewports.sourcesRows}
+          termHeight={termHeight}
+          query={sourcesQuery}
+          inputFocused={sourcesInputFocused}
+          ghAuth={ghAuth}
+          busySpinner={pulse.spinner}
+          sourcesStatus={sourcesStatus || null}
+          targetStatusInfo={targetStatusInfo}
+          leftWidth={listPanelWidth}
+          rightWidth={panelWidths.inspector}
+          gutterWidth={panelWidths.gutter}
+          showInspector={layout.showInspector}
+          activePane={effectivePane}
+          focusBorderBlend={focusPaneBlend}
+          inspectorScrollOffset={sourcesInspectorScroll}
+          onSelectPane={pane => setActivePane(pane)}
+          onFocusIndex={idx => setSourcesFocusIndex(idx)}
+          onActivateRow={idx => activateSourceRowAtIndex(idx)}
+          onScrollDelta={delta => {
+            if (!sourceModalRows.length) return
+            const page = Math.max(1, wsViewports.sourcesRows)
+            const maxOff = Math.max(0, sourceModalRows.length - page)
+            setSourcesScrollOffset(off => {
+              const nextOff = Math.max(0, Math.min(maxOff, off + delta))
+              setSourcesFocusIndex(idx => Math.max(nextOff, Math.min(Math.min(sourceModalRows.length - 1, nextOff + page - 1), idx)))
+              return nextOff
+            })
+          }}
+          onScrollInspectorDelta={delta => {
+            setActivePane("inspector")
+            const installedCount = Object.keys(targetStatusInfo?.lock?.packs ?? {}).length
+            const driftCount = targetStatusInfo?.drift?.length ?? 0
+            const maxPackRows = calculateTargetInstalledPackRows(termHeight, {
+              hasEngineLine: Boolean(engineVersionInfo?.displayVersion),
+              driftCount,
+            })
+            const maxOff = Math.max(0, installedCount - maxPackRows)
+            setSourcesInspectorScroll(off => Math.max(0, Math.min(maxOff, off + delta)))
+          }}
+          onToggleInputFocus={focused => setSourcesInputFocused(focused)}
+          onPullSelected={pullSelectedOrActiveSource}
+          onGhLogin={runInteractiveGhLogin}
+          onReconcileTarget={runTargetReconcile}
+          onRefreshTarget={() => {
+            refreshSourcesView(true)
+            pushToast("✓ Refreshed sources & target status")
+          }}
+          engineVersionLabel={engineVersionInfo?.displayVersion}
+          onOpenSelfUpdate={openSelfUpdateModal}
+        />
+      ) : (
+        /* Workspace 1: Catalog & 6-Tab Inspector */
+        <box width="100%" minHeight={0} flexGrow={1} flexDirection="row" marginTop={1} overflow="hidden">
+          <box
             width={listPanelWidth}
             flexGrow={0}
-           minHeight={0}
-          borderStyle="round"
-          borderColor="#444444"
-          title=" Agents (Tree) "
-           titleColor="#9ECBFF"
-           flexDirection="column"
-           padding={1}
-           overflow="hidden"
-        >
-           {/* Table Header */}
-              <box width={listColumns.total} flexDirection="row" borderStyle="single" border={["bottom"]} borderColor="#333333">
-                 <text wrapMode="none" overflow="hidden" style={{ textColor: "gray" }} width={columnWidth(0)}>Sel/Lint</text>{gutter("th1")}
-                <text wrapMode="none" overflow="hidden" style={{ textColor: "gray" }} width={columnWidth(1)}>Agent Name</text>{gutter("th2")}
-                <text wrapMode="none" overflow="hidden" style={{ textColor: "gray" }} width={columnWidth(2)}>Tier / Model</text>
-             </box>
-
-          {/* List items */}
-           <box width="100%" height={layout.listRows} minHeight={0} overflow="hidden" flexGrow={0} flexShrink={0} flexDirection="column" marginTop={1}>
-            {activeItems.length === 0 ? (
-              <text style={{ textColor: "yellow" }}>
-                {!activeDataSource
-                  ? "No data source connected. Press [O] to connect a GitHub repo or local folder."
-                  : searchQuery
-                    ? `No agents match search: "${searchQuery}"`
-                    : "No agent markdown files found in this source (press [O] to switch sources)."}
-              </text>
-            ) : (
-              visibleItems.map((item, index) => {
-                const globalIndex = scrollOffset + index
-                const isFocused = globalIndex === focusedIndex
-
-                const rowBg = isFocused ? "#2B5581" : "transparent"
-                const itemColor = isFocused ? "#FFFFFF" : item.type === "folder" ? "yellow" : "#9ECBFF"
-
-                const isSelected = item.agent ? selectedAgentPaths.has(item.id) : false
-                const modelText = item.agent ? modelDisplayValue(item.agent, true, modelCatalog) : ""
-                const analysis = item.agent ? analyzeAgentName(item.agent.filename, allAgentFilenames) : null
-                const lintBadge = analysis ? (analysis.isValid ? "✓" : "⚠") : ""
-                const lintColor = analysis ? (analysis.isValid ? "green" : "yellow") : "yellow"
-
-                   return (
-                    <box
-                      key={`${item.type}-${item.id}`}
-                      width="100%"
-                      flexDirection="row"
-                      backgroundColor={rowBg}
-                       height={1}
-                    >
-                       <text style={{ textColor: item.type === "file" ? (isSelected ? "green" : lintColor) : "yellow" }} width={columnWidth(0)} wrapMode="none" overflow="hidden">
-                         {item.type === "file" ? `${isSelected ? "[x]" : "[ ]"} ${lintBadge}` : " "}
-                       </text>
-                       {gutter(`tree-${item.id}-1`)}
-                       <text style={{ textColor: itemColor }} width={columnWidth(1)} wrapMode="none" overflow="hidden" u={isFocused && item.type === "file"}>
-                          {middleEllipsis(item.type === "file" ? item.label : ` ${item.label}`, columnWidth(1))}
-                       </text>
-                       {gutter(`tree-${item.id}-2`)}
-                        {item.type === "file" && <text style={{ textColor: "magenta" }} width={columnWidth(2)} wrapMode="none" overflow="hidden">{middleEllipsis(`${resolvedAgents.get(item.agent!.currentPath)?.tier || "-"} / ${modelText}`, columnWidth(2))}</text>}
-                       {item.type !== "file" && <text width={columnWidth(2)}> </text>}
-                     </box>
-                   )
-              })
-            )}
-          </box>
-
-          {/* Real-time search filter display */}
-           <box width="100%" height={3} flexShrink={0} padding={1} borderStyle="single" border={["top"]} borderColor="#333333" flexDirection="row" alignItems="center" overflow="hidden">
-             <text wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: isSearching ? "yellow" : "gray" }}>
-              {isSearching ? "🔍 Filter typing: " : "🔍 Filter (Press /): "}
-            </text>
-             <text width="60%" wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: searchQuery ? "cyan" : "gray" }} b>
-               {middleEllipsis(searchQuery ? `${searchQuery}_` : isSearching ? "type here..._" : "none", 40)}
-            </text>
-          </box>
-
-          {/* List Footer / Counter */}
-           <box width="100%" height={2} flexShrink={0} justifyContent="space-between" paddingTop={1} borderStyle="single" border={["top"]} borderColor="#333333" overflow="hidden" flexDirection="row">
-              <text width={footerFirstWidth} wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: "gray" }}>
-               {middleEllipsis(`Total: ${agents.length} | Shown: ${activeItems.length} | Selected: ${selectedAgentPaths.size}`, 36)}
-             </text>
-              <text width={footerSecondWidth} wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: "gray" }}>
-                {middleEllipsis("[/] Search | ◀/▶ Collapse/Expand", 36)}
-            </text>
-          </box>
-        </box>
-
-         {layout.showInspector && <>
-         <text width={panelWidths.gutter}> </text>
-        {/* Right Side: Details & Actions (Tabbed Inspector) */}
-         <box
-            width={panelWidths.inspector}
-            flexGrow={0}
-           minHeight={0}
-          borderStyle="round"
-          borderColor="#444444"
-          title=" Inspector "
-          titleColor="#9ECBFF"
-          flexDirection="column"
-          padding={1}
-           overflow="hidden"
-        >
-          {/* Tab Navigation Bar */}
-          <box flexDirection="row" width="100%" borderStyle="single" border={["bottom"]} borderColor="#333333" paddingBottom={1} marginBottom={1}>
-            <text style={{ textColor: inspectorTab === "overview" ? "cyan" : "gray" }} u={inspectorTab === "overview"}>
-              1.Info
-            </text>
-            <text style={{ textColor: "gray" }}>|</text>
-            <text style={{ textColor: inspectorTab === "naming" ? "yellow" : "gray" }} u={inspectorTab === "naming"}>
-              2.Name
-            </text>
-            <text style={{ textColor: "gray" }}>|</text>
-            <text style={{ textColor: inspectorTab === "security" ? "red" : "gray" }} u={inspectorTab === "security"}>
-              3.Sec
-            </text>
-            <text style={{ textColor: "gray" }}>|</text>
-            <text style={{ textColor: inspectorTab === "delegations" ? "green" : "gray" }} u={inspectorTab === "delegations"}>
-              4.Graph
-            </text>
-            <text style={{ textColor: "gray" }}>|</text>
-            <text style={{ textColor: inspectorTab === "resources" ? "magenta" : "gray" }} u={inspectorTab === "resources"}>
-              5.Res
-            </text>
-          </box>
-
-          {currentItem ? (
-             <box flexDirection="column" flexGrow={1} minHeight={0} overflow="hidden">
-              {currentItem.type === "file" && currentItem.agent ? (
-                <box flexDirection="column" flexGrow={1}>
-                  <text style={{ textColor: "#9ECBFF" }} b>
-                     {middleEllipsis(currentItem.agent.filename, 30)}
+            minHeight={0}
+            border={true}
+            borderStyle="rounded"
+            borderColor={catalogListBorder}
+            backgroundColor={hasOverlayModal ? THEME.bgPanelDimmed : THEME.bgPanel}
+            title={
+              layout.showInspector
+                ? effectivePane === "list"
+                  ? ` ● Catalog (${new Set(agents.map(a => a.category)).size} packs · ${agents.length} agents) `
+                  : ` Catalog (${new Set(agents.map(a => a.category)).size} packs · ${agents.length} agents) · ⇧← `
+                : ` Catalog (${new Set(agents.map(a => a.category)).size} packs · ${agents.length} agents) `
+            }
+            titleColor={effectivePane === "list" ? THEME.accentBlue : THEME.fgSecondary}
+            flexDirection="column"
+            paddingLeft={1}
+            paddingRight={1}
+            justifyContent="space-between"
+            overflow="hidden"
+            onMouseDown={() => setActivePane("list")}
+            onMouseScroll={(_self, event) => {
+              const dir = (event as any).scroll?.direction
+              if (!dir || activeItems.length === 0) return
+              const delta = dir === "down" ? 2 : -2
+              const maxOff = Math.max(0, activeItems.length - maxVisibleItems)
+              setScrollOffset(off => Math.max(0, Math.min(maxOff, off + delta)))
+            }}
+          >
+            <box flexDirection="column" width="100%" overflow="hidden">
+              {/* Integrated Search & Filter Bar */}
+              <box
+                width="100%"
+                height={2}
+                borderStyle="single"
+                border={["bottom"]}
+                borderColor={isSearching ? THEME.accentAmber : THEME.borderSubtle}
+                flexDirection="row"
+                justifyContent="space-between"
+                alignItems="center"
+                overflow="hidden"
+                onMouseDown={(_self, event) => {
+                  event.stopPropagation()
+                  setActivePane("list")
+                  setIsSearching(true)
+                }}
+              >
+                <text
+                  wrapMode="none"
+                  overflow="hidden"
+                  style={{ textColor: isSearching ? THEME.accentAmber : searchQuery ? THEME.accentCyan : THEME.fgSecondary }}
+                  b={Boolean(searchQuery || isSearching)}
+                >
+                  {middleEllipsis(
+                    isSearching
+                      ? `🔍 /${terminalSafeText(searchQuery)}▋`
+                      : searchQuery
+                        ? `🔍 Filter: ${terminalSafeText(searchQuery)}`
+                        : "🔍 Press / or click to filter agents...",
+                    Math.max(12, listContentWidth - 18),
+                  )}
+                </text>
+                {searchQuery ? (
+                  <text
+                    wrapMode="none"
+                    style={{ textColor: THEME.accentRed }}
+                    onMouseDown={(_self, event) => {
+                      event.stopPropagation()
+                      setSearchQuery("")
+                      setIsSearching(false)
+                    }}
+                  >
+                    [× Clear]
                   </text>
+                ) : (
+                  <text wrapMode="none" style={{ textColor: THEME.fgMuted }}>
+                    {selectedAgentPaths.size > 0 ? `${selectedAgentPaths.size} marked` : "◀/▶ fold"}
+                  </text>
+                )}
+              </box>
 
-                  {/* TAB 1: OVERVIEW */}
-                  {inspectorTab === "overview" && (
-                    <box flexDirection="column" marginTop={1} flexGrow={1}>
-                      <box flexDirection="row">
-                        <text style={{ textColor: "gray" }} width="35%">Pack:</text>
-                        <text style={{ textColor: "yellow" }} width="65%">
-                           {middleEllipsis(currentItem.agent.category, 30)}
-                        </text>
-                      </box>
+              {/* Column Header */}
+              <box width={listColumns.total} height={1} flexDirection="row" marginTop={0}>
+                <text wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgMuted }} width={columnWidth(0)}>
+                  Sel
+                </text>
+                {gutter("th1")}
+                <text wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgMuted }} width={columnWidth(1)}>
+                  Pack / Agent
+                </text>
+                {gutter("th2")}
+                <text wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgMuted }} width={columnWidth(2)}>
+                  Status / Model
+                </text>
+              </box>
 
-                      <box flexDirection="row" marginTop={1}>
-                        <text style={{ textColor: "gray" }} width="35%">Model:</text>
-                        <text style={{ textColor: "cyan" }} width="65%">
-                          {middleEllipsis(modelDisplayValue(currentItem.agent, false, modelCatalog), 30)}
-                        </text>
-                      </box>
+              {/* Tree Rows */}
+              <box width="100%" height={maxVisibleItems} minHeight={0} overflow="hidden" flexGrow={0} flexShrink={0} flexDirection="column">
+                {activeItems.length === 0 ? (
+                  <box flexDirection="column" marginTop={1}>
+                    <text style={{ textColor: THEME.accentAmber }}>
+                      {!activeDataSource
+                        ? "No data source connected. Press [O] or click Sources above."
+                        : searchQuery
+                          ? `No agents match "${terminalSafeText(searchQuery)}".`
+                          : "No agent markdown files found in this source."}
+                    </text>
+                  </box>
+                ) : (
+                  visibleItems.map((item, index) => {
+                    const globalIndex = scrollOffset + index
+                    const isFocused = globalIndex === focusedIndex
 
-                      <box flexDirection="row" marginTop={1}>
-                        <text style={{ textColor: "gray" }} width="35%">Color:</text>
-                        <box flexDirection="row" width="65%">
-                          {(() => {
-                            const rawCol = currentItem.agent.frontmatter.color
-                             if (!rawCol) return <text style={{ textColor: "gray" }}>Not set</text>
-                             if (typeof rawCol !== "string") return <text style={{ textColor: "red" }}>{`Invalid: ${middleEllipsis(terminalSafeText(rawCol), 20)}`}</text>
-                            
-                            // Find matching color hex from palette or raw hex
-                            let hexColor = rawCol.startsWith("#") ? rawCol : "#9ECBFF"
-                            COLOR_PALETTE.forEach(group => {
-                              group.colors.forEach(c => {
-                                if (c.value === rawCol) hexColor = c.hex
-                              })
+                    if (item.type === "folder") {
+                      const lockedPack = targetStatusInfo?.lock?.packs?.[item.category]
+                      const folderDir = packDir(workspaceRoot, item.category)
+                      const isVirtual = Boolean(folderDir && !fs.existsSync(path.join(folderDir, "opencode-pack.json")))
+                      const overrideCount = userOverridesSummary.countsByPack.get(item.category) ?? 0
+                      const flowCount = packFlowsByCategory.get(item.category)?.flows.length ?? 0
+                      const hasUpdate = Boolean(
+                        lockedPack &&
+                        activeDataSource?.kind === "source" &&
+                        activeDataSource.source.kind === "git" &&
+                        activeRevision &&
+                        lockedPack.revision &&
+                        lockedPack.revision !== activeRevision,
+                      )
+                      const statusParts: string[] = []
+                      if (hasUpdate) statusParts.push("↑ update")
+                      else if (lockedPack) statusParts.push("● installed")
+                      else if (isVirtual) statusParts.push("◌ virtual")
+                      if (overrideCount > 0) statusParts.push(`✎ ${overrideCount}`)
+                      if (flowCount > 0) statusParts.push(`⇄ ${flowCount}`)
+                      const rightMeta = statusParts.join(" · ")
+                      const isExpanded = searchQuery.trim() !== "" || expandedCategories.has(item.id)
+                      const catCount = categoryAgentCounts.get(item.category) ?? 0
+
+                      return (
+                        <box
+                          key={`folder-${item.id}`}
+                          width="100%"
+                          height={1}
+                          flexDirection="row"
+                          backgroundColor={isFocused ? THEME.bgRowFocus : "transparent"}
+                          onMouseDown={(_self, event) => {
+                            event.stopPropagation()
+                            setActivePane("list")
+                            setFocusedIndex(globalIndex)
+                            setExpandedCategories(prev => {
+                              const next = new Set(prev)
+                              if (next.has(item.id)) next.delete(item.id)
+                              else next.add(item.id)
+                              return next
                             })
-
-                            return (
-                              <box flexDirection="row">
-                                <box width={2} height={1} backgroundColor={hexColor} marginRight={1}>
-                                  <text>{" "}</text>
-                                </box>
-                                 <text style={{ textColor: "white" }}>{middleEllipsis(rawCol, 20)}</text>
-                              </box>
-                            )
-                          })()}
-                        </box>
-                      </box>
-
-                      <box flexDirection="row" marginTop={1}>
-                        <text style={{ textColor: "gray" }} width="35%">Steps/Temp:</text>
-                        <text style={{ textColor: "white" }}>
-                           {middleEllipsis(`${currentItem.agent.frontmatter.steps || 50} steps / ${currentItem.agent.frontmatter.temperature ?? 0.2}°`, 30)}
-                        </text>
-                      </box>
-
-                      <box flexDirection="row" marginTop={1}>
-                        <text style={{ textColor: "gray" }} width="35%">Thinking / Effort:</text>
-                        <text style={{ textColor: currentItem.agent.frontmatter.variant ? "cyan" : "gray" }} width="65%">
-                          {middleEllipsis(`${String(currentItem.agent.frontmatter.variant ?? "default")}${currentItem.agent.frontmatter.reasoningEffort ?? currentItem.agent.frontmatter.options?.reasoningEffort ? ` (reasoningEffort: ${String(currentItem.agent.frontmatter.reasoningEffort ?? currentItem.agent.frontmatter.options?.reasoningEffort)})` : ""}`, 36)}
-                        </text>
-                      </box>
-
-                      <box flexDirection="column" marginTop={1} flexGrow={1}>
-                        <text style={{ textColor: "gray" }}>Description:</text>
-                        <box borderStyle="single" borderColor="#333333" padding={1} marginTop={1} flexGrow={1}>
-                          <text style={{ textColor: "white" }}>
-                             {terminalSafeText(currentItem.agent.description || "No description provided.")}
+                          }}
+                        >
+                          <text width={columnWidth(0)} wrapMode="none" overflow="hidden" style={{ textColor: isFocused ? "#ffffff" : THEME.accentAmber }} b>
+                            {isFocused ? `▎ ${isExpanded ? "▾" : "▸"}` : `  ${isExpanded ? "▾" : "▸"}`}
+                          </text>
+                          {gutter(`tree-${item.id}-1`)}
+                          <text width={columnWidth(1)} wrapMode="none" overflow="hidden" style={{ textColor: isFocused ? "#ffffff" : THEME.accentAmber }} b>
+                            {middleEllipsis(`📦 ${terminalSafeText(item.category)} (${catCount})`, columnWidth(1))}
+                          </text>
+                          {gutter(`tree-${item.id}-2`)}
+                          <text
+                            width={columnWidth(2)}
+                            wrapMode="none"
+                            overflow="hidden"
+                            style={{
+                              textColor: hasUpdate
+                                ? THEME.accentAmber
+                                : lockedPack
+                                  ? THEME.accentGreen
+                                  : overrideCount > 0
+                                    ? THEME.accentPurple
+                                    : THEME.fgSecondary,
+                            }}
+                          >
+                            {middleEllipsis(rightMeta, columnWidth(2))}
                           </text>
                         </box>
-                      </box>
-                    </box>
-                  )}
+                      )
+                    }
 
-                  {/* TAB 2: NAMING CONVENTION */}
-                  {inspectorTab === "naming" && (
-                    <box flexDirection="column" marginTop={1} flexGrow={1}>
-                      {(() => {
-                        const analysis = analyzeAgentName(currentItem.agent.filename, allAgentFilenames)
-                        return (
-                          <box flexDirection="column" borderStyle="single" borderColor="#333333" padding={1} flexGrow={1}>
-                            <box flexDirection="row" justifyContent="space-between" flexShrink={0}>
-                              <text style={{ textColor: "white" }} b>Naming Status:</text>
-                              <text style={{ textColor: analysis.isValid ? "green" : "yellow" }} b>
-                                {analysis.isValid ? "✓ Valid" : "⚠ Non-Compliant"}
-                              </text>
-                            </box>
-                            <box flexDirection="row" marginTop={1}>
-                              <text style={{ textColor: "gray" }} width="35%">Family:</text>
-                              <text style={{ textColor: "cyan" }}>{middleEllipsis(analysis.family || "(none)", 30)}</text>
-                            </box>
-                            <box flexDirection="row">
-                              <text style={{ textColor: "gray" }} width="35%">Pack:</text>
-                              <text style={{ textColor: "yellow" }}>{middleEllipsis(analysis.category || "(none)", 30)}</text>
-                            </box>
-                            <box flexDirection="row">
-                              <text style={{ textColor: "gray" }} width="35%">Role:</text>
-                              <text style={{ textColor: "white" }}>{middleEllipsis(analysis.role || "(none)", 30)}</text>
-                            </box>
-                            {!analysis.isValid && analysis.suggestedName && (
-                              <box flexDirection="column" marginTop={1}>
-                                <text style={{ textColor: "gray" }}>Suggested Name:</text>
-                                 <text style={{ textColor: "green" }}>{middleEllipsis(analysis.suggestedName, 40)}</text>
-                              </box>
-                            )}
-                          </box>
-                        )
-                      })()}
-                    </box>
-                  )}
+                    const ag = item.agent!
+                    const isSelected = selectedAgentPaths.has(item.id)
+                    const baseBg = isFocused ? THEME.bgRowFocus : isSelected ? THEME.bgRowSelected : "transparent"
+                    const rowBg = flashedPaths.has(item.id) && mutationFlash > 0
+                      ? lerpColor(baseBg === "transparent" ? THEME.bgPanel : baseBg, THEME.bgRowFlash, mutationFlash)
+                      : baseBg
+                    const dotHex = resolveAgentHexColor(ag.frontmatter.color)
+                    const analysis = analyzeAgentName(ag.filename, allAgentFilenames)
+                    const hasOrderErr = analyzePermissionOrder(ag).hasOrderError
+                    const hasWarn = !analysis.isValid || hasOrderErr
+                    const shortName = ag.filename.replace(/\.md$/, "")
+                    const isOverridden = userOverridesSummary.overriddenAgents.has(`${ag.category}/${shortName}`)
+                    const modelText = modelDisplayValue(ag, true, modelCatalog)
+                    const isModelInvalid = modelText.startsWith("invalid:")
+                    const resolvedTier = resolvedAgents.get(ag.currentPath)?.tier
+                    const rightText = resolvedTier ? `${resolvedTier} · ${modelText}` : modelText
 
-                  {/* TAB 3: SECURITY MATRIX & PERMISSION DETAILS */}
-                  {inspectorTab === "security" && (
-                    <box flexDirection="column" marginTop={1} flexGrow={1}>
-                      {(() => {
-                        const permSummary = getAgentPermissionSummary(currentItem.agent)
-                         const orderCheck = analyzePermissionOrder(currentItem.agent)
-                         const perm = currentItem.agent.frontmatter.permission || {}
-                         const permissionEntries = Object.entries(perm).filter(([key]) => key !== "task")
-                         const permissionPageSize = Math.max(1, maxVisibleItems - 2)
-
-                        return (
-                          <box flexDirection="column" borderStyle="single" borderColor="#333333" padding={1} flexGrow={1} overflow="hidden">
-                            <box flexDirection="row" justifyContent="space-between" flexShrink={0}>
-                              <text style={{ textColor: "white" }} b>Security Matrix:</text>
-                              <text style={{ textColor: permSummary.riskLevel === "HIGH" ? "red" : permSummary.riskLevel === "MEDIUM" ? "yellow" : "green" }} b>
-                                {`${permSummary.riskLevel} RISK`}
-                              </text>
-                            </box>
-
-                            {/* Order Error Alert */}
-                            {orderCheck.hasOrderError && (
-                              <box flexDirection="column" marginTop={1} backgroundColor="#5A1818" padding={1}>
-                                <text style={{ textColor: "red" }} b>⚠ PERMISSION ORDER ERROR!</text>
-                                <text style={{ textColor: "white" }}>Wildcard "*": "deny" MUST be first.</text>
-                              <text style={{ textColor: "yellow" }} b>[Press SHIFT+F to Fix order]</text>
-                              </box>
-                            )}
-
-                            {/* Permission Details */}
-                            <box flexDirection="column" marginTop={1}>
-                              <text style={{ textColor: "yellow" }} b>Frontmatter Permissions:</text>
-                              {permissionEntries.slice(graphScrollOffset, graphScrollOffset + permissionPageSize).map(([key, val]) => {
-                                let valStr = typeof val === "object" ? JSON.stringify(val) : String(val)
-                                 const safeKey = middleEllipsis(key, 30)
-                                 const safeVal = middleEllipsis(valStr, 40)
-                                 const isDanger = key === "bash" && (val === "allow" || val === true || valStr.includes("allow"))
-                                return (
-                                  <box key={key} flexDirection="row" justifyContent="space-between">
-                                     <text style={{ textColor: "gray" }}>{`${safeKey}:`}</text>
-                                     <text style={{ textColor: isDanger ? "red" : "cyan" }}>{safeVal}</text>
-                                  </box>
-                                )
-                              })}
-                              {permissionEntries.length > permissionPageSize && <text style={{ textColor: "gray" }} flexShrink={0}>
-                                {`▲ ${graphScrollOffset + 1}-${Math.min(graphScrollOffset + permissionPageSize, permissionEntries.length)}/${permissionEntries.length} ▼`}
-                              </text>}
-                            </box>
-                          </box>
-                        )
-                      })()}
-                    </box>
-                  )}
-
-                  {/* TAB 4: DELEGATIONS GRAPH (SCROLLABLE) */}
-                  {inspectorTab === "delegations" && (
-                    <box flexDirection="column" marginTop={1} flexGrow={1}>
-                      {(() => {
-                        const allowed = currentItem.agent.allowedSubagents || []
-                        return (
-                          <box flexDirection="column" flexGrow={1}>
-                            <box flexDirection="row" justifyContent="space-between" flexShrink={0}>
-                              <text style={{ textColor: "gray" }}>Authorized Subagents:</text>
-                              <text style={{ textColor: "yellow" }}>{`${allowed.length} total`}</text>
-                            </box>
-
-                            <box borderStyle="single" borderColor="#333333" padding={1} marginTop={1} flexGrow={1} overflow="hidden">
-                              {allowed.length > 0 ? (
-                                allowed.slice(graphScrollOffset, graphScrollOffset + Math.max(1, maxVisibleItems - 2)).map((subName) => {
-                                  const exists = agents.some((a) => a.filename.replace(/\.md$/, "") === subName)
-                                  return (
-                                    <box key={subName} flexDirection="row" justifyContent="space-between">
-                                      <text style={{ textColor: exists ? "cyan" : "red" }}>
-                                         {middleEllipsis(exists ? `├─ @${subName}` : `├─ ❌ @${subName} (Dead Ref)`, 40)}
-                                      </text>
-                                    </box>
-                                  )
-                                })
-                              ) : (
-                                <text style={{ textColor: "gray" }}>No subagents authorized.</text>
-                              )}
-                              {allowed.length > Math.max(1, maxVisibleItems - 2) && <text style={{ textColor: "gray" }} flexShrink={0}>
-                                {`▲ ${graphScrollOffset + 1}-${Math.min(graphScrollOffset + Math.max(1, maxVisibleItems - 2), allowed.length)}/${allowed.length} ▼`}
-                              </text>}
-                            </box>
-                          </box>
-                        )
-                      })()}
-                    </box>
-                  )}
-
-                  {inspectorTab === "resources" && (
-                    <box flexDirection="column" marginTop={1} flexGrow={1} minHeight={0} overflow="hidden">
-                      {resourceInspector.error ? (
-                        <text style={{ textColor: "red" }}>{resourceInspector.error}</text>
-                      ) : (
-                        <>
-                          <box flexDirection="column" flexGrow={1} minHeight={0} overflow="hidden">
-                            {resourceInspectorLines.slice(resourceScrollIndex, resourceScrollIndex + resourceInspectorPageSize).map((line, index) => (
-                              <text key={`${resourceScrollIndex}-${index}`} style={{ textColor: line.startsWith("---") ? "yellow" : line.includes("[DENY]") || line.includes("[Dead Ref]") ? "red" : "white" }} wrapMode="none" overflow="hidden">
-                                {middleEllipsis(line, Math.max(1, panelWidths.inspector - 6))}
-                              </text>
-                            ))}
-                          </box>
-                          {resourceInspectorLines.length > resourceInspectorPageSize && <text style={{ textColor: "gray" }} flexShrink={0}>
-                            {`▲ ${resourceScrollIndex + 1}-${Math.min(resourceScrollIndex + resourceInspectorPageSize, resourceInspectorLines.length)}/${resourceInspectorLines.length} ▼`}
-                          </text>}
-                          <text style={{ textColor: "cyan" }} flexShrink={0}>Press 'u' to edit Skills, Tools &amp; MCP</text>
-                        </>
-                      )}
-                    </box>
-                  )}
-                </box>
-              ) : (
-                <box flexDirection="column" flexGrow={1} overflow="hidden">
-                  <text style={{ textColor: "yellow" }} b>
-                     {middleEllipsis(`📁 Pack: ${currentItem.category.toUpperCase()}`, 40)}
-                  </text>
-                  <text style={{ textColor: "white" }} marginTop={1}>
-                     {middleEllipsis(`Directory: ${path.relative(workspaceRoot, packDir(workspaceRoot, currentItem.category) ?? workspaceRoot) || "."}/`, 50)}
-                  </text>
-                  {(() => {
-                    const folderDir = packDir(workspaceRoot, currentItem.category)
-                    const isVirtual = Boolean(folderDir && !fs.existsSync(path.join(folderDir, "opencode-pack.json")))
                     return (
-                      <box flexDirection="column" marginTop={1}>
-                        <text style={{ textColor: isVirtual ? "cyan" : "green" }}>
-                          {middleEllipsis(isVirtual ? "Format: Virtual .md Pack (no opencode-pack.json)" : "Format: OpenCode Pack (opencode-pack.json)", Math.max(20, panelWidths.inspector - 6))}
+                      <box
+                        key={`file-${item.id}`}
+                        width="100%"
+                        height={1}
+                        flexDirection="row"
+                        backgroundColor={rowBg}
+                        onMouseDown={(_self, event) => {
+                          event.stopPropagation()
+                          setActivePane("list")
+                          if (isFocused) openModelOrFlowsAction()
+                          else setFocusedIndex(globalIndex)
+                        }}
+                      >
+                        <text
+                          width={columnWidth(0)}
+                          wrapMode="none"
+                          overflow="hidden"
+                          style={{
+                            textColor: isSelected
+                              ? THEME.accentGreen
+                              : hasWarn
+                                ? THEME.accentAmber
+                                : isFocused
+                                  ? "#ffffff"
+                                  : THEME.fgMuted,
+                          }}
+                          b={isSelected}
+                          onMouseDown={(_self, event) => {
+                            event.stopPropagation()
+                            setActivePane("list")
+                            setFocusedIndex(globalIndex)
+                            toggleSelectionAtPath(ag.currentPath)
+                          }}
+                        >
+                          {`${isSelected ? "[X]" : "[ ]"}${hasWarn ? " ⚠" : ""}`}
                         </text>
-                        <text style={{ textColor: "cyan" }}>
-                          {middleEllipsis(`[M] Conditional IF/OR Flows${isVirtual && !isReadOnlyGitSource ? " · [I] Init opencode-pack.json" : ""}`, Math.max(20, panelWidths.inspector - 6))}
+                        {gutter(`tree-${item.id}-1`)}
+                        <box width={columnWidth(1)} height={1} flexDirection="row" overflow="hidden">
+                          <text height={1} flexShrink={0} wrapMode="none" style={{ textColor: dotHex }} b>
+                            {" ● "}
+                          </text>
+                          <text
+                            height={1}
+                            wrapMode="none"
+                            overflow="hidden"
+                            style={{ textColor: isFocused ? "#ffffff" : THEME.fgPrimary }}
+                            b={isFocused}
+                          >
+                            {middleEllipsis(`${terminalSafeText(shortName)}${isOverridden ? " ✎" : ""}`, Math.max(4, columnWidth(1) - 3))}
+                          </text>
+                        </box>
+                        {gutter(`tree-${item.id}-2`)}
+                        <text
+                          width={columnWidth(2)}
+                          wrapMode="none"
+                          overflow="hidden"
+                          style={{
+                            textColor: isModelInvalid
+                              ? THEME.accentRed
+                              : isFocused
+                                ? THEME.accentCyan
+                                : THEME.fgSecondary,
+                          }}
+                        >
+                          {middleEllipsis(rightText, columnWidth(2))}
                         </text>
                       </box>
                     )
-                  })()}
-                  <text style={{ textColor: "gray" }} marginTop={1}>
-                    Purpose Summary:
-                  </text>
-                  <box borderStyle="single" borderColor="#333333" padding={1} marginTop={1} flexGrow={1}>
-                    <text style={{ textColor: "white" }}>
-                       {terminalSafeText(packDescription(currentItem.category))}
-                    </text>
-                  </box>
+                  })
+                )}
+              </box>
+            </box>
+
+            {/* Compact Catalog Status Footer */}
+            <box
+              width="100%"
+              height={1}
+              flexShrink={0}
+              justifyContent="space-between"
+              flexDirection="row"
+              overflow="hidden"
+            >
+              <text width={footerFirstWidth} wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: THEME.fgMuted }}>
+                {middleEllipsis(
+                  activeItems.length > 0
+                    ? `Row ${focusedIndex + 1}/${activeItems.length}${selectedAgentPaths.size > 0 ? ` · ${selectedAgentPaths.size} marked` : ""}`
+                    : "Empty",
+                  footerFirstWidth,
+                )}
+              </text>
+              <text width={footerSecondWidth} wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: invalidModelGroups.length > 0 ? THEME.accentAmber : THEME.fgMuted }}>
+                {middleEllipsis(
+                  invalidModelGroups.length > 0
+                    ? `⚠ ${invalidModelGroups.length} invalid model group(s) [V]`
+                    : "Click [ ] to mark · Click twice to edit",
+                  footerSecondWidth,
+                )}
+              </text>
+            </box>
+          </box>
+
+          {layout.showInspector && (
+            <>
+              {/* Draggable Split Divider */}
+              <box
+                width={panelWidths.gutter}
+                height="100%"
+                justifyContent="center"
+                alignItems="center"
+                onMouseDrag={(_self, event) => {
+                  const usable = Math.max(40, termWidth - 2)
+                  const rawRatio = ((event as any).x - 1) / usable
+                  const clamped = Math.max(0.60, Math.min(0.75, Math.round(rawRatio * 100) / 100))
+                  setLayoutDraft(clamped)
+                  setAppliedShare(clamped)
+                }}
+                onMouseDragEnd={() => {
+                  if (!configReadOnly) {
+                    try {
+                      const rev = saveUiConfig(engineConfigDir(), appliedShare, uiConfigRevisionState, { reducedMotion: reducedMotionState })
+                      setUiConfigRevision(rev)
+                    } catch {
+                      // Ignore drag-end persistence lock collision
+                    }
+                  }
+                }}
+              >
+                <text style={{ textColor: THEME.borderSubtle }}>│</text>
+              </box>
+
+              {/* Right Side: 6-Tab Inspector */}
+              <box
+                width={panelWidths.inspector}
+                flexGrow={0}
+                minHeight={0}
+                border={true}
+                borderStyle="rounded"
+                borderColor={catalogInspectorBorder}
+                backgroundColor={hasOverlayModal ? THEME.bgPanelDimmed : THEME.bgPanel}
+                title={effectivePane === "inspector" ? " ● Inspector · ◀/▶ Tab " : " Inspector · ⇧→ "}
+                titleColor={effectivePane === "inspector" ? THEME.accentPurple : THEME.fgSecondary}
+                flexDirection="column"
+                paddingLeft={1}
+                paddingRight={1}
+                overflow="hidden"
+                onMouseDown={() => setActivePane("inspector")}
+                onMouseScroll={(_self, event) => {
+                  const dir = (event as any).scroll?.direction
+                  if (!dir) return
+                  const delta = dir === "down" ? 2 : -2
+                  if (inspectorTab === "overview" && currentItem) {
+                    const mdText = currentItem.type === "file" && currentItem.agent
+                      ? (currentItem.agent.description || "No description provided.")
+                      : packDescription(currentItem.category)
+                    const total = layoutMarkdownDocument(mdText, Math.max(16, panelWidths.inspector - 8)).length
+                    const page = Math.max(2, maxVisibleItems - (currentItem.type === "file" ? 7 : 6))
+                    setOverviewScrollOffset(off => Math.max(0, Math.min(Math.max(0, total - page), off + delta)))
+                  } else if (inspectorTab === "prompt" && currentItem?.agent) {
+                    const body = extractFrontmatter(currentItem.agent.rawContent).body.trim() || "*Empty system prompt body.*"
+                    const total = layoutMarkdownDocument(body, Math.max(16, panelWidths.inspector - 8)).length
+                    const page = Math.max(1, wsViewports.promptRows - 1)
+                    setPromptScrollOffset(off => Math.max(0, Math.min(Math.max(0, total - page), off + delta)))
+                  } else if (inspectorTab === "resources") {
+                    setResourceScrollIndex(off => Math.max(0, Math.min(Math.max(0, resourceInspectorLines.length - resourceInspectorPageSize), off + delta)))
+                  } else if (inspectorTab === "security" || inspectorTab === "delegations") {
+                    const ag = currentItem?.agent
+                    const hasErr = Boolean(ag && inspectorTab === "security" && analyzePermissionOrder(ag).hasOrderError)
+                    const secViewport = calculateWorkspaceViewports(termHeight, { hasSecurityOrderError: hasErr })
+                    const pageSize = inspectorTab === "security" ? secViewport.securityRows : secViewport.delegationsInspectorRows
+                    const total = inspectorTab === "security"
+                      ? Object.keys(ag?.frontmatter.permission || {}).filter(k => k !== "task").length
+                      : (ag?.allowedSubagents || []).length
+                    setGraphScrollOffset(off => Math.max(0, Math.min(Math.max(0, total - pageSize), off + delta)))
+                  }
+                }}
+              >
+                {/* Clickable 6-Tab Navigation Bar */}
+                <box
+                  flexDirection="row"
+                  width="100%"
+                  height={2}
+                  borderStyle="single"
+                  border={["bottom"]}
+                  borderColor={THEME.borderSubtle}
+                  alignItems="center"
+                  overflow="hidden"
+                >
+                  {(
+                    [
+                      ["overview", "1 Info", THEME.accentCyan],
+                      ["prompt", "2 Prompt", THEME.accentBlue],
+                      ["naming", "3 Name", THEME.accentAmber],
+                      ["security", "4 Sec", THEME.accentRed],
+                      ["delegations", "5 Graph", THEME.accentGreen],
+                      ["resources", "6 Res", THEME.accentPurple],
+                    ] as const
+                  ).map(([tKey, tLabel, tColor], idx) => {
+                    const active = inspectorTab === tKey
+                    return (
+                      <React.Fragment key={tKey}>
+                        {idx > 0 && <text wrapMode="none" style={{ textColor: THEME.borderSubtle }}>{" "}</text>}
+                        <box
+                          height={1}
+                          paddingLeft={panelWidths.inspector >= 56 ? 1 : 0}
+                          paddingRight={panelWidths.inspector >= 56 ? 1 : 0}
+                          backgroundColor={active ? THEME.bgPillActive : "transparent"}
+                          onMouseDown={(_self, event) => {
+                            event.stopPropagation()
+                            setActivePane("inspector")
+                            setInspectorTab(tKey)
+                            if (tKey === "security" || tKey === "delegations") setGraphScrollOffset(0)
+                            if (tKey === "resources") setResourceScrollIndex(0)
+                          }}
+                        >
+                          <text wrapMode="none" style={{ textColor: active ? tColor : THEME.fgSecondary }} b={active}>
+                            {panelWidths.inspector >= 46 ? tLabel : tLabel.replace(/^\d\s/, "")}
+                          </text>
+                        </box>
+                      </React.Fragment>
+                    )
+                  })}
                 </box>
-              )}
-            </box>
-          ) : (
-            <box flexGrow={1} justifyContent="center" alignItems="center">
-              <text style={{ textColor: "yellow" }}>Select an item to inspect details</text>
-            </box>
+
+                {currentItem ? (
+                  <box flexDirection="column" flexGrow={1} minHeight={0} overflow="hidden" marginTop={1}>
+                    {currentItem.type === "file" && currentItem.agent ? (
+                      <box flexDirection="column" flexGrow={1} minHeight={0} overflow="hidden">
+                        {(() => {
+                          const ag = currentItem.agent
+                          const dotHex = resolveAgentHexColor(ag.frontmatter.color)
+                          const permSummary = getAgentPermissionSummary(ag)
+                          const shortName = ag.filename.replace(/\.md$/, "")
+                          const isOverridden = userOverridesSummary.overriddenAgents.has(`${ag.category}/${shortName}`)
+                          const riskColor = permSummary.riskLevel === "HIGH"
+                            ? THEME.accentRed
+                            : permSummary.riskLevel === "MEDIUM"
+                              ? THEME.accentAmber
+                              : THEME.accentGreen
+
+                          return (
+                            <box flexDirection="row" justifyContent="space-between" width="100%" flexShrink={0}>
+                              <box flexDirection="row" overflow="hidden" flexShrink={1}>
+                                <text style={{ textColor: dotHex }} b>{"● "}</text>
+                                <text wrapMode="none" overflow="hidden" style={{ textColor: "#ffffff" }} b>
+                                  {middleEllipsis(terminalSafeText(shortName), Math.max(12, panelWidths.inspector - 18))}
+                                </text>
+                                {isOverridden && (
+                                  <text wrapMode="none" style={{ textColor: THEME.accentPurple }}>{" ✎"}</text>
+                                )}
+                              </box>
+                              <text wrapMode="none" flexShrink={0} style={{ textColor: riskColor }} b>
+                                {`${permSummary.riskLevel}`}
+                              </text>
+                            </box>
+                          )
+                        })()}
+
+                        {/* TAB 1: OVERVIEW */}
+                        {inspectorTab === "overview" && (() => {
+                          const ag = currentItem.agent
+                          const inspInner = Math.max(18, panelWidths.inspector - 4)
+                          const stepsNum = resolveAgentSteps(ag.frontmatter)
+                          const modeText = `${resolveAgentTuningMode(ag.frontmatter.mode)}${ag.frontmatter.hidden ? " · hidden" : ""}`
+                          const gaugeW = Math.max(6, Math.min(12, inspInner - 28))
+                          const effortText = terminalSafeText(`${String(ag.frontmatter.variant ?? "default")}${ag.frontmatter.reasoningEffort ?? ag.frontmatter.options?.reasoningEffort ? ` (${String(ag.frontmatter.reasoningEffort ?? ag.frontmatter.options?.reasoningEffort)})` : ""}`)
+
+                          return (
+                            <box flexDirection="column" marginTop={1} flexGrow={1} minHeight={0} overflow="hidden">
+                              <box height={1} flexShrink={0} flexDirection="row" justifyContent="space-between">
+                                <text height={1} style={{ textColor: THEME.fgSecondary }}>Pack</text>
+                                <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: THEME.accentAmber }} b>
+                                  {middleEllipsis(terminalSafeText(ag.category), Math.max(10, inspInner - 8))}
+                                </text>
+                              </box>
+
+                              <box
+                                height={1}
+                                flexShrink={0}
+                                flexDirection="row"
+                                justifyContent="space-between"
+                                onMouseDown={(_self, event) => {
+                                  event.stopPropagation()
+                                  openModelOrFlowsAction()
+                                }}
+                              >
+                                <text height={1} style={{ textColor: THEME.fgSecondary }}>Model [M]</text>
+                                <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: THEME.accentCyan }} u>
+                                  {middleEllipsis(modelDisplayValue(ag, false, modelCatalog), Math.max(10, inspInner - 12))}
+                                </text>
+                              </box>
+
+                              <box
+                                height={1}
+                                flexShrink={0}
+                                flexDirection="row"
+                                justifyContent="space-between"
+                                onMouseDown={(_self, event) => {
+                                  event.stopPropagation()
+                                  openTuningModalAction()
+                                }}
+                              >
+                                <text height={1} style={{ textColor: THEME.fgSecondary }}>Effort [T]</text>
+                                <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: ag.frontmatter.variant ? THEME.accentPurple : THEME.fgMuted }}>
+                                  {middleEllipsis(effortText, Math.max(10, inspInner - 12))}
+                                </text>
+                              </box>
+
+                              <box
+                                height={1}
+                                flexShrink={0}
+                                flexDirection="row"
+                                justifyContent="space-between"
+                                onMouseDown={(_self, event) => {
+                                  event.stopPropagation()
+                                  openTuningModalAction()
+                                }}
+                              >
+                                <text height={1} style={{ textColor: THEME.fgSecondary }}>Mode [T]</text>
+                                <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: ag.frontmatter.hidden ? THEME.accentRed : THEME.accentAmber }}>
+                                  {middleEllipsis(modeText, Math.max(10, inspInner - 12))}
+                                </text>
+                              </box>
+
+                              <box
+                                height={1}
+                                flexShrink={0}
+                                flexDirection="row"
+                                justifyContent="space-between"
+                                onMouseDown={(_self, event) => {
+                                  event.stopPropagation()
+                                  openTuningModalAction()
+                                }}
+                              >
+                                <text height={1} style={{ textColor: THEME.fgSecondary }}>Steps</text>
+                                <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: THEME.accentBlue }}>
+                                  {`${gaugeBar(Math.min(1, Math.max(0, stepsNum / 100)), gaugeW)} ${stepsNum}`}
+                                </text>
+                              </box>
+
+                              <box
+                                flexDirection="column"
+                                marginTop={1}
+                                flexGrow={1}
+                                minHeight={0}
+                                border={true}
+                                borderStyle="rounded"
+                                borderColor={THEME.borderSubtle}
+                                backgroundColor={THEME.bgInput}
+                                paddingLeft={1}
+                                paddingRight={1}
+                                overflow="hidden"
+                              >
+                                <PromptMarkdownView
+                                  markdown={ag.description || "No description provided."}
+                                  width={Math.max(16, panelWidths.inspector - 8)}
+                                  maxRows={Math.max(2, maxVisibleItems - 7)}
+                                  scrollOffset={overviewScrollOffset}
+                                  showFooter={false}
+                                />
+                              </box>
+                            </box>
+                          )
+                        })()}
+
+                        {/* TAB 2: MARKDOWN PROMPT PREVIEW */}
+                        {inspectorTab === "prompt" && (() => {
+                          const rawBody = extractFrontmatter(currentItem.agent.rawContent).body.trim()
+                          const mdBody = rawBody || "*Empty system prompt body.*"
+                          const promptInnerWidth = Math.max(16, panelWidths.inspector - 8)
+                          const promptMaxRows = wsViewports.promptRows
+                          return (
+                            <box
+                              flexDirection="column"
+                              marginTop={1}
+                              flexGrow={1}
+                              minHeight={0}
+                              border={true}
+                              borderStyle="rounded"
+                              borderColor={THEME.borderSubtle}
+                              backgroundColor={THEME.bgInput}
+                              paddingLeft={1}
+                              paddingRight={1}
+                              overflow="hidden"
+                            >
+                              <PromptMarkdownView
+                                markdown={mdBody}
+                                width={promptInnerWidth}
+                                maxRows={promptMaxRows}
+                                scrollOffset={promptScrollOffset}
+                                onScrollDelta={delta => {
+                                  const total = layoutMarkdownDocument(mdBody, promptInnerWidth).length
+                                  setPromptScrollOffset(off => Math.max(0, Math.min(Math.max(0, total - promptMaxRows), off + delta)))
+                                }}
+                              />
+                            </box>
+                          )
+                        })()}
+
+                        {/* TAB 3: NAMING CONVENTION */}
+                        {inspectorTab === "naming" && (
+                          <box flexDirection="column" marginTop={1} flexGrow={1}>
+                            {(() => {
+                              const analysis = analyzeAgentName(currentItem.agent.filename, allAgentFilenames)
+                              return (
+                                <box
+                                  flexDirection="column"
+                                  border={true}
+                                  borderStyle="rounded"
+                                  borderColor={THEME.borderSubtle}
+                                  backgroundColor={THEME.bgInput}
+                                  padding={1}
+                                  flexGrow={1}
+                                >
+                                  <box flexDirection="row" justifyContent="space-between" flexShrink={0}>
+                                    <text style={{ textColor: THEME.fgPrimary }} b>Naming Status</text>
+                                    <text style={{ textColor: analysis.isValid ? THEME.accentGreen : THEME.accentAmber }} b>
+                                      {analysis.isValid ? "✓ Compliant" : "⚠ Non-Compliant"}
+                                    </text>
+                                  </box>
+                                  <box flexDirection="row" marginTop={1}>
+                                    <text style={{ textColor: THEME.fgSecondary }} width="35%">Family:</text>
+                                    <text style={{ textColor: THEME.accentCyan }}>{middleEllipsis(analysis.family || "(none)", 30)}</text>
+                                  </box>
+                                  <box flexDirection="row">
+                                    <text style={{ textColor: THEME.fgSecondary }} width="35%">Pack:</text>
+                                    <text style={{ textColor: THEME.accentAmber }}>{middleEllipsis(analysis.category || "(none)", 30)}</text>
+                                  </box>
+                                  <box flexDirection="row">
+                                    <text style={{ textColor: THEME.fgSecondary }} width="35%">Role:</text>
+                                    <text style={{ textColor: THEME.fgPrimary }}>{middleEllipsis(analysis.role || "(none)", 30)}</text>
+                                  </box>
+                                  {!analysis.isValid && analysis.suggestedName && (
+                                    <box flexDirection="column" marginTop={1}>
+                                      <text style={{ textColor: THEME.fgSecondary }}>Suggested Name:</text>
+                                      <text style={{ textColor: THEME.accentGreen }} b>{middleEllipsis(analysis.suggestedName, 40)}</text>
+                                    </box>
+                                  )}
+                                  {!isReadOnlyGitSource && (
+                                    <text
+                                      style={{ textColor: THEME.accentCyan }}
+                                      marginTop={1}
+                                      u
+                                      onMouseDown={(_self, event) => {
+                                        event.stopPropagation()
+                                        executeActionById("agent-rename")
+                                      }}
+                                    >
+                                      [R] Open Rename Assistant
+                                    </text>
+                                  )}
+                                </box>
+                              )
+                            })()}
+                          </box>
+                        )}
+
+                        {/* TAB 4: SECURITY MATRIX */}
+                        {inspectorTab === "security" && (
+                          <box flexDirection="column" marginTop={1} flexGrow={1} minHeight={0}>
+                            {(() => {
+                              const orderCheck = analyzePermissionOrder(currentItem.agent)
+                              const perm = currentItem.agent.frontmatter.permission || {}
+                              const permissionEntries = Object.entries(perm).filter(([k]) => k !== "task")
+                              const permissionPageSize = calculateWorkspaceViewports(termHeight, { hasSecurityOrderError: orderCheck.hasOrderError }).securityRows
+
+                              return (
+                                <box
+                                  flexDirection="column"
+                                  border={true}
+                                  borderStyle="rounded"
+                                  borderColor={THEME.borderSubtle}
+                                  backgroundColor={THEME.bgInput}
+                                  padding={1}
+                                  flexGrow={1}
+                                  overflow="hidden"
+                                >
+                                  <box flexDirection="row" justifyContent="space-between" flexShrink={0}>
+                                    <text style={{ textColor: THEME.fgPrimary }} b>Permissions</text>
+                                    <text
+                                      style={{ textColor: THEME.accentCyan }}
+                                      u
+                                      onMouseDown={(_self, event) => {
+                                        event.stopPropagation()
+                                        executeActionById("agent-permissions")
+                                      }}
+                                    >
+                                      [P] Preset
+                                    </text>
+                                  </box>
+
+                                  {orderCheck.hasOrderError && (
+                                    <box flexDirection="column" marginTop={1} backgroundColor={THEME.bgDangerSoft} paddingLeft={1} paddingRight={1}>
+                                      <text style={{ textColor: THEME.accentRed }} b>⚠ Wildcard "*": "deny" must be first!</text>
+                                      <text style={{ textColor: THEME.accentAmber }} u>[Press SHIFT+F to fix order]</text>
+                                    </box>
+                                  )}
+
+                                  <box flexDirection="column" marginTop={1} flexGrow={1} overflow="hidden">
+                                    {permissionEntries.slice(graphScrollOffset, graphScrollOffset + permissionPageSize).map(([k, val]) => {
+                                      const valStr = typeof val === "object" ? JSON.stringify(val) : String(val)
+                                      const safeKey = middleEllipsis(k, Math.max(10, Math.floor((panelWidths.inspector - 8) * 0.48)))
+                                      const safeVal = middleEllipsis(valStr, Math.max(10, Math.floor((panelWidths.inspector - 8) * 0.48)))
+                                      const isDanger = k === "bash" && (val === "allow" || val === true || valStr.includes("allow"))
+                                      return (
+                                        <box key={k} flexDirection="row" justifyContent="space-between">
+                                          <text wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgSecondary }}>{safeKey}</text>
+                                          <text wrapMode="none" overflow="hidden" style={{ textColor: isDanger ? THEME.accentRed : valStr.includes("deny") ? THEME.fgMuted : THEME.accentCyan }}>{safeVal}</text>
+                                        </box>
+                                      )
+                                    })}
+                                  </box>
+                                  {permissionEntries.length > permissionPageSize && (
+                                    <text style={{ textColor: THEME.fgMuted }} flexShrink={0}>
+                                      {`▲ ${graphScrollOffset + 1}-${Math.min(graphScrollOffset + permissionPageSize, permissionEntries.length)}/${permissionEntries.length} ▼ (scroll)`}
+                                    </text>
+                                  )}
+                                </box>
+                              )
+                            })()}
+                          </box>
+                        )}
+
+                        {/* TAB 5: DELEGATIONS GRAPH */}
+                        {inspectorTab === "delegations" && (
+                          <box flexDirection="column" marginTop={1} flexGrow={1} minHeight={0}>
+                            {(() => {
+                              const allowed = currentItem.agent.allowedSubagents || []
+                              const delInspectorPageSize = wsViewports.delegationsInspectorRows
+                              return (
+                                <box flexDirection="column" flexGrow={1} minHeight={0}>
+                                  <box flexDirection="row" justifyContent="space-between" flexShrink={0}>
+                                    <text style={{ textColor: THEME.fgSecondary }}>{`Authorized (${allowed.length})`}</text>
+                                    <text
+                                      style={{ textColor: THEME.accentCyan }}
+                                      u
+                                      onMouseDown={(_self, event) => {
+                                        event.stopPropagation()
+                                        executeActionById("agent-delegations")
+                                      }}
+                                    >
+                                      [G] Edit
+                                    </text>
+                                  </box>
+
+                                  <box
+                                    border={true}
+                                    borderStyle="rounded"
+                                    borderColor={THEME.borderSubtle}
+                                    backgroundColor={THEME.bgInput}
+                                    padding={1}
+                                    marginTop={1}
+                                    flexGrow={1}
+                                    overflow="hidden"
+                                  >
+                                    {allowed.length > 0 ? (
+                                      allowed.slice(graphScrollOffset, graphScrollOffset + delInspectorPageSize).map((subName, sliceIdx) => {
+                                        const absIdx = graphScrollOffset + sliceIdx
+                                        const isSubFocused = effectivePane === "inspector" && absIdx === catalogDelFocus
+                                        const targetAg = agents.find((a) => a.filename.replace(/\.md$/, "") === subName)
+                                        return (
+                                          <box
+                                            key={subName}
+                                            flexDirection="row"
+                                            justifyContent="space-between"
+                                            backgroundColor={isSubFocused ? THEME.bgRowFocus : "transparent"}
+                                            onMouseDown={(_self, event) => {
+                                              event.stopPropagation()
+                                              setActivePane("inspector")
+                                              setCatalogDelFocus(absIdx)
+                                              if (targetAg) jumpToCatalogAgent(targetAg.currentPath)
+                                            }}
+                                          >
+                                            <text
+                                              wrapMode="none"
+                                              overflow="hidden"
+                                              style={{ textColor: isSubFocused ? "#ffffff" : targetAg ? THEME.accentCyan : THEME.accentRed }}
+                                              b={isSubFocused}
+                                            >
+                                              {middleEllipsis(
+                                                targetAg
+                                                  ? `${isSubFocused ? "▎ " : ""}├─▶ @${subName}${isSubFocused ? " [Enter: Jump]" : ""}`
+                                                  : `${isSubFocused ? "▎ " : ""}├─▶ ❌ @${subName} (Dead Ref)`,
+                                                Math.max(14, panelWidths.inspector - 8),
+                                              )}
+                                            </text>
+                                          </box>
+                                        )
+                                      })
+                                    ) : (
+                                      <text style={{ textColor: THEME.fgMuted }}>Leaf agent · no @subagents authorized.</text>
+                                    )}
+                                    {allowed.length > delInspectorPageSize && (
+                                      <text style={{ textColor: THEME.fgMuted }} flexShrink={0}>
+                                        {`▲ ${graphScrollOffset + 1}-${Math.min(graphScrollOffset + delInspectorPageSize, allowed.length)}/${allowed.length} ▼`}
+                                      </text>
+                                    )}
+                                  </box>
+                                </box>
+                              )
+                            })()}
+                          </box>
+                        )}
+
+                        {/* TAB 6: RESOURCES */}
+                        {inspectorTab === "resources" && (
+                          <box flexDirection="column" marginTop={1} flexGrow={1} minHeight={0} overflow="hidden">
+                            {resourceInspector.error ? (
+                              <text style={{ textColor: THEME.accentRed }}>{resourceInspector.error}</text>
+                            ) : (
+                              <>
+                                <box
+                                  flexDirection="column"
+                                  flexGrow={1}
+                                  minHeight={0}
+                                  border={true}
+                                  borderStyle="rounded"
+                                  borderColor={THEME.borderSubtle}
+                                  backgroundColor={THEME.bgInput}
+                                  paddingLeft={1}
+                                  paddingRight={1}
+                                  overflow="hidden"
+                                >
+                                  {resourceInspectorLines.slice(resourceScrollIndex, resourceScrollIndex + resourceInspectorPageSize).map((line, index) => (
+                                    <text
+                                      key={`${resourceScrollIndex}-${index}`}
+                                      style={{
+                                        textColor: line.startsWith("---")
+                                          ? THEME.accentAmber
+                                          : line.includes("[DENY]") || line.includes("[Dead Ref]")
+                                            ? THEME.accentRed
+                                            : line.includes("[ALLOW]")
+                                              ? THEME.accentGreen
+                                              : THEME.fgPrimary,
+                                      }}
+                                      wrapMode="none"
+                                      overflow="hidden"
+                                    >
+                                      {middleEllipsis(line, Math.max(1, panelWidths.inspector - 6))}
+                                    </text>
+                                  ))}
+                                </box>
+                                <box flexDirection="row" justifyContent="space-between" flexShrink={0}>
+                                  <text
+                                    style={{ textColor: THEME.accentCyan }}
+                                    u
+                                    onMouseDown={(_self, event) => {
+                                      event.stopPropagation()
+                                      executeActionById("agent-resources")
+                                    }}
+                                  >
+                                    [U] Edit Skills, Tools &amp; MCP
+                                  </text>
+                                  {resourceInspectorLines.length > resourceInspectorPageSize && (
+                                    <text style={{ textColor: THEME.fgMuted }}>
+                                      {`${resourceScrollIndex + 1}/${resourceInspectorLines.length}`}
+                                    </text>
+                                  )}
+                                </box>
+                              </>
+                            )}
+                          </box>
+                        )}
+                      </box>
+                    ) : (
+                      /* Pack Folder Inspector */
+                      <box flexDirection="column" flexGrow={1} overflow="hidden">
+                        <box flexDirection="row" justifyContent="space-between" width="100%">
+                          <text wrapMode="none" overflow="hidden" style={{ textColor: THEME.accentAmber }} b>
+                            {middleEllipsis(`📦 ${terminalSafeText(currentItem.category)}`, Math.max(14, panelWidths.inspector - 18))}
+                          </text>
+                          <text
+                            wrapMode="none"
+                            style={{ textColor: THEME.accentGreen }}
+                            b
+                            u
+                            onMouseDown={(_self, event) => {
+                              event.stopPropagation()
+                              previewInstall(currentItem.category)
+                            }}
+                          >
+                            [E] Install
+                          </text>
+                        </box>
+                        <text wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgMuted }} marginTop={1}>
+                          {middleEllipsis(`Dir: ${path.relative(workspaceRoot, packDir(workspaceRoot, currentItem.category) ?? workspaceRoot) || "."}/`, Math.max(16, panelWidths.inspector - 4))}
+                        </text>
+                        {(() => {
+                          const folderDir = packDir(workspaceRoot, currentItem.category)
+                          const isVirtual = Boolean(folderDir && !fs.existsSync(path.join(folderDir, "opencode-pack.json")))
+                          const lockedPack = targetStatusInfo?.lock?.packs?.[currentItem.category]
+                          return (
+                            <box flexDirection="column" marginTop={1}>
+                              <text wrapMode="none" overflow="hidden" style={{ textColor: isVirtual ? THEME.accentCyan : THEME.accentGreen }}>
+                                {middleEllipsis(
+                                  isVirtual ? "Format: Virtual .md Pack" : `Format: OpenCode Pack${lockedPack ? ` · installed (${lockedPack.version})` : ""}`,
+                                  Math.max(16, panelWidths.inspector - 4),
+                                )}
+                              </text>
+                              <box flexDirection="row" marginTop={1} gap={2}>
+                                <text
+                                  wrapMode="none"
+                                  style={{ textColor: THEME.accentCyan }}
+                                  u
+                                  onMouseDown={(_self, event) => {
+                                    event.stopPropagation()
+                                    openPackFlowsModal(currentItem.category)
+                                  }}
+                                >
+                                  [M] IF/OR Flows
+                                </text>
+                                {isVirtual ? (
+                                  <text
+                                    wrapMode="none"
+                                    style={{ textColor: THEME.accentGreen }}
+                                    b
+                                    u
+                                    onMouseDown={(_self, event) => {
+                                      event.stopPropagation()
+                                      openInitPackModal()
+                                    }}
+                                  >
+                                    {isReadOnlyGitSource ? "[I] Clone & Onboard" : "[I] Onboard Pack"}
+                                  </text>
+                                ) : !isReadOnlyGitSource ? (
+                                  <>
+                                    <text
+                                      wrapMode="none"
+                                      style={{ textColor: THEME.accentAmber }}
+                                      u
+                                      onMouseDown={(_self, event) => {
+                                        event.stopPropagation()
+                                        openPackDoctorModal("doctor")
+                                      }}
+                                    >
+                                      [D] Pack Doctor
+                                    </text>
+                                    <text
+                                      wrapMode="none"
+                                      style={{ textColor: THEME.accentGreen }}
+                                      u
+                                      onMouseDown={(_self, event) => {
+                                        event.stopPropagation()
+                                        openPackDoctorModal("scaffold")
+                                      }}
+                                    >
+                                      [N] New Resource
+                                    </text>
+                                  </>
+                                ) : null}
+                              </box>
+                            </box>
+                          )
+                        })()}
+                        <box
+                          border={true}
+                          borderStyle="rounded"
+                          borderColor={THEME.borderSubtle}
+                          backgroundColor={THEME.bgInput}
+                          paddingLeft={1}
+                          paddingRight={1}
+                          marginTop={1}
+                          flexGrow={1}
+                          overflow="hidden"
+                        >
+                          <PromptMarkdownView
+                            markdown={packDescription(currentItem.category)}
+                            width={Math.max(16, panelWidths.inspector - 8)}
+                            maxRows={Math.max(2, maxVisibleItems - 6)}
+                            scrollOffset={overviewScrollOffset}
+                            showFooter={false}
+                          />
+                        </box>
+                      </box>
+                    )}
+                  </box>
+                ) : (
+                  <box flexGrow={1} justifyContent="center" alignItems="center">
+                    <text style={{ textColor: THEME.fgSecondary }}>Select a pack or agent to inspect</text>
+                  </box>
+                )}
+              </box>
+            </>
           )}
+        </box>
+      )}
 
-         </box></>}
-      </box>
+      {/* Slim Contextual Pill Footer */}
+      {(() => {
+        const footerBudget = Math.max(20, termWidth - 6)
+        const isTailChip = (id: string) => id === "pane-toggle" || id === "palette" || id === "help"
+        const tailChips = contextualChips.filter(c => isTailChip(c.actionId))
+        const bodyChips = contextualChips.filter(c => !isTailChip(c.actionId))
+        const chipWidth = (c: { key: string; label: string }) => displayWidth(c.key) + 1 + displayWidth(c.label) + 2
+        const reservedTail = tailChips.reduce((s, c) => s + chipWidth(c) + 1, 0)
+        let used = 0
+        const fittedBody = bodyChips.filter(c => {
+          const w = chipWidth(c) + (used > 0 ? 1 : 0)
+          if (used + w + reservedTail <= footerBudget) {
+            used += w
+            return true
+          }
+          return false
+        })
 
-        {(() => {
-          const footerInnerWidth = Math.max(0, termWidth - 6)
-          const compact = footerInnerWidth < 118
-          const showInitHint = isWorkspaceVirtualPack
-            const footerRows = viewMode !== "main" ? [[], [], []] : compact ? [
-              [["O", "Sources"], ["SPACE", "Sel"], ["A", "All"], ["S", "Match"], ["/", "Search"], ["1-5", "Tabs"]],
-              [["M", "Mod/Flows"], ["C", "Col"], ["P", "Perm"], ["G", "Del"], ["T", "Tun"], ["S+T", "Tier"], ["S+L", "Layout"]],
-              [["B", "Claude"], ["S+B", "Codex"], ["R", "Rename"], ["E", "Install"], ...(showInitHint ? [["I", "InitPack"]] : []), ["V", "Repair"], ["U", "Resources"]]
-            ] : [
-              [["O", "Sources"], ["SPACE", "Select"], ["A", "All"], ["S", "Same model"], ["/", "Search"], ["1-5", "Inspector"]],
-              [["M", "Model/Flows"], ["C", "Color"], ["P", "Permissions"], ["G", "Delegations"], ["T", "Tune"], ["SHIFT+T", "Tier"], ["V", "Repair"]],
-              [["B", "Claude bridge"], ["SHIFT+B", "Codex bridge"], ["R", "Rename"], ["E", "Install"], ...(showInitHint ? [["I", "Init pack"]] : []), ["U", "Skills/Tools"], ["SHIFT+L", "Layout"]]
-          ]
-         return (
-           <box height={5} flexShrink={0} overflow="hidden" flexDirection="column" borderStyle="single" borderColor="#2B5581" paddingLeft={1} paddingRight={1}>
-             {footerRows.map((row, rowIndex) => (
-               <box key={rowIndex} height={1} flexShrink={0} flexDirection="row" overflow="hidden">
-                 {row.map(([shortcut, action], index) => (
-                   <React.Fragment key={shortcut}>
-                      {index > 0 && <text wrapMode="none" flexShrink={0} style={{ textColor: "#E1E4E8" }}>{compact ? " " : " | "}</text>}
-                     <text wrapMode="none" flexShrink={0} style={{ textColor: "#E1E4E8" }}>{`[${shortcut}]`}</text>
-                     <text wrapMode="none" flexShrink={0} style={{ textColor: "#E1E4E8" }}>{` ${action}`}</text>
-                   </React.Fragment>
-                 ))}
-               </box>
-             ))}
-           </box>
-         )
-       })()}
+        return (
+          <box
+            width="100%"
+            height={3}
+            flexShrink={0}
+            border={true}
+            borderStyle="rounded"
+            borderColor={THEME.borderSubtle}
+            backgroundColor={hasOverlayModal ? THEME.bgPanelDimmed : THEME.bgPanel}
+            paddingLeft={1}
+            paddingRight={1}
+            flexDirection="row"
+            alignItems="center"
+            justifyContent="space-between"
+            overflow="hidden"
+          >
+            <box flexDirection="row" alignItems="center" overflow="hidden" flexShrink={0}>
+              {fittedBody.map((chip, index) => (
+                <React.Fragment key={`${chip.key}-${chip.actionId}`}>
+                  {index > 0 && (
+                    <text height={1} wrapMode="none" flexShrink={0} style={{ textColor: THEME.borderSubtle }}>
+                      {" "}
+                    </text>
+                  )}
+                  <box
+                    height={1}
+                    paddingLeft={1}
+                    paddingRight={1}
+                    flexShrink={0}
+                    backgroundColor={chip.accent ? THEME.bgPillActive : THEME.bgPill}
+                    onMouseDown={() => executeActionById(chip.actionId)}
+                  >
+                    <box flexDirection="row">
+                      <text height={1} wrapMode="none" style={{ textColor: chip.accent ? THEME.accentCyan : THEME.accentAmber }} b>
+                        {chip.key}
+                      </text>
+                      <text height={1} wrapMode="none" style={{ textColor: THEME.fgPrimary }}>
+                        {` ${chip.label}`}
+                      </text>
+                    </box>
+                  </box>
+                </React.Fragment>
+              ))}
+            </box>
 
-       {viewMode === "layout" && (
-         <box style={{ position: "absolute", left: "10%", top: "24%", width: "80%", height: "52%" }} borderStyle="double" borderColor="cyan" backgroundColor="#1e1e1e" title=" Layout " titleColor="cyan" padding={1} flexDirection="column" justifyContent="space-between" overflow="hidden">
-           <box flexDirection="column" overflow="hidden">
-             <text style={{ textColor: "white" }} b>Adjust the normal list / inspector split</text>
-             <text style={{ textColor: "cyan" }} marginTop={1}>{`List ${Math.round(layoutDraft * 100)}%  /  Inspector ${Math.round((1 - layoutDraft) * 100)}%`}</text>
-             <text style={{ textColor: "gray" }} marginTop={1} wrapMode="none" overflow="hidden">{`[${"=".repeat(Math.max(1, Math.round(layoutDraft * 30)))}|${"-".repeat(Math.max(1, 30 - Math.round(layoutDraft * 30)))}]`}</text>
-             <text style={{ textColor: "gray" }} marginTop={1}>Preview applies to normal mode; the inspector may be hidden at this width.</text>
-             {configReadOnly && <text style={{ textColor: "yellow" }} marginTop={1}>Environment override is read-only: preview only; Enter will not save.</text>}
-             {layoutError && <text style={{ textColor: "red" }} marginTop={1} wrapMode="none" overflow="hidden">{layoutError}</text>}
-           </box>
-           <box borderStyle="single" border={['top']} borderColor="#333333" paddingTop={1}>
-             <text style={{ textColor: "gray" }}>←/→ or h/l adjust | ↑/↓ also adjust | Home .60 | End .75 | R reset</text>
-             <text style={{ textColor: "green" }}>[ENTER] Save | [ESC] Cancel</text>
-           </box>
-         </box>
-       )}
+            <box flexDirection="row" alignItems="center" overflow="hidden" flexShrink={0}>
+              {tailChips.map((chip, index) => (
+                <React.Fragment key={`tail-${chip.key}-${chip.actionId}`}>
+                  {index > 0 && (
+                    <text height={1} wrapMode="none" flexShrink={0} style={{ textColor: THEME.borderSubtle }}>
+                      {" "}
+                    </text>
+                  )}
+                  <box
+                    height={1}
+                    paddingLeft={1}
+                    paddingRight={1}
+                    flexShrink={0}
+                    backgroundColor={chip.accent ? THEME.bgPillActive : THEME.bgPill}
+                    onMouseDown={() => executeActionById(chip.actionId)}
+                  >
+                    <box flexDirection="row">
+                      <text height={1} wrapMode="none" style={{ textColor: chip.accent ? THEME.accentCyan : THEME.accentAmber }} b>
+                        {chip.key === "Ctrl+K" ? "⌘K" : chip.key}
+                      </text>
+                      <text height={1} wrapMode="none" style={{ textColor: THEME.fgPrimary }}>
+                        {` ${chip.label}`}
+                      </text>
+                    </box>
+                  </box>
+                </React.Fragment>
+              ))}
+            </box>
+          </box>
+        )
+      })()}
 
-       {/* Modal - Permission Presets */}
+      {viewMode === "layout" && (
+        <box
+          style={{ position: "absolute", left: "14%", top: "24%", width: "72%", height: "48%" }}
+          zIndex={45}
+          border={true}
+          borderStyle="rounded"
+          borderColor={THEME.accentCyan}
+          backgroundColor={THEME.bgElevated}
+          title=" Split Layout & Motion "
+          titleColor={THEME.accentCyan}
+          padding={1}
+          flexDirection="column"
+          justifyContent="space-between"
+          overflow="hidden"
+        >
+          <box flexDirection="column" overflow="hidden">
+            <text style={{ textColor: THEME.fgPrimary }} b>
+              Adjust Catalog / Inspector split (or drag the center divider with the mouse)
+            </text>
+            <text style={{ textColor: THEME.accentCyan }} marginTop={1} b>
+              {`Left ${Math.round(layoutDraft * 100)}%   │   Right ${Math.round((1 - layoutDraft) * 100)}%`}
+            </text>
+            <text style={{ textColor: THEME.accentBlue }} marginTop={1} wrapMode="none" overflow="hidden">
+              {fractionalBar((layoutDraft - 0.60) / 0.15, Math.min(40, Math.max(16, termWidth - 28)), "─")}
+            </text>
+            {configReadOnly && (
+              <text style={{ textColor: THEME.accentAmber }} marginTop={1}>
+                Environment override is read-only: preview only; Enter will not save.
+              </text>
+            )}
+            {layoutError && (
+              <text style={{ textColor: THEME.accentRed }} marginTop={1} wrapMode="none" overflow="hidden">
+                {layoutError}
+              </text>
+            )}
+          </box>
+          <box borderStyle="single" border={["top"]} borderColor={THEME.borderSubtle} paddingTop={1} flexDirection="row" justifyContent="space-between">
+            <text style={{ textColor: THEME.fgSecondary }}>←/→ or h/l adjust · Home 60% · End 75% · R reset</text>
+            <text style={{ textColor: THEME.accentGreen }} b>[ENTER] Save · [ESC] Cancel</text>
+          </box>
+        </box>
+      )}
+
+      {/* Modal - Permission Presets */}
       {viewMode === "permission-preset" && (
         <box
-          style={{
-            position: "absolute",
-           left: "8%",
-           top: "8%",
-           width: "84%",
-           height: "84%"
-          }}
-          borderStyle="double"
-          borderColor="#E74C3C"
-          backgroundColor="#1e1e1e"
+          style={{ position: "absolute", left: "10%", top: "10%", width: "80%", height: "80%" }}
+          zIndex={45}
+          border={true}
+          borderStyle="rounded"
+          borderColor={THEME.borderDanger}
+          backgroundColor={THEME.bgElevated}
           title=" Apply Safety Preset "
-          titleColor="#E74C3C"
+          titleColor={THEME.accentRed}
           padding={1}
           flexDirection="column"
           justifyContent="space-between"
         >
           <box flexDirection="column">
-            <text style={{ textColor: "white" }} paddingBottom={1}>
-              Select safety preset to apply to {selectedAgentPaths.size > 0 ? selectedAgentPaths.size : 1} agents:
+            <text style={{ textColor: THEME.fgPrimary }} paddingBottom={1}>
+              Select safety preset to apply to {selectedAgentPaths.size > 0 ? selectedAgentPaths.size : 1} agent(s):
             </text>
             <box flexDirection="column" marginTop={1}>
               {SAFETY_PRESETS.map((preset, idx) => {
@@ -3402,15 +5938,16 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                 return (
                   <box
                     key={preset.key}
-                    backgroundColor={isFocused ? "#2B5581" : "transparent"}
+                    backgroundColor={isFocused ? THEME.bgRowFocus : "transparent"}
                     padding={1}
                     flexDirection="column"
                     marginTop={idx > 0 ? 1 : 0}
+                    onMouseDown={() => setFocusedPresetIndex(idx)}
                   >
-                    <text style={{ textColor: isFocused ? "#FFFFFF" : "yellow" }} b>
-                      {isFocused ? `► ${preset.name}` : `  ${preset.name}`}
+                    <text style={{ textColor: isFocused ? "#FFFFFF" : THEME.accentAmber }} b>
+                      {isFocused ? `▎ ${preset.name}` : `  ${preset.name}`}
                     </text>
-                    <text style={{ textColor: "#E1E4E8" }}>
+                    <text style={{ textColor: THEME.fgSecondary }}>
                       {`   ${preset.description}`}
                     </text>
                   </box>
@@ -3419,9 +5956,9 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
             </box>
           </box>
 
-          <box justifyContent="space-between" borderStyle="single" border={["top"]} borderColor="#333333" paddingTop={1} flexShrink={0}>
-            <text style={{ textColor: "gray" }}>[↑/↓] Select Preset | [ENTER] Apply to Selected</text>
-            <text style={{ textColor: "red" }} b>[ESC] Cancel</text>
+          <box justifyContent="space-between" borderStyle="single" border={["top"]} borderColor={THEME.borderSubtle} paddingTop={1} flexShrink={0}>
+            <text style={{ textColor: THEME.fgSecondary }}>[↑/↓] Choose Preset · [ENTER] Apply</text>
+            <text style={{ textColor: THEME.accentRed }} b onMouseDown={() => setViewMode("main")}>[ESC] Cancel</text>
           </box>
         </box>
       )}
@@ -3429,30 +5966,37 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       {/* Modal - Subagent Delegation Manager */}
       {viewMode === "delegation-manager" && delegationTargetAgent && (
         <box
-          style={{
-            position: "absolute",
-            left: "12%",
-            top: "12%",
-            width: "76%",
-            height: "76%"
-          }}
-          borderStyle="double"
-          borderColor="#3498DB"
-          backgroundColor="#1e1e1e"
-           title={` Delegation Manager: ${middleEllipsis(delegationTargetAgent.filename, 45)} `}
-          titleColor="#3498DB"
+          position="absolute"
+          left={delegationViewport.left}
+          top={delegationViewport.top}
+          width={delegationViewport.modalWidth}
+          height={delegationViewport.modalHeight}
+          zIndex={45}
+          border={true}
+          borderStyle="rounded"
+          borderColor={THEME.accentBlue}
+          backgroundColor={THEME.bgElevated}
+          title={` Delegation Manager: ${middleEllipsis(delegationTargetAgent.filename, 45)} `}
+          titleColor={THEME.accentBlue}
           padding={1}
           flexDirection="column"
           justifyContent="space-between"
+          overflow="hidden"
+          onMouseScroll={(_self, event) => {
+            const dir = (event as any).scroll?.direction
+            if (!dir) return
+            const delta = dir === "down" ? 2 : -2
+            setDelegationScrollOffset(off => Math.max(0, Math.min(Math.max(0, delegationItems.length - maxVisibleDelegations), off + delta)))
+          }}
         >
-          <box flexDirection="column" flexGrow={1} overflow="hidden">
-            <text style={{ textColor: "white" }} flexShrink={0}>
-              Toggle subagents authorized for invocation via permission.task:
+          <box flexDirection="column" flexGrow={1} minHeight={0} overflow="hidden">
+            <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgPrimary }} flexShrink={0}>
+              Toggle @subagents authorized for invocation (click row or press Space):
             </text>
 
-            <box flexDirection="column" marginTop={1} flexGrow={1} overflow="hidden">
-              {visibleDelegationItems.map((ag) => {
-                const idx = delegationItems.indexOf(ag)
+            <box flexDirection="column" marginTop={1} flexGrow={1} minHeight={0} overflow="hidden">
+              {visibleDelegationItems.map((ag, offsetIdx) => {
+                const idx = delegationScrollOffset + offsetIdx
                 const subName = ag.filename.replace(/\.md$/, "")
                 const isSelected = selectedDelegations.has(subName)
                 const isFocused = idx === focusedDelegationIndex
@@ -3460,22 +6004,32 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                 return (
                   <box
                     key={ag.currentPath}
-                    backgroundColor={isFocused ? "#2B5581" : "transparent"}
+                    backgroundColor={isFocused ? THEME.bgRowFocus : "transparent"}
                     paddingLeft={1}
                     height={1}
+                    flexShrink={0}
                     flexDirection="row"
+                    onMouseDown={() => {
+                      setFocusedDelegationIndex(idx)
+                      setSelectedDelegations(prev => {
+                        const next = new Set(prev)
+                        if (next.has(subName)) next.delete(subName)
+                        else next.add(subName)
+                        return next
+                      })
+                    }}
                   >
-                    <text style={{ textColor: isSelected ? "green" : "gray" }} width="8%">
-                      {isSelected ? "[x]" : "[ ]"}
+                    <text style={{ textColor: isSelected ? THEME.accentGreen : THEME.fgMuted }} width="8%" b={isSelected}>
+                      {isSelected ? "[X]" : "[ ]"}
                     </text>
-                    <text style={{ textColor: isFocused ? "#FFFFFF" : "#9ECBFF" }} width="50%">
-                       {middleEllipsis(ag.filename, 35)}
+                    <text wrapMode="none" overflow="hidden" style={{ textColor: isFocused ? "#FFFFFF" : THEME.fgPrimary }} width="50%">
+                      {middleEllipsis(subName, Math.max(12, Math.floor(delegationViewport.innerWidth * 0.48)))}
                     </text>
-                    <text style={{ textColor: "yellow" }} width="20%">
-                       {middleEllipsis(ag.category, 15)}
+                    <text wrapMode="none" overflow="hidden" style={{ textColor: THEME.accentAmber }} width="20%">
+                      {middleEllipsis(ag.category, 15)}
                     </text>
-                    <text style={{ textColor: "gray" }} width="22%">
-                       {middleEllipsis(ag.model.split("/").pop() || "", 15)}
+                    <text wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgSecondary }} width="22%">
+                      {middleEllipsis(ag.model.split("/").pop() || "", 15)}
                     </text>
                   </box>
                 )
@@ -3483,33 +6037,50 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
             </box>
           </box>
 
-           <box justifyContent="space-between" borderStyle="single" border={["top"]} borderColor="#333333" paddingTop={1} flexShrink={0}>
-            {delegationItems.length > maxVisibleItems && <text style={{ textColor: "gray" }} flexShrink={0}>
-              {`▲ ${delegationScrollOffset + 1}-${Math.min(delegationScrollOffset + maxVisibleItems, delegationItems.length)}/${delegationItems.length} ▼`}
-            </text>}
-            <text style={{ textColor: "gray" }}>[↑/↓] Navigate | [SPACE] Toggle | [ENTER] Save</text>
-            <text style={{ textColor: "red" }} b>[ESC] Cancel</text>
+          <box flexDirection="row" justifyContent="space-between" borderStyle="single" border={["top"]} borderColor={THEME.borderSubtle} paddingTop={1} flexShrink={0} overflow="hidden">
+            <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgSecondary }}>
+              {middleEllipsis(
+                `${delegationItems.length > maxVisibleDelegations ? `▲ ${delegationScrollOffset + 1}-${Math.min(delegationScrollOffset + maxVisibleDelegations, delegationItems.length)}/${delegationItems.length} ▼ · ` : ""}[↑/↓] Nav · [Space] Toggle · [Enter] Save`,
+                Math.max(16, delegationViewport.innerWidth - 15),
+              )}
+            </text>
+            <text height={1} wrapMode="none" flexShrink={0} style={{ textColor: THEME.accentRed }} b onMouseDown={() => setViewMode("main")}>
+              [ESC] Cancel
+            </text>
           </box>
         </box>
       )}
 
       {viewMode === "resource-manager" && resourceCatalog && (
         <box
-          style={{ position: "absolute", left: "10%", top: "8%", width: "80%", height: "84%" }}
-          borderStyle="double"
-          borderColor="#9B59B6"
-          backgroundColor="#1e1e1e"
+          position="absolute"
+          left={resourceViewport.left}
+          top={resourceViewport.top}
+          width={resourceViewport.modalWidth}
+          height={resourceViewport.modalHeight}
+          zIndex={45}
+          border={true}
+          borderStyle="rounded"
+          borderColor={THEME.accentPurple}
+          backgroundColor={THEME.bgElevated}
           title={` Resource Manager: ${middleEllipsis(resourceTargetAgent?.filename ?? "", 38)} `}
-          titleColor="#9B59B6"
+          titleColor={THEME.accentPurple}
           padding={1}
           flexDirection="column"
           justifyContent="space-between"
           overflow="hidden"
+          onMouseScroll={(_self, event) => {
+            const dir = (event as any).scroll?.direction
+            if (!dir) return
+            const delta = dir === "down" ? 2 : -2
+            setResourceModalScrollOffset(off => Math.max(0, Math.min(Math.max(0, resourceManagerRows.length - maxVisibleResourceRows), off + delta)))
+          }}
         >
           <box flexDirection="column" flexGrow={1} minHeight={0} overflow="hidden">
-            <text style={{ textColor: "white" }} flexShrink={0}>Toggle the skills, custom tools and MCP servers this agent may use (from its pack and the packs it requires).</text>
+            <text style={{ textColor: THEME.fgPrimary }} flexShrink={0}>
+              Toggle skills, custom tools and MCP servers this agent may use:
+            </text>
             <box flexDirection="column" marginTop={1} flexGrow={1} minHeight={0} overflow="hidden">
-              {resourceTargetAgent && <text style={{ textColor: "yellow" }}>--- AGENT RESOURCES ---</text>}
               {visibleResourceRows.map((row, index) => {
                 const rowIndex = resourceModalScrollOffset + index
                 const item = row.item
@@ -3520,257 +6091,211 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                   : row.kind === "skill"
                     ? draftAllowedSkills.has(agentResource.name)
                     : draftPermissions[agentResource.permissionKey]
-                const tag = row.kind === "skill-wildcard" || row.kind === "skill" ? "[SKILL]"
-                  : row.kind === "tool-family" ? "[TOOL-GRP]"
-                    : row.kind === "tool" ? "[TOOL]" : "[MCP]"
+                const tag = row.kind === "skill-wildcard" || row.kind === "skill" ? "SKILL"
+                  : row.kind === "tool-family" ? "TOOL-GRP"
+                    : row.kind === "tool" ? "TOOL" : "MCP"
                 const mcpItem = agentResource as AgentMcpResourceItem
                 const status = row.kind === "mcp"
                   ? mcpItem.configuredInOpencode
                     ? ` [MCP: ${mcpItem.serverEnabled ? "ON" : "OFF"}]`
-                    : mcpItem.recommendedInRepo ? " [declared by its packs]" : " [not declared nor installed]"
+                    : mcpItem.recommendedInRepo ? " [declared]" : " [undeclared]"
                   : ""
                 return (
-                  <box key={`${item.id}-${rowIndex}`} backgroundColor={isFocused ? "#2B5581" : "transparent"} height={1} flexShrink={0} flexDirection="row">
-                    <text width={8} style={{ textColor: allowed ? "green" : "gray" }}>{allowed ? "[x]" : "[ ]"}</text>
-                    <text width={12} style={{ textColor: "magenta" }}>{tag}</text>
-                    <text flexGrow={1} wrapMode="none" overflow="hidden" style={{ textColor: isFocused ? "white" : "#E1E4E8" }} u={isFocused}>
+                  <box
+                    key={`${item.id}-${rowIndex}`}
+                    backgroundColor={isFocused ? THEME.bgRowFocus : "transparent"}
+                    height={1}
+                    flexShrink={0}
+                    flexDirection="row"
+                    onMouseDown={() => setResourceModalFocusIndex(rowIndex)}
+                  >
+                    <text width={6} style={{ textColor: allowed ? THEME.accentGreen : THEME.fgMuted }} b={Boolean(allowed)}>
+                      {allowed ? " [X]" : " [ ]"}
+                    </text>
+                    <text width={11} style={{ textColor: THEME.accentPurple }}>{tag}</text>
+                    <text flexGrow={1} wrapMode="none" overflow="hidden" style={{ textColor: isFocused ? "#ffffff" : THEME.fgPrimary }} b={isFocused}>
                       {middleEllipsis(item.name, Math.max(1, panelWidths.inspector + panelWidths.list - 42))}
                     </text>
-                    <text style={{ textColor: row.kind === "mcp" && mcpItem.configuredInOpencode && mcpItem.serverEnabled ? "green" : "gray" }}>{status}</text>
+                    <text style={{ textColor: row.kind === "mcp" && mcpItem.configuredInOpencode && mcpItem.serverEnabled ? THEME.accentGreen : THEME.fgMuted }}>
+                      {status}
+                    </text>
                   </box>
                 )
               })}
             </box>
           </box>
-          <box flexDirection="column" flexShrink={0} borderStyle="single" border={['top']} borderColor="#333333" paddingTop={1} overflow="hidden">
-            {resourceManagerRows.length > maxVisibleResourceRows && <text style={{ textColor: "gray" }} flexShrink={0}>
-              {`▲ ${resourceModalScrollOffset + 1}-${Math.min(resourceModalScrollOffset + maxVisibleResourceRows, resourceManagerRows.length)}/${resourceManagerRows.length} ▼`}
-            </text>}
-            <text style={{ textColor: "gray" }} wrapMode="none" overflow="hidden">Navigate: ↑/↓ | Space: Toggle | Enter: Save | Esc: Cancel</text>
+          <box flexDirection="row" justifyContent="space-between" flexShrink={0} borderStyle="single" border={["top"]} borderColor={THEME.borderSubtle} paddingTop={1} overflow="hidden">
+            <text style={{ textColor: THEME.fgSecondary }} wrapMode="none" overflow="hidden">
+              {`↑/↓ Navigate · Space Toggle · Enter Save${resourceManagerRows.length > maxVisibleResourceRows ? ` (${resourceModalScrollOffset + 1}/${resourceManagerRows.length})` : ""}`}
+            </text>
+            <text style={{ textColor: THEME.accentRed }} b onMouseDown={() => setViewMode("main")}>[ESC] Cancel</text>
           </box>
         </box>
       )}
 
       {/* Modal - Parameter Tuning */}
       {viewMode === "parameter-tuning" && (
-        <box
-          style={{
-            position: "absolute",
-            left: "15%",
-             top: layout.mode === "compact" ? "0%" : "15%",
-            width: "70%",
-             height: layout.mode === "compact" ? "100%" : "70%"
+        <ParameterTuningModal
+          targetCount={tuningTargetPaths.length}
+          singleTargetName={tuningAgents.length === 1 ? tuningAgents[0]?.filename : undefined}
+          focusedField={tuningFocusedField}
+          dirtyFields={tuningDirtyFields}
+          summary={tuningSummary}
+          steps={tuningSteps}
+          variant={tuningVariant}
+          mode={tuningMode}
+          hidden={tuningHidden}
+          variantChoices={tuningVariantChoices}
+          hasModelSpecificVariants={Boolean(modelVariants && modelVariants.length > 0)}
+          termWidth={termWidth}
+          termHeight={termHeight}
+          onFocusField={(next) => {
+            setTuningVariantTyping(false)
+            setTuningFocusedField(next)
           }}
-          borderStyle="double"
-          borderColor="#F1C40F"
-          backgroundColor="#1e1e1e"
-           title={` Tune Agent Parameters (${tuningTargetPaths.length} agents) `}
-          titleColor="#F1C40F"
-          padding={1}
-          flexDirection="column"
-          justifyContent="space-between"
-        >
-          <box flexDirection="column" gap={layout.mode === "compact" ? 0 : 1} overflow="hidden" flexShrink={0}>
-            <text height={1} flexShrink={0} wrapMode="none" overflow="hidden" style={{ textColor: "white" }}>
-              Regulate execution limits, temperature, thinking effort, mode, and visibility:
-            </text>
-
-            {/* Steps field */}
-            <box
-              flexDirection="row"
-              height={3}
-              flexShrink={0}
-              borderStyle="single"
-              borderColor={tuningFocusedField === "steps" ? "#F1C40F" : "#333333"}
-              paddingLeft={1}
-              paddingRight={1}
-               marginTop={layout.mode === "compact" ? 0 : 1}
-            >
-              <text width="60%" wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: tuningFocusedField === "steps" ? "#F1C40F" : "gray" }} b>
-                {tuningFocusedField === "steps" ? "► 1. Max Agentic Steps (e.g. 50):" : "  1. Max Agentic Steps:"}
-              </text>
-              <text width="40%" height={1} wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: "white" }}>{!tuningDirtyFields.has("steps") && tuningSummary.steps.mixed ? tuningSummary.steps.displayMixed : `${tuningSteps}${!tuningDirtyFields.has("steps") && tuningTargetPaths.length > 1 ? " (unchanged)" : ""}`}</text>
-            </box>
-
-            {/* Temp field */}
-            <box
-              flexDirection="row"
-              borderStyle="single"
-              borderColor={tuningFocusedField === "temp" ? "#F1C40F" : "#333333"}
-              height={3}
-              flexShrink={0}
-              paddingLeft={1}
-              paddingRight={1}
-            >
-              <text width="60%" wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: tuningFocusedField === "temp" ? "#F1C40F" : "gray" }} b>
-                {tuningFocusedField === "temp" ? "► 2. Temperature (e.g. 0.1 - 0.7):" : "  2. Temperature:"}
-              </text>
-              <text width="40%" height={1} wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: "white" }}>{!tuningDirtyFields.has("temp") && tuningSummary.temp.mixed ? tuningSummary.temp.displayMixed : `${tuningTemp}${!tuningDirtyFields.has("temp") && tuningTargetPaths.length > 1 ? " (unchanged)" : ""}`}</text>
-            </box>
-
-            {/* Thinking / Effort field */}
-            <box
-              flexDirection="column"
-              height={4}
-              flexShrink={0}
-              borderStyle="single"
-              borderColor={tuningFocusedField === "variant" ? "#F1C40F" : "#333333"}
-              paddingLeft={1}
-              paddingRight={1}
-            >
-              <box flexDirection="row" height={1}>
-                <text width="60%" wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: tuningFocusedField === "variant" ? "#F1C40F" : "gray" }} b>
-                  {tuningFocusedField === "variant" ? "► 3. Thinking / Effort (variant):" : "  3. Thinking / Effort:"}
-                </text>
-                <text width="40%" wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: "cyan" }}>
-                  {!tuningDirtyFields.has("variant") && tuningSummary.variant.mixed ? tuningSummary.variant.displayMixed : `${tuningVariant || "(default / unset)"}${!tuningDirtyFields.has("variant") && tuningTargetPaths.length > 1 ? " (unchanged)" : ""}`}
-                </text>
-              </box>
-              {tuningFocusedField === "variant" && <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: "gray" }}>{modelVariants !== null && modelVariants.length > 0
-                ? `[Space/←/→: model variants (${modelVariants.join(" | ")}) | type custom | Backspace: clear]`
-                : modelVariants !== null
-                  ? "[Model exposes no preset variants in OpenCode | type custom | Backspace: clear]"
-                  : `[Space/←/→: none/${AGENT_EFFORT_VARIANTS.join("/")} | type custom | Backspace: clear]`}</text>}
-            </box>
-
-            {/* Mode field */}
-            <box
-              flexDirection="row"
-              borderStyle="single"
-              borderColor={tuningFocusedField === "mode" ? "#F1C40F" : "#333333"}
-              height={3}
-              flexShrink={0}
-              paddingLeft={1}
-              paddingRight={1}
-            >
-              <text width="60%" wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: tuningFocusedField === "mode" ? "#F1C40F" : "gray" }} b>
-                {tuningFocusedField === "mode" ? "► 4. Mode (Press SPACE to toggle):" : "  4. Mode:"}
-              </text>
-              <text width="40%" height={1} wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: "yellow" }}>{!tuningDirtyFields.has("mode") && tuningSummary.mode.mixed ? tuningSummary.mode.displayMixed : `${tuningMode.toUpperCase()}${!tuningDirtyFields.has("mode") && tuningTargetPaths.length > 1 ? " (unchanged)" : ""}`}</text>
-            </box>
-
-            {/* Hidden field */}
-            <box
-              flexDirection="row"
-              borderStyle="single"
-              borderColor={tuningFocusedField === "hidden" ? "#F1C40F" : "#333333"}
-              height={3}
-              flexShrink={0}
-              paddingLeft={1}
-              paddingRight={1}
-            >
-              <text width="60%" wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: tuningFocusedField === "hidden" ? "#F1C40F" : "gray" }} b>
-                {tuningFocusedField === "hidden" ? "► 5. Hidden Status (Press SPACE to toggle):" : "  5. Hidden Status:"}
-              </text>
-              <text width="40%" height={1} wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: tuningHidden ? "red" : "green" }}>{!tuningDirtyFields.has("hidden") && tuningSummary.hidden.mixed ? tuningSummary.hidden.displayMixed : `${tuningHidden ? "TRUE" : "FALSE"}${!tuningDirtyFields.has("hidden") && tuningTargetPaths.length > 1 ? " (unchanged)" : ""}`}</text>
-            </box>
-          </box>
-
-          <box height={2} flexShrink={0} justifyContent="space-between" borderStyle="single" border={["top"]} borderColor="#333333" paddingTop={1} overflow="hidden" flexDirection="row">
-            <text width="78%" wrapMode="none" overflow="hidden" style={{ textColor: "gray" }}>{middleEllipsis("[TAB/↑/↓] Switch Fields | [SPACE] Variant/Toggle | [ENTER] Save", 58)}</text>
-            <text width="22%" wrapMode="none" overflow="hidden" style={{ textColor: "red" }} b>[ESC] Cancel</text>
-          </box>
-        </box>
+          onStepDelta={adjustTuningSteps}
+          onSelectVariant={(next) => {
+            setTuningVariant(next)
+            setTuningVariantTyping(false)
+            markTuningDirty("variant")
+          }}
+          onSelectMode={(next) => {
+            setTuningMode(next)
+            markTuningDirty("mode")
+          }}
+          onSelectHidden={(next) => {
+            setTuningHidden(next)
+            markTuningDirty("hidden")
+          }}
+          onSave={submitTuningModal}
+          onClose={() => setViewMode("main")}
+        />
       )}
 
       {/* Modal - Rename Assistant */}
       {viewMode === "rename-prompt" && renameTargetAgent && (
         <box
-          style={{
-            position: "absolute",
-            left: "15%",
-            top: "15%",
-            width: "70%",
-            height: "70%"
-          }}
-          borderStyle="double"
-          borderColor="#9B59B6"
-          backgroundColor="#1e1e1e"
+          style={{ position: "absolute", left: "15%", top: "14%", width: "70%", height: "72%" }}
+          zIndex={45}
+          border={true}
+          borderStyle="rounded"
+          borderColor={THEME.accentPurple}
+          backgroundColor={THEME.bgElevated}
           title=" Rename Agent (Naming Convention) "
-          titleColor="#9B59B6"
+          titleColor={THEME.accentPurple}
           padding={1}
           flexDirection="column"
           justifyContent="space-between"
         >
           <box flexDirection="column" gap={1}>
             <box flexDirection="row">
-              <text style={{ textColor: "white" }} b>CURRENT FILE: </text>
-               <text style={{ textColor: "yellow" }} b>{middleEllipsis(renameTargetAgent.filename, Math.max(1, Math.floor(termWidth * 0.7) - 8))}</text>
+              <text style={{ textColor: THEME.fgSecondary }} b>CURRENT FILE: </text>
+              <text style={{ textColor: THEME.accentAmber }} b>{middleEllipsis(renameTargetAgent.filename, Math.max(1, Math.floor(termWidth * 0.7) - 18))}</text>
             </box>
-            <text style={{ textColor: "gray" }}>
+            <text style={{ textColor: THEME.fgMuted }}>
               Convention: [family-]category-role_with_underscores.md
             </text>
 
             {/* Family Field */}
             <box
-              flexDirection="column"
-              borderStyle="single"
-              borderColor={renameFocusedField === "family" ? "#9B59B6" : "#333333"}
+              flexDirection="row"
+              justifyContent="space-between"
+              height={3}
+              border={true}
+              borderStyle="rounded"
+              borderColor={renameFocusedField === "family" ? THEME.accentPurple : THEME.borderSubtle}
+              backgroundColor={THEME.bgInput}
               paddingLeft={1}
               paddingRight={1}
-              marginTop={1}
+              onMouseDown={() => setRenameFocusedField("family")}
             >
-              <text style={{ textColor: renameFocusedField === "family" ? "#9B59B6" : "gray" }} b>
-                {renameFocusedField === "family" ? "► 1. Family (Optional):" : "  1. Family (Optional):"}
-              </text>
-              <text style={{ textColor: "white" }}>
-                {renameFamily || "[ e.g. go, mistral, hybrid or leave empty ]"}
+              <box flexDirection="row" height={1}>
+                <text style={{ textColor: renameFocusedField === "family" ? THEME.accentPurple : THEME.fgSecondary }} b>
+                  {renameFocusedField === "family" ? "▎ Family" : "  Family"}
+                </text>
+                <text style={{ textColor: THEME.fgMuted }}>{"  optional"}</text>
+              </box>
+              <text style={{ textColor: renameFamily ? THEME.fgPrimary : THEME.fgMuted }} b={Boolean(renameFamily)}>
+                {renameFamily ? `${terminalSafeText(renameFamily)}${renameFocusedField === "family" ? "▋" : ""}` : `e.g. flow${renameFocusedField === "family" ? "▋" : ""}`}
               </text>
             </box>
 
             {/* Category Field */}
             <box
-              flexDirection="column"
-              borderStyle="single"
-              borderColor={renameFocusedField === "category" ? "#9B59B6" : "#333333"}
+              flexDirection="row"
+              justifyContent="space-between"
+              height={3}
+              border={true}
+              borderStyle="rounded"
+              borderColor={renameFocusedField === "category" ? THEME.accentPurple : THEME.borderSubtle}
+              backgroundColor={THEME.bgInput}
               paddingLeft={1}
               paddingRight={1}
+              onMouseDown={() => setRenameFocusedField("category")}
             >
-              <text style={{ textColor: renameFocusedField === "category" ? "#9B59B6" : "gray" }} b>
-                {renameFocusedField === "category" ? "► 2. Category (Required):" : "  2. Category (Required):"}
-              </text>
-              <text style={{ textColor: "white" }}>
-                {renameCategory || "[ e.g. pipeline, wiki, slides, docs, general ]"}
+              <box flexDirection="row" height={1}>
+                <text style={{ textColor: renameFocusedField === "category" ? THEME.accentPurple : THEME.fgSecondary }} b>
+                  {renameFocusedField === "category" ? "▎ Category" : "  Category"}
+                </text>
+                <text style={{ textColor: THEME.fgMuted }}>{"  pack slug"}</text>
+              </box>
+              <text style={{ textColor: renameCategory ? THEME.fgPrimary : THEME.fgMuted }} b={Boolean(renameCategory)}>
+                {renameCategory ? `${terminalSafeText(renameCategory)}${renameFocusedField === "category" ? "▋" : ""}` : `required${renameFocusedField === "category" ? "▋" : ""}`}
               </text>
             </box>
 
             {/* Role Field */}
             <box
-              flexDirection="column"
-              borderStyle="single"
-              borderColor={renameFocusedField === "role" ? "#9B59B6" : "#333333"}
+              flexDirection="row"
+              justifyContent="space-between"
+              height={3}
+              border={true}
+              borderStyle="rounded"
+              borderColor={renameFocusedField === "role" ? THEME.accentPurple : THEME.borderSubtle}
+              backgroundColor={THEME.bgInput}
               paddingLeft={1}
               paddingRight={1}
+              onMouseDown={() => setRenameFocusedField("role")}
             >
-              <text style={{ textColor: renameFocusedField === "role" ? "#9B59B6" : "gray" }} b>
-                {renameFocusedField === "role" ? "► 3. Role (Required, '_' for multi-word):" : "  3. Role (Required, '_' for multi-word):"}
-              </text>
-              <text style={{ textColor: "white" }}>
-                {renameRole || "[ e.g. code_reviewer, orchestrator, html_writer ]"}
+              <box flexDirection="row" height={1}>
+                <text style={{ textColor: renameFocusedField === "role" ? THEME.accentPurple : THEME.fgSecondary }} b>
+                  {renameFocusedField === "role" ? "▎ Role" : "  Role"}
+                </text>
+                <text style={{ textColor: THEME.fgMuted }}>{"  snake_case"}</text>
+              </box>
+              <text style={{ textColor: renameRole ? THEME.fgPrimary : THEME.fgMuted }} b={Boolean(renameRole)}>
+                {renameRole ? `${terminalSafeText(renameRole)}${renameFocusedField === "role" ? "▋" : ""}` : `e.g. code_reviewer${renameFocusedField === "role" ? "▋" : ""}`}
               </text>
             </box>
 
             {/* Live Preview */}
-            <box flexDirection="column" marginTop={1} borderStyle="single" borderColor="#2B5581" padding={1}>
-              <text style={{ textColor: "gray" }}>Live Preview Filename:</text>
-              <text style={{ textColor: "green" }} b>
-                {(() => {
-                  const cleanRole = (renameRole || "role").trim().replace(/\s+/g, "_").replace(/-/g, "_")
-                  const cleanCategory = (renameCategory || "category").trim()
-                  const cleanFamily = renameFamily.trim()
-                  return cleanFamily
-                    ? `${cleanFamily}-${cleanCategory}-${cleanRole}.md`
-                    : `${cleanCategory}-${cleanRole}.md`
-                })()}
-              </text>
+            <box flexDirection="column" border={true} borderStyle="rounded" borderColor={THEME.borderSubtle} backgroundColor={THEME.bgInput} paddingLeft={1} paddingRight={1}>
+              <text style={{ textColor: THEME.fgSecondary }}>Live Preview:</text>
+              {(() => {
+                const cleanRole = (renameRole || "role").trim().replace(/\s+/g, "_").replace(/-/g, "_")
+                const cleanCategory = (renameCategory || "category").trim()
+                const cleanFamily = renameFamily.trim()
+                const candidate = cleanFamily
+                  ? `${cleanFamily}-${cleanCategory}-${cleanRole}.md`
+                  : `${cleanCategory}-${cleanRole}.md`
+                let valid = Boolean(renameCategory.trim() && renameRole.trim())
+                if (valid) {
+                  try { sanitizeFilename(candidate) } catch { valid = false }
+                }
+                return (
+                  <text style={{ textColor: valid ? THEME.accentGreen : THEME.accentAmber }} b>
+                    {terminalSafeText(candidate)}
+                  </text>
+                )
+              })()}
             </box>
           </box>
 
-          <box justifyContent="space-between" borderStyle="single" border={["top"]} borderColor="#333333" paddingTop={1}>
-            <text style={{ textColor: "gray" }}>
-              [TAB/↑/↓] Switch Fields | [ENTER] Confirm Rename
+          <box justifyContent="space-between" borderStyle="single" border={["top"]} borderColor={THEME.borderSubtle} paddingTop={1}>
+            <text style={{ textColor: THEME.fgSecondary }}>
+              [TAB/↑/↓] Switch Fields · [ENTER] Confirm Rename
             </text>
-            <text style={{ textColor: "red" }} b>
+            <text style={{ textColor: THEME.accentRed }} b onMouseDown={() => setViewMode("main")}>
               [ESC] Cancel
             </text>
           </box>
@@ -3780,448 +6305,440 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       {/* Modal - Model Selection */}
       {viewMode === "model-selector" || viewMode === "repair-selector" ? (
         <box
-          style={{
-            position: "absolute",
-            left: "15%",
-            top: "15%",
-            width: "70%",
-            height: "70%"
-          }}
-          borderStyle="double"
-          borderColor="#00AAFF"
-          backgroundColor="#1e1e1e"
-           title={viewMode === "repair-selector" ? ` Repair Model Group ${Number(repairGroupKey) + 1}/${invalidModelGroups.length} ` : routingPick?.kind === "trigger" ? " Select OR Triggers " : routingPick ? " Model Configuration " : " Select LLM Model "}
-          titleColor="#00AAFF"
+          position="absolute"
+          left={modelViewport.left}
+          top={modelViewport.top}
+          width={modelViewport.modalWidth}
+          height={modelViewport.modalHeight}
+          zIndex={45}
+          border={true}
+          borderStyle="rounded"
+          borderColor={THEME.accentBlue}
+          backgroundColor={THEME.bgElevated}
+          title={viewMode === "repair-selector" ? ` Repair Model Group ${Number(repairGroupKey) + 1}/${invalidModelGroups.length} ` : routingPick?.kind === "trigger" ? " Select OR Triggers " : routingPick ? " Model Configuration " : " Select LLM Model "}
+          titleColor={THEME.accentBlue}
           padding={1}
           flexDirection="column"
           overflow="hidden"
+          onMouseScroll={(_self, event) => {
+            const dir = (event as any).scroll?.direction
+            if (!dir) return
+            const delta = dir === "down" ? 2 : -2
+            setModelScrollOffset(off => Math.max(0, Math.min(Math.max(0, modelTreeItems.length - maxVisibleModels), off + delta)))
+          }}
         >
-          <text style={{ textColor: "white" }} paddingBottom={1} flexShrink={0}>
-             {viewMode === "repair-selector"
-                ? middleEllipsis(`Choose an exact replacement for explicit model ${JSON.stringify(invalidModelGroups[Number(repairGroupKey)]?.value)} (${invalidModelGroups[Number(repairGroupKey)]?.agents.length || 0} agents):`, modelModalInnerWidth)
-               : routingPick?.kind === "trigger"
-                 ? middleEllipsis(`When ${routingView ? callersLabel(routingView) : "callers"} run on (OR)${pendingTriggers.size > 0 ? `: [${[...pendingTriggers].join(" OR ")}]` : " — SPACE/TAB toggle multiple, ENTER confirm"}:`, modelModalInnerWidth)
-                 : routingPick?.kind === "roles"
-                   ? middleEllipsis(`${routingPick.roles.map(role => `${routingArchetype}-${role}`).join(", ")} use (when ${routingView ? callersLabel(routingView) : "?"} runs on ${routingDraft ? formatTriggerLabel(routingDraft.triggers) : "?"}):`, modelModalInnerWidth)
-                   : `Choose model to apply to ${selectedAgentPaths.size > 0 ? selectedAgentPaths.size : 1} selected agents:`}
+          <text height={2} wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgPrimary }} paddingBottom={1} flexShrink={0}>
+            {middleEllipsis(
+              viewMode === "repair-selector"
+                ? `Choose replacement for ${JSON.stringify(invalidModelGroups[Number(repairGroupKey)]?.value)} (${invalidModelGroups[Number(repairGroupKey)]?.agents.length || 0} agents):`
+                : routingPick?.kind === "trigger"
+                  ? `When ${routingView ? callersLabel(routingView) : "callers"} run on (OR)${pendingTriggers.size > 0 ? `: [${[...pendingTriggers].join(" OR ")}]` : " · SPACE/TAB toggle, ENTER confirm"}:`
+                  : routingPick?.kind === "roles"
+                    ? `${routingPick.roles.map(role => `${routingArchetype}-${role}`).join(", ")} use (when ${routingView ? callersLabel(routingView) : "?"} runs on ${routingDraft ? formatTriggerLabel(routingDraft.triggers) : "?"}):`
+                    : `Choose model to apply to ${selectedAgentPaths.size > 0 ? selectedAgentPaths.size : 1} target agent(s):`,
+              modelModalInnerWidth,
+            )}
           </text>
-          <text style={{ textColor: modelFilter ? "cyan" : "gray" }} flexShrink={0}>{middleEllipsis(modelFilter ? `Search: ${modelFilter}▏ (${modelTreeItems.filter(item => item.type === "model").length} matches)` : "Search: type to filter models", modelModalInnerWidth)}</text>
+          <box
+            height={1}
+            flexShrink={0}
+            backgroundColor={THEME.bgInput}
+            paddingLeft={1}
+            paddingRight={1}
+          >
+            <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: modelFilter ? THEME.accentCyan : THEME.fgSecondary }}>
+              {middleEllipsis(modelFilter ? `🔍 ${modelFilter}▋ (${modelTreeItems.filter(item => item.type === "model").length} matches)` : "🔍 Type to filter providers & models...", modelModalInnerWidth - 2)}
+            </text>
+          </box>
           {viewMode === "repair-selector" && invalidModelGroups[Number(repairGroupKey)] && (
-            <text style={{ textColor: "gray" }}>
-               Suggestions: {middleEllipsis(suggestModels(invalidModelGroups[Number(repairGroupKey)].value, modelCatalog).join(", ") || "none (choose from catalog below)", modelModalInnerWidth)}
+            <text height={1} wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: THEME.accentAmber }} marginTop={1}>
+              {middleEllipsis(`Suggestions: ${suggestModels(invalidModelGroups[Number(repairGroupKey)].value, modelCatalog).join(", ") || "none (choose below)"}`, modelModalInnerWidth)}
             </text>
           )}
 
-          <box flexGrow={1} flexDirection="column" marginTop={1} overflow="hidden">
+          <box flexGrow={1} minHeight={0} flexDirection="column" marginTop={1} overflow="hidden">
             {visibleModels.map((item, index) => {
               const globalIndex = modelScrollOffset + index
               const isFocused = globalIndex === focusedModelIndex
-              const rowBg = isFocused ? "#00AAFF" : "transparent"
-              
+              const rowBg = isFocused ? THEME.bgRowFocus : "transparent"
               const textColor = isFocused
                 ? "#FFFFFF"
                 : item.type === "provider"
-                ? "yellow"
-                : "#E1E4E8"
+                  ? THEME.accentAmber
+                  : THEME.fgPrimary
 
               return (
                 <box
                   key={`${item.type}-${item.id}`}
                   backgroundColor={rowBg}
-                  paddingLeft={2}
+                  paddingLeft={1}
                   height={1}
+                  flexShrink={0}
                   width="100%"
+                  onMouseDown={() => {
+                    setFocusedModelIndex(globalIndex)
+                    if (item.type === "provider") {
+                      setExpandedProviders(prev => {
+                        const next = new Set(prev)
+                        if (next.has(item.id)) next.delete(item.id)
+                        else next.add(item.id)
+                        return next
+                      })
+                    }
+                  }}
                 >
-                  <text style={{ textColor }}>
-                    {middleEllipsis(isFocused && item.type === "model" ? `> ${item.label.trim()}` : item.label, modelModalInnerWidth)}
+                  <text height={1} wrapMode="none" overflow="hidden" style={{ textColor }} b={item.type === "provider" || isFocused}>
+                    {middleEllipsis(isFocused && item.type === "model" ? `▎ ${item.label.trim()}` : item.label, modelModalInnerWidth)}
                   </text>
                 </box>
               )
             })}
           </box>
 
-          <box flexDirection="column" borderStyle="single" border={["top"]} borderColor="#333333" paddingTop={1} flexShrink={0}>
-              <text width="100%" height={1} flexShrink={0} wrapMode="none" overflow="hidden" style={{ textColor: "gray" }}>{middleEllipsis(`Total: ${modelTreeItems.length} · Position: ${focusedModelIndex + 1}/${modelTreeItems.length}${routingPick?.kind === "trigger" && pendingTriggers.size > 0 ? ` · Selected OR: ${pendingTriggers.size}` : ""}`, modelModalInnerWidth)}</text>
-              <text width="100%" height={1} flexShrink={0} wrapMode="none" overflow="hidden" style={{ textColor: "gray" }}>{middleEllipsis(routingPick?.kind === "trigger" ? "SPACE/TAB toggle OR triggers · ENTER confirm · ↑/↓ browse · ←/→ fold · type to search" : "ENTER select · ↑/↓ browse · ←/→ fold provider · type to search", modelModalInnerWidth)}</text>
-              <text width="100%" height={1} flexShrink={0} wrapMode="none" overflow="hidden" style={{ textColor: "gray" }}>{middleEllipsis("BACKSPACE edit search · ESC clear search / cancel · CTRL+R reload catalog", modelModalInnerWidth)}</text>
+          <box flexDirection="column" borderStyle="single" border={["top"]} borderColor={THEME.borderSubtle} paddingTop={1} flexShrink={0}>
+            <text width="100%" height={1} flexShrink={0} wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgSecondary }}>
+              {middleEllipsis(`${focusedModelIndex + 1}/${modelTreeItems.length} · ENTER confirm · ←/→ fold · CTRL+R reload · ESC cancel`, modelModalInnerWidth)}
+            </text>
           </box>
         </box>
       ) : null}
 
-      {/* Modal - Color Selection */}
+      {/* Modal - Tier Selection */}
       {viewMode === "tier-selector" && translationConfig && (() => {
         const tiers = Object.keys(translationConfig.tiers)
         const targets = selectedAgentPaths.size > 0 ? agents.filter(a => selectedAgentPaths.has(a.currentPath)) : (activeItems[focusedIndex]?.agent ? [activeItems[focusedIndex].agent!] : [])
         const states = targets.map(a => resolvedAgents.get(a.currentPath)).filter((state): state is ReturnType<typeof resolveModelTarget> => Boolean(state))
         const current = new Set(states.map(s => `${s!.tier} (${s!.source})`))
-        return <box style={{ position: "absolute", left: "15%", top: "5%", width: "70%", height: "90%" }} borderStyle="double" borderColor="magenta" backgroundColor="#1e1e1e" title=" Assign Tier " titleColor="magenta" padding={1} flexDirection="column" overflow="hidden">
-          <text style={{ textColor: "yellow" }} flexShrink={0}>Role-based assignment: basename, not an individual file.</text>
-          <text style={{ textColor: "white" }} flexShrink={0}>{middleEllipsis(`Current: ${current.size > 1 ? `multiple tiers - ${Array.from(current).join(", ")}` : Array.from(current)[0] || "unknown"}`, 70)}</text>
-          <box flexGrow={1} flexDirection="column" overflow="hidden">
-            {tiers.slice(tierScrollOffset, tierScrollOffset + maxVisibleTiers).map((tier, index) => {
-              const tierIndex = tierScrollOffset + index
-              const isFocused = tierIndex === focusedTierIndex
-              const tierConfig = translationConfig.tiers[tier]
-              return (
-                <box key={tier} flexDirection="column" flexShrink={0}>
-                  <box height={1} backgroundColor={isFocused ? "magenta" : "transparent"}>
-                    <text style={{ textColor: isFocused ? "white" : "cyan" }}>
-                       {middleEllipsis(`${tier} - Claude: ${tierConfig.claude.model} | Codex: ${tierConfig.codex.model}`, 70)}
-                    </text>
-                  </box>
-                   {isFocused && tierConfig.description && <text style={{ textColor: "gray" }}>{terminalSafeText(tierConfig.description)}</text>}
-                </box>
-              )
-            })}
-          </box>
-          <text style={{ textColor: "gray" }} flexShrink={0}>[UP/DOWN/j/k] Select | [ENTER] Assign | [ESC] Cancel</text>
-        </box>
-      })()}
-
-      {/* Modal - Conditional IF/OR Flows of any pack (M on its folder) */}
-      {(viewMode === "routing-configs" || viewMode === "routing-editor" || viewMode === "routing-callers" || viewMode === "routing-tools" || viewMode === "routing-permissions" || viewMode === "routing-delegations") && (
-        <box
-          style={{ position: "absolute", left: "10%", top: "8%", width: "80%", height: "84%" }}
-          borderStyle="double"
-          borderColor="#00AAFF"
-          backgroundColor="#1e1e1e"
-          title={` ${(routingArchetype || "").toUpperCase()} · Conditional Flows (IF / OR) `}
-          titleColor="#00AAFF"
-          padding={1}
-          flexDirection="column"
-          overflow="hidden"
-        >
-          {!routingView ? (
-            <text style={{ textColor: "red" }}>{routingLoad.error || `No agents found for ${routingArchetype}.`}</text>
-          ) : viewMode === "routing-callers" ? (
-            <>
-              <text style={{ textColor: "white" }} flexShrink={0}>
-                {middleEllipsis(`Choose which agents act as callers in OR for ${routingArchetype} (saved in routing.json):`, modelModalInnerWidth)}
-              </text>
-              <text style={{ textColor: "gray" }} flexShrink={0}>
-                {middleEllipsis(`Active source: ${routingView.callerSource} · Press R to reset to pack / inferred defaults.`, modelModalInnerWidth)}
-              </text>
-              <box flexGrow={1} flexDirection="column" marginTop={1} overflow="hidden">
-                {routingView.callerCandidates.map((cand, index) => {
-                  const focused = index === callerFocus
-                  const checked = callerDraftSet.has(cand.name)
-                  return (
-                    <box key={`caller-${cand.name}`} height={1} backgroundColor={focused ? "#00AAFF" : "transparent"} paddingLeft={1} flexShrink={0}>
-                      <text style={{ textColor: focused ? "#FFFFFF" : checked ? "green" : "#E1E4E8" }}>
-                        {middleEllipsis(`${focused ? "> " : "  "}${checked ? "[x]" : "[ ]"} ${cand.name}${cand.model ? ` (${cand.model})` : ""}`, modelModalInnerWidth)}
+        return (
+          <box
+            position="absolute"
+            left={tierViewport.left}
+            top={tierViewport.top}
+            width={tierViewport.modalWidth}
+            height={tierViewport.modalHeight}
+            zIndex={45}
+            border={true}
+            borderStyle="rounded"
+            borderColor={THEME.accentPurple}
+            backgroundColor={THEME.bgElevated}
+            title=" Assign Translation Tier "
+            titleColor={THEME.accentPurple}
+            padding={1}
+            flexDirection="column"
+            overflow="hidden"
+            onMouseScroll={(_self, event) => {
+              const dir = (event as any).scroll?.direction
+              if (!dir) return
+              const delta = dir === "down" ? 2 : -2
+              setTierScrollOffset(off => Math.max(0, Math.min(Math.max(0, tiers.length - maxVisibleTiers), off + delta)))
+            }}
+          >
+            <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: THEME.accentAmber }} flexShrink={0}>Role-based assignment: basename, not an individual file.</text>
+            <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgPrimary }} flexShrink={0}>{middleEllipsis(`Current: ${current.size > 1 ? `multiple tiers · ${Array.from(current).join(", ")}` : Array.from(current)[0] || "unknown"}`, tierViewport.innerWidth)}</text>
+            <box flexGrow={1} minHeight={0} flexDirection="column" marginTop={1} overflow="hidden">
+              {tiers.slice(tierScrollOffset, tierScrollOffset + maxVisibleTiers).map((tier, index) => {
+                const tierIndex = tierScrollOffset + index
+                const isFocused = tierIndex === focusedTierIndex
+                const tierConfig = translationConfig.tiers[tier]
+                return (
+                  <box
+                    key={tier}
+                    flexDirection="column"
+                    flexShrink={0}
+                    onMouseDown={() => setFocusedTierIndex(tierIndex)}
+                  >
+                    <box height={1} backgroundColor={isFocused ? THEME.bgRowFocus : "transparent"} paddingLeft={1}>
+                      <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: isFocused ? "#ffffff" : THEME.accentCyan }} b={isFocused}>
+                        {middleEllipsis(`${isFocused ? "▎ " : "  "}${tier} · Claude: ${tierConfig.claude.model} · Codex: ${tierConfig.codex.model}`, tierViewport.innerWidth)}
                       </text>
                     </box>
-                  )
-                })}
-              </box>
-              {routingStatus && <text style={{ textColor: routingStatus.startsWith("Error") ? "red" : "yellow" }} flexShrink={0}>{middleEllipsis(routingStatus, modelModalInnerWidth)}</text>}
-              <text style={{ textColor: "gray" }} flexShrink={0}>[↑/↓] Navigate | [SPACE] Toggle caller | [ENTER] Save callers | [R] Reset defaults | [ESC] Back</text>
-            </>
-          ) : viewMode === "routing-tools" && routingDraft ? (() => {
-            const toolRows = [{ key: "*", label: "* (All tools fallback)", group: "builtin" as const, staticallyDeniedByCaller: false }, ...routingView.availableTools]
-            const visibleCount = Math.max(2, Math.floor(termHeight * 0.72) - 8)
-            const visible = toolRows.slice(flowSubScroll, flowSubScroll + visibleCount)
-            return (
-              <>
-                <text style={{ textColor: "white" }} flexShrink={0}>
-                  {middleEllipsis(`Tools & MCP overrides when ${callersLabel(routingView)} runs on ${formatTriggerLabel(routingDraft.triggers)}:`, modelModalInnerWidth)}
-                </text>
-                <text style={{ textColor: "gray" }} flexShrink={0}>
-                  {middleEllipsis(`SPACE or ←/→ cycles: unchanged -> deny -> ask -> allow. Denied tools are removed from context & blocked.`, modelModalInnerWidth)}
-                </text>
-                <box flexGrow={1} flexDirection="column" marginTop={1} overflow="hidden">
-                  {visible.map((row, idx) => {
-                    const globalIdx = flowSubScroll + idx
-                    const focused = globalIdx === flowSubFocus
-                    const effect = routingDraft.tools[row.key]
-                    const effectColor = focused ? "#FFFFFF" : effect === "deny" ? "red" : effect === "ask" ? "yellow" : effect === "allow" ? "green" : "gray"
-                    return (
-                      <box key={`ftool-${row.key}`} flexDirection="row" height={1} backgroundColor={focused ? "#00AAFF" : "transparent"} paddingLeft={1} flexShrink={0}>
-                        <text style={{ textColor: focused ? "#FFFFFF" : "#E1E4E8" }} width="55%">
-                          {middleEllipsis(`${focused ? "> " : "  "}${row.label}`, Math.max(12, Math.floor(modelModalInnerWidth * 0.54)))}
-                        </text>
-                        <text style={{ textColor: effectColor }}>
-                          {middleEllipsis(`${effect ? effect.toUpperCase() : "unchanged"}${effect === "allow" && row.staticallyDeniedByCaller ? " ⚠ static deny on caller" : ""}`, Math.max(12, Math.floor(modelModalInnerWidth * 0.44)))}
-                        </text>
-                      </box>
-                    )
-                  })}
-                </box>
-                {routingStatus && <text style={{ textColor: routingStatus.startsWith("Error") ? "red" : "yellow" }} flexShrink={0}>{middleEllipsis(routingStatus, modelModalInnerWidth)}</text>}
-                <text style={{ textColor: "gray" }} flexShrink={0}>[↑/↓] Navigate | [SPACE/←/→] Cycle allow/ask/deny | [BACKSPACE] Unchanged | [ENTER/ESC] Done</text>
-              </>
-            )
-          })() : viewMode === "routing-permissions" && routingDraft ? (() => {
-            const permRows = [
-              { key: "*", label: "* (All permissions fallback)" },
-              { key: "shell", label: "shell / bash (command execution)" },
-              { key: "edit", label: "edit / write (file modifications)" },
-              { key: "read", label: "read (file & directory reads)" },
-              { key: "webfetch", label: "webfetch (HTTP requests)" },
-              { key: "skill", label: "skill (load skills)" },
-              { key: "external_directory", label: "external_directory (outside workspace)" },
-            ]
-            return (
-              <>
-                <text style={{ textColor: "white" }} flexShrink={0}>
-                  {middleEllipsis(`Permission overrides when ${callersLabel(routingView)} runs on ${formatTriggerLabel(routingDraft.triggers)}:`, modelModalInnerWidth)}
-                </text>
-                <text style={{ textColor: "gray" }} flexShrink={0}>
-                  {middleEllipsis(`SPACE or ←/→ cycles: unchanged -> deny -> ask -> allow.`, modelModalInnerWidth)}
-                </text>
-                <box flexGrow={1} flexDirection="column" marginTop={1} overflow="hidden">
-                  {permRows.map((row, idx) => {
-                    const focused = idx === flowSubFocus
-                    const effect = routingDraft.permissions[row.key]
-                    const staticDeny = routingView.staticDeniedTools.has(row.key) || routingView.staticDeniedTools.has("*")
-                    const effectColor = focused ? "#FFFFFF" : effect === "deny" ? "red" : effect === "ask" ? "yellow" : effect === "allow" ? "green" : "gray"
-                    return (
-                      <box key={`fperm-${row.key}`} flexDirection="row" height={1} backgroundColor={focused ? "#00AAFF" : "transparent"} paddingLeft={1} flexShrink={0}>
-                        <text style={{ textColor: focused ? "#FFFFFF" : "#E1E4E8" }} width="55%">
-                          {middleEllipsis(`${focused ? "> " : "  "}${row.label}`, Math.max(12, Math.floor(modelModalInnerWidth * 0.54)))}
-                        </text>
-                        <text style={{ textColor: effectColor }}>
-                          {middleEllipsis(`${effect ? effect.toUpperCase() : "unchanged"}${effect === "allow" && staticDeny ? " ⚠ static deny on caller" : ""}`, Math.max(12, Math.floor(modelModalInnerWidth * 0.44)))}
-                        </text>
-                      </box>
-                    )
-                  })}
-                </box>
-                {routingStatus && <text style={{ textColor: routingStatus.startsWith("Error") ? "red" : "yellow" }} flexShrink={0}>{middleEllipsis(routingStatus, modelModalInnerWidth)}</text>}
-                <text style={{ textColor: "gray" }} flexShrink={0}>[↑/↓] Navigate | [SPACE/←/→] Cycle allow/ask/deny | [BACKSPACE] Unchanged | [ENTER/ESC] Done</text>
-              </>
-            )
-          })() : viewMode === "routing-delegations" && routingDraft ? (() => {
-            const delRows = [
-              { name: "*", label: "* (All subagents fallback)", staticDeny: routingView.staticDeniedDelegations.has("*") },
-              ...routingView.subagents.map(sub => ({ name: sub.name, label: sub.name, staticDeny: routingView.staticDeniedDelegations.has(sub.name) || routingView.staticDeniedDelegations.has("*") })),
-            ]
-            const visibleCount = Math.max(2, Math.floor(termHeight * 0.72) - 8)
-            const visible = delRows.slice(flowSubScroll, flowSubScroll + visibleCount)
-            return (
-              <>
-                <text style={{ textColor: "white" }} flexShrink={0}>
-                  {middleEllipsis(`Subagent delegation policy when ${callersLabel(routingView)} runs on ${formatTriggerLabel(routingDraft.triggers)}:`, modelModalInnerWidth)}
-                </text>
-                <text style={{ textColor: "gray" }} flexShrink={0}>
-                  {middleEllipsis(`SPACE or ←/→ cycles: unchanged -> deny -> allow. Denied delegations are blocked before execution.`, modelModalInnerWidth)}
-                </text>
-                <box flexGrow={1} flexDirection="column" marginTop={1} overflow="hidden">
-                  {visible.map((row, idx) => {
-                    const globalIdx = flowSubScroll + idx
-                    const focused = globalIdx === flowSubFocus
-                    const effect = routingDraft.delegations[row.name]
-                    const effectColor = focused ? "#FFFFFF" : effect === "deny" ? "red" : effect === "allow" ? "green" : "gray"
-                    return (
-                      <box key={`fdel-${row.name}`} flexDirection="row" height={1} backgroundColor={focused ? "#00AAFF" : "transparent"} paddingLeft={1} flexShrink={0}>
-                        <text style={{ textColor: focused ? "#FFFFFF" : "#E1E4E8" }} width="55%">
-                          {middleEllipsis(`${focused ? "> " : "  "}${row.label}`, Math.max(12, Math.floor(modelModalInnerWidth * 0.54)))}
-                        </text>
-                        <text style={{ textColor: effectColor }}>
-                          {middleEllipsis(`${effect ? effect.toUpperCase() : "unchanged"}${effect === "allow" && row.staticDeny ? " ⚠ static deny on caller" : ""}`, Math.max(12, Math.floor(modelModalInnerWidth * 0.44)))}
-                        </text>
-                      </box>
-                    )
-                  })}
-                </box>
-                {routingStatus && <text style={{ textColor: routingStatus.startsWith("Error") ? "red" : "yellow" }} flexShrink={0}>{middleEllipsis(routingStatus, modelModalInnerWidth)}</text>}
-                <text style={{ textColor: "gray" }} flexShrink={0}>[↑/↓] Navigate | [SPACE/←/→] Cycle allow/deny | [BACKSPACE] Unchanged | [ENTER/ESC] Done</text>
-              </>
-            )
-          })() : (
-            <>
-              <text style={{ textColor: "white" }} flexShrink={0}>{middleEllipsis(viewMode === "routing-configs"
-                ? `Callers (OR): ${callersLabel(routingView)} [${routingView.callerSource}] · press [C] to edit callers`
-                : `Configure triggers (OR), subagent models, tools/MCP [U] and delegations [G] for this flow.`, modelModalInnerWidth)}</text>
-              <text style={{ textColor: "cyan" }} flexShrink={0}>{middleEllipsis(
-                isReadOnlyGitSource
-                  ? `Saved in user settings (routing.json) · reconciles target automatically`
-                  : routingView.hasManifest
-                    ? `Saved in user settings (routing.json) by default · press [W] to export defaults into opencode-pack.json`
-                    : `Virtual .md pack · saved in routing.json · press [I] to generate opencode-pack.json`,
-                modelModalInnerWidth,
-              )}</text>
-              {routingView.pinned.length > 0 && <text style={{ textColor: "gray" }} flexShrink={0}>{middleEllipsis(`Pinned subagents (fixed model, skipped by model routing): ${routingView.pinned.map(agent => `${agent.name}=${agent.model}`).join(", ")}`, modelModalInnerWidth)}</text>}
-              {viewMode === "routing-editor" && routingDraft && (() => {
-                const blockedAllowTools = Object.entries(routingDraft.tools).filter(([k, v]) => v === "allow" && (routingView.staticDeniedTools.has(k) || routingView.staticDeniedTools.has("*"))).map(([k]) => k)
-                const blockedAllowDels = Object.entries(routingDraft.delegations).filter(([k, v]) => v === "allow" && (routingView.staticDeniedDelegations.has(k) || routingView.staticDeniedDelegations.has("*"))).map(([k]) => k)
-                if (!blockedAllowTools.length && !blockedAllowDels.length) return null
-                return (
-                  <text style={{ textColor: "yellow" }} flexShrink={0}>
-                    {middleEllipsis(`⚠ Static 'deny' on caller frontmatter overrides runtime 'allow' in OpenCode V2 (${[...blockedAllowTools, ...blockedAllowDels].join(", ")}); set caller base permission to allow/ask.`, modelModalInnerWidth)}
-                  </text>
+                    {isFocused && tierConfig.description && <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgSecondary }}>{middleEllipsis(`   ${terminalSafeText(tierConfig.description)}`, tierViewport.innerWidth)}</text>}
+                  </box>
                 )
-              })()}
-              <box flexGrow={1} flexDirection="column" marginTop={1} overflow="hidden">
-                {viewMode === "routing-configs"
-                  ? [...routingView.flows, null].map((flow, index) => {
-                      const focused = index === routingFocus
-                      return (
-                        <box key={flow ? flow.key : "routing-new"} flexDirection="column" backgroundColor={focused ? "#00AAFF" : "transparent"} paddingLeft={1} flexShrink={0}>
-                          <text style={{ textColor: focused ? "#FFFFFF" : flow ? "yellow" : "#7EE787" }}>
-                            {middleEllipsis(
-                              flow
-                                ? `${focused ? "> " : "  "}IF ${flow.callers?.join(" or ") || callersLabel(routingView)} runs on ${formatTriggerLabel(flow.triggers)} [${flow.origin}]`
-                                : `${focused ? "> " : "  "}+ New conditional flow (IF / OR)`,
-                              modelModalInnerWidth,
-                            )}
-                          </text>
-                          {flow && <text style={{ textColor: focused ? "#FFFFFF" : "gray" }}>{middleEllipsis(`    ${summarizeUnifiedFlow(flow, routingView.related)}`, modelModalInnerWidth)}</text>}
-                        </box>
-                      )
-                    })
-                  : routingDraft && (() => {
-                      const toolsSummary = Object.entries(routingDraft.tools).map(([k, v]) => `${k}=${v}`).join(", ") || "unchanged (press U or ENTER to configure)"
-                      const permSummary = Object.entries(routingDraft.permissions).map(([k, v]) => `${k}=${v}`).join(", ") || "unchanged (press P or ENTER to configure)"
-                      const delSummary = Object.entries(routingDraft.delegations).map(([k, v]) => `${k}=${v}`).join(", ") || "unchanged (press G or ENTER to configure)"
-                      const editorRows = [
-                        { kind: "triggers" as const, role: "", label: `When ${routingView.callers.map(agent => agent.role).join("/")} runs on (OR)`, value: formatTriggerLabel(routingDraft.triggers) },
-                        ...routingView.related.map(agent => ({
-                          kind: "agent" as const,
-                          role: agent.role,
-                          label: agent.name,
-                          value: routingDraft.roles[agent.role] && routingDraft.roles[agent.role] !== INHERIT ? routingDraft.roles[agent.role] : INHERIT,
-                        })),
-                        { kind: "tools" as const, role: "", label: "Tools & MCP policy [U]", value: toolsSummary },
-                        { kind: "permissions" as const, role: "", label: "Permissions policy [P]", value: permSummary },
-                        { kind: "delegations" as const, role: "", label: "Subagent delegations [G]", value: delSummary },
-                      ]
-                      return editorRows.map((row, index) => {
-                        const focused = index === routingEditorFocus
-                        const selected = row.kind === "agent" && routingSelected.has(row.role)
-                        const leftText = row.kind === "agent"
-                          ? `${selected ? "[x]" : "[ ]"} ${row.label}`
-                          : `${focused ? "> " : "  "}${row.label}`
-                        const leftColor = focused ? "#FFFFFF" : row.kind === "triggers" ? "yellow" : row.kind !== "agent" ? "magenta" : selected ? "green" : "#E1E4E8"
-                        const rightColor = focused ? "#FFFFFF" : row.value === INHERIT || row.value.startsWith("unchanged") ? "gray" : "cyan"
-                        return (
-                          <box key={`routing-row-${index}`} flexDirection="row" backgroundColor={focused ? "#00AAFF" : "transparent"} paddingLeft={1} height={1} flexShrink={0} marginBottom={index === 0 ? 1 : 0} marginTop={row.kind === "tools" ? 1 : 0}>
-                            <text style={{ textColor: leftColor }} width="42%">{middleEllipsis(leftText, Math.max(10, Math.floor(modelModalInnerWidth * 0.41)))}</text>
-                            <text style={{ textColor: rightColor }}>{middleEllipsis(row.value === INHERIT ? "inherit (same model as caller)" : row.value, Math.max(10, Math.floor(modelModalInnerWidth * 0.56)))}</text>
-                          </box>
-                        )
-                      })
-                    })()}
-              </box>
-              {routingStatus && <text style={{ textColor: routingStatus.startsWith("Error") ? "red" : "yellow" }} flexShrink={0}>{middleEllipsis(routingStatus, modelModalInnerWidth)}</text>}
-              <text style={{ textColor: "gray" }} flexShrink={0}>{middleEllipsis(
-                viewMode === "routing-configs"
-                  ? `[↑/↓] Select | [ENTER] Edit/New | [C] Callers (OR)${!isReadOnlyGitSource ? (routingView.hasManifest ? " | [W] Save to pack" : " | [I] Init pack") : ""} | [D] Delete | [ESC] Close`
-                  : "[SPACE/A] Select | [M/ENTER] Pick | [U] Tools | [P] Perms | [G] Delegations | [TAB/←/→] Variant | [ESC] Back",
-                modelModalInnerWidth,
-              )}</text>
-            </>
-          )}
-        </box>
+              })}
+            </box>
+            <box flexDirection="row" justifyContent="space-between" borderStyle="single" border={["top"]} borderColor={THEME.borderSubtle} paddingTop={1} flexShrink={0}>
+              <text height={1} wrapMode="none" style={{ textColor: THEME.fgSecondary }} flexShrink={0}>[↑/↓] Select · [ENTER] Assign</text>
+              <text height={1} wrapMode="none" style={{ textColor: THEME.accentRed }} b onMouseDown={() => setViewMode("main")}>[ESC] Cancel</text>
+            </box>
+          </box>
+        )
+      })()}
+
+      {/* Modal - Conditional IF/OR Flows of any pack */}
+      {(viewMode === "routing-configs" ||
+        viewMode === "routing-editor" ||
+        viewMode === "routing-callers" ||
+        viewMode === "routing-tools" ||
+        viewMode === "routing-permissions" ||
+        viewMode === "routing-delegations") && (
+        <PackFlowsModal
+          packName={routingArchetype || ""}
+          mode={viewMode}
+          routingView={routingView}
+          loadError={routingLoad.error}
+          isReadOnlyGitSource={isReadOnlyGitSource}
+          routingFocus={routingFocus}
+          routingScroll={routingScroll}
+          routingEditorFocus={routingEditorFocus}
+          routingEditorScroll={routingEditorScroll}
+          routingDraft={routingDraft}
+          routingSelected={routingSelected}
+          routingStatus={routingStatus}
+          callerDraftSet={callerDraftSet}
+          callerFocus={callerFocus}
+          callerScroll={callerScroll}
+          flowSubFocus={flowSubFocus}
+          flowSubScroll={flowSubScroll}
+          termWidth={termWidth}
+          termHeight={termHeight}
+          onClose={() => {
+            setRoutingConfirmDelete(false)
+            setRoutingArchetype(null)
+            setViewMode("main")
+          }}
+          onBackToConfigs={() => {
+            setRoutingConfirmDelete(false)
+            setRoutingSelected(new Set())
+            setRoutingDraft(null)
+            setViewMode("routing-configs")
+          }}
+          onBackToEditor={() => setViewMode("routing-editor")}
+          onFocusBranch={idx => {
+            setRoutingFocus(idx)
+            setRoutingConfirmDelete(false)
+          }}
+          onOpenBranch={idx => openRoutingBranchAtIndex(idx)}
+          onScrollBranches={delta => {
+            const total = (routingView?.flows.length ?? 0) + 1
+            if (total <= 0) return
+            const vpRows = Math.max(1, calculatePackFlowsModalLayout(termWidth, termHeight, {
+              hasPinned: Boolean(routingView?.pinned.length),
+              hasStatus: Boolean(routingStatus),
+            }).configViewportRows)
+            const maxOff = Math.max(0, total - vpRows)
+            setRoutingScroll(off => {
+              const nextOff = Math.max(0, Math.min(maxOff, off + delta))
+              setRoutingFocus(idx => Math.max(nextOff, Math.min(Math.min(total - 1, nextOff + vpRows - 1), idx)))
+              return nextOff
+            })
+            setRoutingConfirmDelete(false)
+          }}
+          onOpenCallers={openRoutingCallersModal}
+          onExportManifest={exportRoutingToManifest}
+          onOpenInitPack={openInitPackModal}
+          onFocusEditorRow={idx => setRoutingEditorFocus(idx)}
+          onActivateEditorRow={idx => activateRoutingEditorRow(idx, false)}
+          onToggleEditorAgentSelect={role => {
+            setRoutingSelected(prev => {
+              const next = new Set(prev)
+              if (next.has(role)) next.delete(role)
+              else next.add(role)
+              return next
+            })
+          }}
+          onScrollEditor={delta => {
+            const total = (routingView?.related.length ?? 0) + 4
+            if (total <= 0) return
+            const vpRows = Math.max(1, calculatePackFlowsModalLayout(termWidth, termHeight, {
+              hasPinned: Boolean(routingView?.pinned.length),
+              hasStatus: Boolean(routingStatus),
+            }).editorViewportRows)
+            const maxOff = Math.max(0, total - vpRows)
+            setRoutingEditorScroll(off => {
+              const nextOff = Math.max(0, Math.min(maxOff, off + delta))
+              setRoutingEditorFocus(idx => Math.max(nextOff, Math.min(Math.min(total - 1, nextOff + vpRows - 1), idx)))
+              return nextOff
+            })
+          }}
+          onOpenSubPolicy={target => {
+            setFlowSubFocus(0)
+            setFlowSubScroll(0)
+            setViewMode(target)
+          }}
+          onFocusCaller={idx => setCallerFocus(idx)}
+          onToggleCaller={name => {
+            setCallerDraftSet(prev => {
+              const next = new Set(prev)
+              if (next.has(name)) next.delete(name)
+              else next.add(name)
+              return next
+            })
+          }}
+          onSaveCallers={saveCallersDraftAction}
+          onResetCallers={resetCallersToDefaultsAction}
+          onScrollCallers={delta => {
+            const total = routingView?.callerCandidates.length ?? 0
+            if (total <= 0) return
+            const vpRows = Math.max(1, calculatePackFlowsModalLayout(termWidth, termHeight, {
+              hasStatus: Boolean(routingStatus),
+            }).subviewViewportRows)
+            const maxOff = Math.max(0, total - vpRows)
+            setCallerScroll(off => {
+              const nextOff = Math.max(0, Math.min(maxOff, off + delta))
+              setCallerFocus(idx => Math.max(nextOff, Math.min(Math.min(total - 1, nextOff + vpRows - 1), idx)))
+              return nextOff
+            })
+          }}
+          onFocusSubRow={idx => setFlowSubFocus(idx)}
+          onCycleSubRow={idx => cycleRoutingSubPolicyAt(idx, 1)}
+          onScrollSubRows={delta => {
+            const total =
+              viewMode === "routing-tools"
+                ? 1 + (routingView?.availableTools.length ?? 0)
+                : viewMode === "routing-permissions"
+                  ? PERMISSION_POLICY_ROWS.length
+                  : 1 + (routingView?.subagents.length ?? 0)
+            if (total <= 0) return
+            const vpRows = Math.max(1, calculatePackFlowsModalLayout(termWidth, termHeight, {
+              hasStatus: Boolean(routingStatus),
+            }).subviewViewportRows)
+            const maxOff = Math.max(0, total - vpRows)
+            setFlowSubScroll(off => {
+              const nextOff = Math.max(0, Math.min(maxOff, off + delta))
+              setFlowSubFocus(idx => Math.max(nextOff, Math.min(Math.min(total - 1, nextOff + vpRows - 1), idx)))
+              return nextOff
+            })
+          }}
+        />
       )}
 
-      {/* Modal - Guided opencode-pack.json Initializer ([I] on virtual .md folder) */}
+      {/* Modal - Guided OpenCode Pack Onboarding ([I] or proactive on virtual sources) */}
       {viewMode === "pack-init" && (
-        <box
-          style={{ position: "absolute", left: "15%", top: "18%", width: "70%", height: "62%" }}
-          borderStyle="double"
-          borderColor="#7EE787"
-          backgroundColor="#1e1e1e"
-          title=" Initialize OpenCode Pack (opencode-pack.json) "
-          titleColor="#7EE787"
-          padding={1}
-          flexDirection="column"
-          justifyContent="space-between"
-          overflow="hidden"
-        >
-          <box flexDirection="column">
-            <text style={{ textColor: "white" }}>
-              {middleEllipsis(`Turn ${workspaceRoot} into a standard contract pack while keeping virtual mode compatible:`, Math.max(20, Math.floor(termWidth * 0.66)))}
-            </text>
-            <box flexDirection="row" marginTop={1} backgroundColor={initPackField === "name" ? "#2B5581" : "transparent"} paddingLeft={1}>
-              <text style={{ textColor: "yellow" }} width="32%">Pack Name:</text>
-              <text style={{ textColor: "white" }}>{`${initPackName}${initPackField === "name" ? "▏" : ""}`}</text>
-            </box>
-            <box flexDirection="row" marginTop={1} backgroundColor={initPackField === "version" ? "#2B5581" : "transparent"} paddingLeft={1}>
-              <text style={{ textColor: "yellow" }} width="32%">Semver Version:</text>
-              <text style={{ textColor: "white" }}>{`${initPackVersion}${initPackField === "version" ? "▏" : ""}`}</text>
-            </box>
-            <box flexDirection="row" marginTop={1} backgroundColor={initPackField === "desc" ? "#2B5581" : "transparent"} paddingLeft={1}>
-              <text style={{ textColor: "yellow" }} width="32%">Description:</text>
-              <text style={{ textColor: "white" }}>{middleEllipsis(`${initPackDesc}${initPackField === "desc" ? "▏" : ""}`, Math.max(16, Math.floor(termWidth * 0.42)))}</text>
-            </box>
-            <box flexDirection="row" marginTop={1} backgroundColor={initPackField === "organize" ? "#2B5581" : "transparent"} paddingLeft={1}>
-              <text style={{ textColor: "yellow" }} width="32%">Organize Layout:</text>
-              <text style={{ textColor: initPackOrganize ? "green" : "gray" }}>
-                {`${initPackOrganize ? "[x]" : "[ ]"} Move loose .md agents into agents/ & normalize V2 frontmatter`}
-              </text>
-            </box>
-          </box>
-          <box borderStyle="single" border={["top"]} borderColor="#333333" paddingTop={1}>
-            <text style={{ textColor: "gray" }}>[TAB/↑/↓] Next field | [SPACE] Toggle organize | [ENTER] Create opencode-pack.json | [ESC] Cancel</text>
-          </box>
-        </box>
+        <PackOnboardingModal
+          workspaceRoot={workspaceRoot}
+          sourceLabel={activeDataSource?.kind === "source" ? activeDataSource.source.name : undefined}
+          isRemoteGit={isReadOnlyGitSource}
+          inspection={initInspection}
+          focusedField={initPackField}
+          cloneDest={initCloneDest}
+          name={initPackName}
+          version={initPackVersion}
+          description={initPackDesc}
+          layout={initPackLayout}
+          organize={initPackOrganize}
+          authoringKit={initPackKit}
+          termWidth={termWidth}
+          termHeight={termHeight}
+          onFocusField={f => setInitPackField(f)}
+          onSelectLayout={l => setInitPackLayout(l)}
+          onSelectOrganize={v => setInitPackOrganize(v)}
+          onSelectAuthoringKit={v => setInitPackKit(v)}
+          onSubmit={submitPackOnboarding}
+          onCancel={() => setViewMode(routingArchetype ? "routing-configs" : "main")}
+        />
+      )}
+
+      {/* Modal - Pack Doctor & Authoring Scaffolding ([D] / [N] on local packs) */}
+      {viewMode === "pack-doctor" && (
+        <PackDoctorModal
+          tab={doctorTab}
+          report={doctorReport}
+          scrollOffset={doctorScrollOffset}
+          statusMessage={doctorStatusMessage}
+          scaffoldField={scaffoldField}
+          scaffoldKind={scaffoldKind}
+          scaffoldId={scaffoldId}
+          scaffoldDesc={scaffoldDesc}
+          scaffoldMode={scaffoldMode}
+          termWidth={termWidth}
+          termHeight={termHeight}
+          onSwitchTab={nextTab => {
+            setDoctorTab(nextTab)
+            if (nextTab === "scaffold") setScaffoldField("id")
+          }}
+          onScrollDelta={delta => {
+            const totalFindings = doctorReport?.findings.length ?? 0
+            const maxRows = getDoctorMaxFindingRows(termHeight)
+            setDoctorScrollOffset(off => Math.max(0, Math.min(Math.max(0, totalFindings - maxRows), off + delta)))
+          }}
+          onAutoFix={runPackDoctorAutoFix}
+          onInstallKit={runPackDoctorAuthoringKit}
+          onBumpVersion={runPackDoctorBump}
+          onFocusScaffoldField={f => setScaffoldField(f)}
+          onSelectScaffoldKind={k => setScaffoldKind(k)}
+          onSelectScaffoldMode={m => setScaffoldMode(m)}
+          onSubmitScaffold={submitPackScaffold}
+          onClose={() => setViewMode("main")}
+        />
       )}
 
       {/* Modal - Color Selection */}
       {viewMode === "color-selector" && (
         <box
-          style={{
-            position: "absolute",
-            left: "15%",
-            top: "15%",
-            width: "70%",
-            height: "70%"
-          }}
-          borderStyle="double"
-          borderColor="#E84393"
-          backgroundColor="#1e1e1e"
+          position="absolute"
+          left={colorViewport.left}
+          top={colorViewport.top}
+          width={colorViewport.modalWidth}
+          height={colorViewport.modalHeight}
+          zIndex={45}
+          border={true}
+          borderStyle="rounded"
+          borderColor={THEME.accentPink}
+          backgroundColor={THEME.bgElevated}
           title=" Select Agent Color "
-          titleColor="#E84393"
+          titleColor={THEME.accentPink}
           padding={1}
           flexDirection="column"
+          overflow="hidden"
+          onMouseScroll={(_self, event) => {
+            const dir = (event as any).scroll?.direction
+            if (!dir) return
+            const delta = dir === "down" ? 2 : -2
+            setColorScrollOffset(off => Math.max(0, Math.min(Math.max(0, colorTreeItems.length - maxVisibleColors), off + delta)))
+          }}
         >
-          <text style={{ textColor: "white" }} paddingBottom={1}>
-            Choose color to apply to {selectedAgentPaths.size} selected agents:
+          <text height={2} wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: THEME.fgPrimary }} paddingBottom={1}>
+            {middleEllipsis(`Choose badge color for ${selectedAgentPaths.size > 0 ? selectedAgentPaths.size : 1} agent(s):`, colorViewport.innerWidth)}
           </text>
 
-          <box flexGrow={1} flexDirection="column" marginTop={1}>
+          <box flexGrow={1} minHeight={0} flexDirection="column" marginTop={1} overflow="hidden">
             {visibleColors.map((item, index) => {
               const globalIndex = colorScrollOffset + index
               const isFocused = globalIndex === focusedColorIndex
 
               if (item.type === "group") {
-                const rowBg = isFocused ? "#444444" : "transparent"
                 return (
                   <box
                     key={`group-${item.id}`}
-                    backgroundColor={rowBg}
-                    paddingLeft={2}
+                    backgroundColor={isFocused ? THEME.bgRowFocus : "transparent"}
+                    paddingLeft={1}
                     height={1}
+                    flexShrink={0}
                     width="100%"
+                    onMouseDown={() => {
+                      setFocusedColorIndex(globalIndex)
+                      setExpandedColorGroups(prev => {
+                        const next = new Set(prev)
+                        if (next.has(item.id)) next.delete(item.id)
+                        else next.add(item.id)
+                        return next
+                      })
+                    }}
                   >
-                    <text style={{ textColor: isFocused ? "#FFFFFF" : "yellow" }}>
+                    <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: isFocused ? "#FFFFFF" : THEME.accentAmber }} b>
                       {item.label}
                     </text>
                   </box>
                 )
               }
 
-              // Color item — show colored swatch preview
-              const rowBg = isFocused ? item.hex : "transparent"
-              const textCol = isFocused ? "#FFFFFF" : "#E1E4E8"
-
               return (
                 <box
                   key={`color-${item.id}`}
-                  backgroundColor={rowBg}
+                  backgroundColor={isFocused ? THEME.bgRowFocus : "transparent"}
                   paddingLeft={2}
                   height={1}
+                  flexShrink={0}
                   width="100%"
                   flexDirection="row"
+                  onMouseDown={() => setFocusedColorIndex(globalIndex)}
                 >
-                  <box width={3} height={1} backgroundColor={item.hex}>
-                    <text>{" "}</text>
-                  </box>
-                  <text style={{ textColor: textCol }}>
-                    {isFocused ? ` > ${item.label.trim()}` : `   ${item.label.trim()}`}
+                  <text height={1} style={{ textColor: item.hex }} b>{"● "}</text>
+                  <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: isFocused ? "#FFFFFF" : THEME.fgPrimary }} b={isFocused}>
+                    {item.label.trim()}
                   </text>
-                  <text style={{ textColor: "gray" }}>
+                  <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgMuted }}>
                     {`  ${item.value}`}
                   </text>
                 </box>
@@ -4229,338 +6746,362 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
             })}
           </box>
 
-          <box justifyContent="space-between" borderStyle="single" border={["top"]} borderColor="#333333" paddingTop={1}>
-            <text style={{ textColor: "gray" }}>
-              Total: {colorTreeItems.length} | Scroll: {focusedColorIndex + 1}/{colorTreeItems.length}
+          <box flexDirection="row" justifyContent="space-between" borderStyle="single" border={["top"]} borderColor={THEME.borderSubtle} paddingTop={1} flexShrink={0}>
+            <text height={1} wrapMode="none" style={{ textColor: THEME.fgSecondary }}>
+              {`${focusedColorIndex + 1}/${colorTreeItems.length} · [ENTER] Confirm`}
             </text>
-            <text style={{ textColor: "gray" }}>
-              [ENTER/RETURN] Confirm | [ESC] Cancel
+            <text height={1} wrapMode="none" style={{ textColor: THEME.accentRed }} b onMouseDown={() => setViewMode("main")}>
+              [ESC] Cancel
             </text>
           </box>
         </box>
       )}
 
-      {/* Modal - Bridge to Claude Code */}
-      {viewMode === "bridge-prompt" && (
+      {/* Modal - Bridge to Claude Code / Codex */}
+      {viewMode === "bridge-confirm" && (
         <box
-          style={{
-             position: "absolute",
-             left: "15%",
-             top: "5%",
-             width: "70%",
-             height: "90%"
-          }}
-          borderStyle="double"
-          borderColor={bridgeTarget === "codex" ? "#00AAFF" : "#FF6B35"}
-          backgroundColor="#1e1e1e"
-          title={` Bridge to ${bridgeTarget === "codex" ? "Codex" : "Claude Code"} `}
-          titleColor={bridgeTarget === "codex" ? "#00AAFF" : "#FF6B35"}
+          style={{ position: "absolute", left: "10%", top: "16%", width: "80%", height: "68%" }}
+          zIndex={46}
+          border={true}
+          borderStyle="rounded"
+          borderColor={THEME.borderWarn}
+          backgroundColor={THEME.bgElevated}
+          title=" Confirm Executable Bridge Content "
+          titleColor={THEME.accentAmber}
           padding={1}
           flexDirection="column"
           justifyContent="space-between"
           overflow="hidden"
         >
-          <box flexDirection="column" gap={0} flexShrink={1} overflow="hidden">
-            <box flexDirection="row" flexShrink={0}>
-              <text style={{ textColor: "white" }} b>BRIDGE TO {bridgeTarget === "codex" ? "CODEX" : "CLAUDE CODE"} </text>
-              <text style={{ textColor: bridgeTarget === "codex" ? "#00AAFF" : "#FF6B35" }} b>
-                OpenCode → {bridgeTarget === "codex" ? "Codex Translation Layer" : "Claude Code Plugin"}
-              </text>
-            </box>
-            <text style={{ textColor: "gray" }} marginTop={1} flexShrink={0}>
-              {bridgeTarget === "codex"
-                ? "Generate a Codex plugin manifest and project-scoped agents with configurable Sol/Luna mapping."
-                : "Convert agents to a Claude Code plugin with deterministic field mapping."}
+          <box flexDirection="column" flexGrow={1} overflow="hidden">
+            <text style={{ textColor: THEME.accentAmber }} b>
+              This untrusted pack includes executable content. Confirm before writing bridge output:
             </text>
-
-            {/* Plugin Name field */}
-            <box
-              flexDirection="column"
-              borderStyle="single"
-              borderColor={bridgeFocusedField === "name" ? (bridgeTarget === "codex" ? "#00AAFF" : "#FF6B35") : "#333333"}
-              paddingLeft={1}
-              paddingRight={1}
-              marginTop={1}
-              flexShrink={0}
-            >
-              <text width={bridgeFocusedField === "name" ? undefined : "30%"} flexShrink={0} style={{ textColor: bridgeFocusedField === "name" ? (bridgeTarget === "codex" ? "#00AAFF" : "#FF6B35") : "gray" }} b>
-                {bridgeFocusedField === "name" ? "► Plugin Name:" : "  Plugin Name:"}
-              </text>
-          <input width={bridgeFocusedField === "name" ? undefined : "70%"} value={bridgePluginName} placeholder="e.g. decent-pipeline" focused={bridgeFocusedField === "name"} onInput={setBridgePluginName} onSubmit={generateBridge} />
-              {bridgeFocusedField === "name" && <text flexShrink={0} style={{ textColor: "gray" }}>Output plugin or translation-layer name.</text>}
-            </box>
-
-            {/* Prefix to Strip field */}
-            <box
-              flexDirection={bridgeFocusedField === "prefix" ? "column" : "row"}
-              borderStyle="single"
-              borderColor={bridgeFocusedField === "prefix" ? (bridgeTarget === "codex" ? "#00AAFF" : "#FF6B35") : "#333333"}
-              paddingLeft={1}
-              paddingRight={1}
-              marginTop={1}
-              flexShrink={0}
-            >
-              <text width="30%" flexShrink={0} style={{ textColor: bridgeFocusedField === "prefix" ? (bridgeTarget === "codex" ? "#00AAFF" : "#FF6B35") : "gray" }} b>
-                       {bridgeFocusedField === "prefix" ? "► Prefix to Strip:" : "  Prefix to Strip:"}
-              </text>
-              <input width="70%" value={bridgePipelinePrefix} placeholder="empty = include all" focused={bridgeFocusedField === "prefix"} onInput={(value) => { setBridgePipelinePrefix(value); setBridgeSuggestionIndex(0); setBridgeSuggestionScrollOffset(0) }} onSubmit={generateBridge} />
-              {bridgeFocusedField === "prefix" && <text flexShrink={0} style={{ textColor: "gray" }}>Includes matching agents and removes this prefix from generated names.</text>}
-                {bridgeFocusedField === "prefix" && <box borderStyle="single" borderColor="#444444" width="100%" flexDirection="column" paddingLeft={1} paddingRight={1} flexShrink={0} overflow="hidden">
-                <text flexShrink={0} style={{ textColor: "gray" }}>Suggestions (↑/↓, TAB selects):</text>
-                {filteredBridgePrefixSuggestions.slice(bridgeSuggestionScrollOffset, bridgeSuggestionScrollOffset + 5).map(({ prefix, count }, index) => {
-                  const globalIndex = bridgeSuggestionScrollOffset + index
-                  return (
-                  <text key={prefix || "all"} flexShrink={0} style={{ textColor: globalIndex === bridgeSuggestionIndex ? "yellow" : "gray" }}>
-                     {globalIndex === bridgeSuggestionIndex ? "► " : "  "}{middleEllipsis(prefix || "(empty)", 30)}  ({count} agents)
+            <scrollbox scrollY={true} flexGrow={1} marginTop={1} overflow="hidden">
+              <box flexDirection="column">
+                {bridgeConfirmReasons.map((reason, index) => (
+                  <text key={`bridge-confirm-${index}`} style={{ textColor: THEME.fgPrimary }}>
+                    {`• ${terminalSafeText(reason)}`}
                   </text>
-                  )
-                })}
-               </box>}
-            </box>
-
-            {/* Map all models to field */}
-            <box
-              flexDirection={bridgeFocusedField === "model" ? "column" : "row"}
-              borderStyle="single"
-              borderColor={bridgeFocusedField === "model" ? (bridgeTarget === "codex" ? "#00AAFF" : "#FF6B35") : "#333333"}
-              paddingLeft={1}
-              paddingRight={1}
-              marginTop={1}
-              flexShrink={0}
-            >
-              <text width="30%" flexShrink={0} style={{ textColor: bridgeFocusedField === "model" ? (bridgeTarget === "codex" ? "#00AAFF" : "#FF6B35") : "gray" }} b>
-                {bridgeFocusedField === "model" ? "► Map all models to:" : "  Map all models to:"}
-              </text>
-              <input width="70%" value={bridgeModelTarget} placeholder="empty = tier mapping" focused={bridgeFocusedField === "model"} onInput={setBridgeModelTarget} onSubmit={generateBridge} />
-              {bridgeFocusedField === "model" && <text flexShrink={0} style={{ textColor: "gray" }}>empty = tier mapping; full per-model editing lives in bridges/translation-config.json</text>}
-            </box>
-
-            {/* Info */}
-            <box marginTop={1} flexDirection="column">
-              <text flexShrink={0} style={{ textColor: "gray" }}>
-                {`Source: pack '${activeItems[focusedIndex]?.category ?? ""}' and the packs it requires`}
-              </text>
-              <text flexShrink={0} style={{ textColor: "gray" }}>
-                {`Output: bridges/${bridgeTarget === "codex" ? "codex" : "claude-code"}/${bridgePluginName || "..."}/`}
-              </text>
-            </box>
+                ))}
+              </box>
+            </scrollbox>
           </box>
-
-          <box flexDirection="column" borderStyle="single" border={["top"]} borderColor="#333333" paddingTop={1} flexShrink={0} overflow="hidden">
-            <text flexShrink={0} style={{ textColor: "gray" }}>
-             Target: {bridgeTarget === "codex" ? "Codex" : "Claude Code"} | main b/B
+          <box borderStyle="single" border={["top"]} borderColor={THEME.borderSubtle} paddingTop={1} justifyContent="space-between" flexDirection="row">
+            <text style={{ textColor: THEME.accentGreen }} b>
+              [Y / ENTER] Continue Bridge
             </text>
-            <text flexShrink={0} style={{ textColor: "red" }} b>
-               Field: {bridgeFocusedField} | TAB next | ENTER generate | ESC
+            <text style={{ textColor: THEME.accentRed }} b>
+              [N / ESC] Cancel
             </text>
           </box>
         </box>
       )}
 
-      {/* Modal - Install a pack of the workspace into OpenCode */}
-      {viewMode === "install-confirm" && installPreview && (
-        <box
-          style={{
-            position: "absolute",
-            left: "12%",
-            top: "15%",
-            width: "76%",
-            height: "70%"
+      {viewMode === "bridge-prompt" && (
+        <BridgeModal
+          target={bridgeTarget}
+          focusedField={bridgeFocusedField}
+          pluginName={bridgePluginName}
+          selectedPack={bridgeSelectedPack}
+          suggestedPack={bridgePackSuggested}
+          packQuery={bridgePackQuery}
+          allPacks={bridgeablePacks}
+          filteredPacks={filteredBridgePacks}
+          packIndex={bridgePackIndex}
+          packScrollOffset={bridgePackScrollOffset}
+          tiers={bridgeDraftTiers}
+          tierIndex={bridgeTierIndex}
+          tierScrollOffset={bridgeTierScrollOffset}
+          previewItems={bridgePreview.items}
+          tierCounts={bridgePreview.tierCounts}
+          agentIndex={bridgeAgentIndex}
+          agentScrollOffset={bridgeAgentScrollOffset}
+          modelTarget={bridgeModelTarget}
+          tiersDirty={bridgeTiersDirty}
+          termWidth={termWidth}
+          termHeight={termHeight}
+          onFocusField={field => {
+            setBridgeClaudeTierTyping(false)
+            setBridgeFocusedField(field)
           }}
-          borderStyle="double"
-          borderColor="#00CC66"
-          backgroundColor="#1e1e1e"
-          title={` Install ${installPreview.pack} `}
-          titleColor="#00CC66"
-          padding={1}
-          flexDirection="column"
-          justifyContent="space-between"
-        >
-          <box flexDirection="column" overflow="hidden">
-            <text style={{ textColor: "white" }} b>
-              {`Install pack '${installPreview.pack}' and the packs it requires into ${installPreview.target.replace(os.homedir(), "~")}`}
-            </text>
-            {installPreview.lines.map((line, index) => (
-              <text key={`install-${index}`} style={{ textColor: line.startsWith("ERROR") ? "red" : line.startsWith("warning") ? "yellow" : "#E1E4E8" }}>{line}</text>
-            ))}
-            {installPreview.confirmations.length > 0 && <text style={{ textColor: "yellow" }} b marginTop={1}>Confirming also accepts:</text>}
-            {installPreview.confirmations.map((reason, index) => (
-              <text key={`confirm-${index}`} style={{ textColor: "yellow" }}>{`  * ${terminalSafeText(reason)}`}</text>
-            ))}
-          </box>
-
-          <box justifyContent="center" gap={4}>
-            {installPreview.blocked
-              ? <text style={{ textColor: "red" }} b>Nothing can be installed: press [ESC] to go back</text>
-              : <text style={{ textColor: "green" }} b>Press [Y] or [ENTER/RETURN] to install</text>}
-            {!installPreview.blocked && <text style={{ textColor: "red" }} b>Press [N] or [ESC] to cancel</text>}
-          </box>
-        </box>
+          onChangePluginName={setBridgePluginName}
+          onChangePackQuery={value => {
+            const next = reconcileBridgePackQuery(bridgeablePacks, value, bridgeSelectedPack, bridgePackViewportRows)
+            setBridgePackQuery(next.query)
+            setBridgeSelectedPack(next.selectedPack)
+            setBridgePackIndex(next.index)
+            setBridgePackScrollOffset(next.scrollOffset)
+            setBridgeAgentIndex(0)
+            setBridgeAgentScrollOffset(0)
+          }}
+          onSelectPackAt={(filteredIndex, pack) => {
+            setBridgeFocusedField("pack")
+            setBridgePackIndex(filteredIndex)
+            setBridgeSelectedPack(pack)
+            setBridgeAgentIndex(0)
+            setBridgeAgentScrollOffset(0)
+          }}
+          onSelectTierIndex={idx => {
+            setBridgeClaudeTierTyping(false)
+            setBridgeTierIndex(idx)
+          }}
+          onChangeTierModel={(tierName, model) => {
+            setBridgeClaudeTierTyping(false)
+            updateBridgeTierModel(tierName, model)
+          }}
+          onSelectTierEffort={(tierName, effort) => updateBridgeTierEffort(tierName, effort)}
+          onSelectAgentIndex={idx => setBridgeAgentIndex(idx)}
+          onCycleAgentTierAt={(idx, delta) => cycleBridgeAgentTierAt(idx, delta)}
+          onChangeModelTarget={value => {
+            bridgeModelTargetDirtyRef.current = true
+            setBridgeModelTarget(value)
+          }}
+          onSaveTiers={saveBridgeTiersOnly}
+          onSubmit={() => generateBridge()}
+          onClose={() => setViewMode("main")}
+        />
       )}
 
-      {/* Modal - Data Sources (GitHub & Local) */}
-      {viewMode === "sources" && (() => {
-        const innerWidth = Math.max(20, Math.floor(termWidth * 0.88) - 6)
-        const visibleSourceRows = sourceModalRows.slice(sourcesScrollOffset, sourcesScrollOffset + maxVisibleSourceRows)
-        const ghLine = !ghAuth
-          ? "GitHub CLI (gh): checking status..."
-          : ghAuth.authenticated
-            ? `✓ GitHub CLI: authenticated on ${ghAuth.host}${ghAuth.login ? ` as ${ghAuth.login}` : ""} (${ghRepos.length} repos)`
-            : ghAuth.available
-              ? `⚠ GitHub CLI: ${ghAuth.message} — press [G] to log in via browser`
-              : `⚠ ${ghAuth.message}`
-        const ghColor = ghAuth?.authenticated ? "#2ECC71" : "yellow"
-        const inputDisplay = sourcesQuery
-          ? `${sourcesQuery}${sourcesInputFocused ? "█" : ""}`
-          : sourcesInputFocused
-            ? "█"
-            : "owner/repo[#ref], https://...git, or /local/path  (press [A] or [/] to type)"
+      {/* Modal - Install a pack into OpenCode with Native Diff Preview */}
+      {viewMode === "install-confirm" && installPreview && (() => {
+        const addedLines = installPreview.lines.filter(l => /^\s*\b(write|add|install|update)\b/i.test(l))
+        const removedLines = installPreview.lines.filter(l => /^\s*\b(remove|delete|prune)\b/i.test(l))
+        const hasDiffItems = addedLines.length > 0 || removedLines.length > 0
 
         return (
           <box
-            style={{
-              position: "absolute",
-              left: "6%",
-              top: "8%",
-              width: "88%",
-              height: "84%"
-            }}
-            borderStyle="double"
-            borderColor="#9ECBFF"
-            backgroundColor="#1e1e1e"
-            title=" Data Sources (GitHub & Local) "
-            titleColor="#9ECBFF"
+            style={{ position: "absolute", left: "10%", top: "12%", width: "80%", height: "76%" }}
+            zIndex={45}
+            border={true}
+            borderStyle="rounded"
+            borderColor={installPreview.blocked ? THEME.borderDanger : THEME.borderSuccess}
+            backgroundColor={THEME.bgElevated}
+            title={` Install ${installPreview.pack} `}
+            titleColor={installPreview.blocked ? THEME.accentRed : THEME.accentGreen}
             padding={1}
             flexDirection="column"
             justifyContent="space-between"
-            overflow="hidden"
           >
             <box flexDirection="column" flexGrow={1} overflow="hidden">
-              <text width="100%" height={1} wrapMode="none" overflow="hidden" style={{ textColor: ghColor }} b>
-                {middleEllipsis(terminalSafeText(ghLine), innerWidth)}
+              <text style={{ textColor: THEME.fgPrimary }} b>
+                {`Install '${installPreview.pack}' and its dependencies into ${installPreview.target.replace(os.homedir(), "~")}`}
               </text>
-
-              <box
-                width="100%"
-                height={3}
-                marginTop={1}
-                borderStyle="single"
-                borderColor={sourcesInputFocused ? "cyan" : "#444444"}
-                title={sourcesInputFocused ? " Connect or Filter (typing) " : " Connect or Filter "}
-                titleColor={sourcesInputFocused ? "cyan" : "gray"}
-                paddingLeft={1}
-                paddingRight={1}
-                overflow="hidden"
-              >
-                <text width="100%" height={1} wrapMode="none" overflow="hidden" style={{ textColor: sourcesQuery || sourcesInputFocused ? "white" : "gray" }}>
-                  {middleEllipsis(terminalSafeText(inputDisplay), Math.max(10, innerWidth - 4))}
-                </text>
-              </box>
-
-              <box flexDirection="column" marginTop={1} flexGrow={1} overflow="hidden">
-                {sourceModalRows.length === 0 ? (
-                  <box flexDirection="column">
-                    <text style={{ textColor: "yellow" }}>
-                      No registered sources or GitHub repositories listed yet.
+              <scrollbox scrollY={true} flexGrow={1} marginTop={1} overflow="hidden">
+                <box flexDirection="column">
+                  {installPreview.lines.map((line, index) => (
+                    <text
+                      key={`install-${index}`}
+                      style={{
+                        textColor: line.startsWith("ERROR")
+                          ? THEME.accentRed
+                          : line.startsWith("warning")
+                            ? THEME.accentAmber
+                            : THEME.fgPrimary,
+                      }}
+                    >
+                      {line}
                     </text>
-                    <text style={{ textColor: "gray" }} marginTop={1}>
-                      Press [G] to sign in with GitHub CLI, or press [A] and type owner/repo (e.g. lorecanc/agents) or a local folder path.
+                  ))}
+                  {hasDiffItems && (
+                    <box width="100%" marginTop={1}>
+                      <diff
+                        width="100%"
+                        view="unified"
+                        showLineNumbers={true}
+                        syntaxStyle={getMarkdownSyntaxStyle()}
+                        diff={buildPreviewUnifiedDiff(
+                          `${installPreview.pack}-target-plan`,
+                          removedLines.length ? removedLines : ["(no removals)"],
+                          addedLines.length ? addedLines : ["(no additions)"],
+                        )}
+                      />
+                    </box>
+                  )}
+                  {installPreview.confirmations.length > 0 && (
+                    <text style={{ textColor: THEME.accentAmber }} b marginTop={1}>
+                      Confirming also accepts executable surface:
                     </text>
-                  </box>
-                ) : (
-                  visibleSourceRows.map((row, idx) => {
-                    const globalIdx = sourcesScrollOffset + idx
-                    const focused = globalIdx === sourcesFocusIndex
-                    const bg = focused ? "#2B5581" : "transparent"
-                    let line = ""
-                    let color = "#E1E4E8"
-                    if (row.kind === "connect-input") {
-                      line = `+ Attach "${row.spec}"`
-                      color = focused ? "#FFFFFF" : "#2ECC71"
-                    } else if (row.kind === "registered") {
-                      const mark = row.isActive ? "★" : "●"
-                      const trustTag = row.source.trusted ? "trusted" : "untrusted"
-                      const loc = row.source.kind === "local"
-                        ? formatDisplayPath(row.source.path)
-                        : `${row.source.url.replace(/^https?:\/\/github\.com\//i, "github.com/").replace(/\.git$/i, "")}${row.source.ref ? `#${row.source.ref}` : ""} (${row.revision ? row.revision.slice(0, 7) : "not pulled"})`
-                      line = `${mark} [source] ${row.source.name}  [${row.source.kind} · ${trustTag}]  ${loc}`
-                      color = focused ? "#FFFFFF" : row.isActive ? "#9ECBFF" : "yellow"
-                    } else {
-                      const vis = row.repo.isPrivate ? "private" : "public"
-                      const desc = row.repo.description ? ` · ${row.repo.description}` : ""
-                      line = `  [gh]     ${row.repo.nameWithOwner}  [${vis}]${desc}`
-                      color = focused ? "#FFFFFF" : "#E1E4E8"
-                    }
-                    return (
-                      <box key={row.id} width="100%" height={1} backgroundColor={bg} paddingLeft={1} overflow="hidden" flexShrink={0}>
-                        <text width="100%" height={1} wrapMode="none" overflow="hidden" style={{ textColor: color }}>
-                          {middleEllipsis(terminalSafeText(line), Math.max(10, innerWidth - 2))}
-                        </text>
-                      </box>
-                    )
-                  })
-                )}
-              </box>
+                  )}
+                  {installPreview.confirmations.map((reason, index) => (
+                    <text key={`confirm-${index}`} style={{ textColor: THEME.accentAmber }}>
+                      {`  • ${terminalSafeText(reason)}`}
+                    </text>
+                  ))}
+                </box>
+              </scrollbox>
             </box>
 
-            <box flexDirection="column" borderStyle="single" border={["top"]} borderColor="#333333" paddingTop={1} flexShrink={0} overflow="hidden">
-              {sourcesStatus !== "" && (
-                <text width="100%" height={1} wrapMode="none" overflow="hidden" style={{ textColor: "yellow" }}>
-                  {middleEllipsis(terminalSafeText(sourcesStatus), innerWidth)}
+            <box borderStyle="single" border={["top"]} borderColor={THEME.borderSubtle} paddingTop={1} justifyContent="space-between" flexDirection="row">
+              {installPreview.blocked ? (
+                <text style={{ textColor: THEME.accentRed }} b onMouseDown={() => setViewMode("main")}>
+                  Blocked · [ESC] Back
+                </text>
+              ) : (
+                <text style={{ textColor: THEME.accentGreen }} b onMouseDown={() => applyInstall(installPreview)}>
+                  [Y / ENTER] Confirm &amp; Install
                 </text>
               )}
-              <text width="100%" height={1} wrapMode="none" overflow="hidden" style={{ textColor: "#2ECC71" }}>
-                {middleEllipsis(
-                  sourcesInputFocused
-                    ? "[ENTER] Attach/Open selected | [↑/↓] Choose row"
-                    : "[ENTER] Open/Attach | [A /] Type repo or path | [G] gh Login",
-                  innerWidth
-                )}
-              </text>
-              <text width="100%" height={1} wrapMode="none" overflow="hidden" style={{ textColor: "gray" }}>
-                {middleEllipsis(
-                  sourcesInputFocused
-                    ? "[CTRL+G] gh Login | [ESC] Done typing"
-                    : "[P] Pull/Refresh | [T] Trust | [X] Remove | [ESC] Back",
-                  innerWidth
-                )}
-              </text>
+              {!installPreview.blocked && (
+                <text style={{ textColor: THEME.accentRed }} b onMouseDown={() => setViewMode("main")}>
+                  [N / ESC] Cancel
+                </text>
+              )}
             </box>
           </box>
         )
       })()}
 
+      {/* Modal - Engine Self-Update (GitHub Releases) */}
+      {viewMode === "self-update" && (
+        <box
+          position="absolute"
+          left={selfUpdateViewport.left}
+          top={selfUpdateViewport.top}
+          width={selfUpdateViewport.modalWidth}
+          height={selfUpdateViewport.modalHeight}
+          zIndex={45}
+          border={true}
+          borderStyle="rounded"
+          borderColor={THEME.accentCyan}
+          backgroundColor={THEME.bgElevated}
+          title=" Engine Update (manage-agents) "
+          titleColor={THEME.accentCyan}
+          padding={1}
+          flexDirection="column"
+          justifyContent="space-between"
+          overflow="hidden"
+        >
+          <box flexDirection="column" overflow="hidden">
+            <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgPrimary }} b>
+              {middleEllipsis(`Installed: ${engineVersionInfo ? `${engineVersionInfo.displayVersion} (${engineVersionInfo.channel}${engineVersionInfo.dirty ? " · dirty" : " · clean"})` : "unknown"}`, selfUpdateViewport.innerWidth)}
+            </text>
+            {selfUpdateCheck && (
+              <>
+                <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: selfUpdateCheck.updateAvailable ? THEME.accentGreen : THEME.fgSecondary }} marginTop={1}>
+                  {middleEllipsis(
+                    `Latest:    ${selfUpdateCheck.metadata.tag} · commit ${selfUpdateCheck.metadata.commit.slice(0, 7)} · ${selfUpdateCheck.verificationMode === "ed25519" ? "Signed Ed25519" : "Verified SHA-256"}`,
+                    selfUpdateViewport.innerWidth,
+                  )}
+                </text>
+                <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgSecondary }}>
+                  {middleEllipsis(
+                    `Asset:     ${selfUpdateCheck.metadata.archive.name} (${Math.max(1, Math.round(selfUpdateCheck.metadata.archive.size / 1024))} KB)`,
+                    selfUpdateViewport.innerWidth,
+                  )}
+                </text>
+                <text
+                  height={1}
+                  wrapMode="none"
+                  overflow="hidden"
+                  marginTop={1}
+                  style={{
+                    textColor: selfUpdateCheck.updateAvailable
+                      ? THEME.accentGreen
+                      : selfUpdateCheck.downgrade
+                        ? THEME.accentAmber
+                        : THEME.fgSecondary,
+                  }}
+                  b={selfUpdateCheck.updateAvailable}
+                >
+                  {middleEllipsis(
+                    selfUpdateCheck.updateAvailable
+                      ? `Status:    ↑ Update available${selfUpdateCheck.targetReconcileNeeded ? " (reconciles OpenCode router plugin)" : ""}`
+                      : selfUpdateCheck.downgrade
+                        ? "Status:    Installed version is newer than latest release ([F] force downgrade)"
+                        : "Status:    ✓ manage-agents is already up to date",
+                    selfUpdateViewport.innerWidth,
+                  )}
+                </text>
+                {selfUpdateCheck.localGitDirty && (
+                  <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: THEME.accentAmber }} marginTop={1}>
+                    {middleEllipsis("⚠ Engine directory has uncommitted changes ([F] force overwrite).", selfUpdateViewport.innerWidth)}
+                  </text>
+                )}
+              </>
+            )}
+            {selfUpdateStatus && (
+              <text
+                height={1}
+                wrapMode="none"
+                overflow="hidden"
+                marginTop={1}
+                style={{ textColor: selfUpdateStatus.startsWith("Error") ? THEME.accentRed : THEME.accentCyan }}
+              >
+                {middleEllipsis(`${selfUpdateBusy && pulse.spinner ? `${pulse.spinner} ` : ""}${selfUpdateStatus}`, selfUpdateViewport.innerWidth)}
+              </text>
+            )}
+          </box>
+
+          <box flexDirection="row" justifyContent="space-between" borderStyle="single" border={["top"]} borderColor={THEME.borderSubtle} paddingTop={1} flexShrink={0}>
+            <text height={1} wrapMode="none" style={{ textColor: selfUpdateCheck?.updateAvailable && !selfUpdateCheck.localGitDirty ? THEME.accentGreen : THEME.fgSecondary }} b={Boolean(selfUpdateCheck?.updateAvailable && !selfUpdateCheck.localGitDirty)}>
+              {selfUpdateBusy
+                ? "Working..."
+                : selfUpdateCheck?.updateAvailable
+                  ? selfUpdateCheck.localGitDirty
+                    ? "[F] Force Update · [R] Re-check"
+                    : "[Y / ENTER] Update Engine · [R] Re-check"
+                  : "[R] Re-check"}
+            </text>
+            <text height={1} wrapMode="none" style={{ textColor: THEME.accentRed }} b onMouseDown={() => !selfUpdateBusy && setViewMode("main")}>
+              [ESC] Close
+            </text>
+          </box>
+        </box>
+      )}
+
       {/* Modal - Action Result */}
       {viewMode === "action-result" && (
         <box
-          style={{
-            position: "absolute",
-            left: "12%",
-            top: "15%",
-            width: "76%",
-            height: "70%"
-          }}
-          borderStyle="double"
-          borderColor="green"
-          backgroundColor="#1e1e1e"
-           title={` ${middleEllipsis(actionResultTitle, 50)} `}
-          titleColor="green"
+          position="absolute"
+          left={actionResultViewport.left}
+          top={actionResultViewport.top}
+          width={actionResultViewport.modalWidth}
+          height={actionResultViewport.modalHeight}
+          zIndex={45}
+          border={true}
+          borderStyle="rounded"
+          borderColor={actionResultTitle.toLowerCase().includes("error") || actionResultTitle.toLowerCase().includes("fail") ? THEME.borderDanger : THEME.borderSuccess}
+          backgroundColor={THEME.bgElevated}
+          title={` ${middleEllipsis(actionResultTitle, 50)} `}
+          titleColor={actionResultTitle.toLowerCase().includes("error") || actionResultTitle.toLowerCase().includes("fail") ? THEME.accentRed : THEME.accentGreen}
           padding={1}
           flexDirection="column"
           overflow="hidden"
+          onMouseScroll={(_self, event) => {
+            const dir = (event as any).scroll?.direction
+            if (!dir) return
+            const delta = dir === "down" ? 2 : -2
+            setActionResultScrollOffset(off => Math.max(0, Math.min(actionResultMaxOffset, off + delta)))
+          }}
         >
-          <box flexGrow={1} flexDirection="column" overflow="hidden" flexShrink={1}>
-             {visibleActionResultLines.map((line, idx) => (
-                <text key={actionResultScrollOffset + idx} style={{ textColor: line.startsWith("⚠ AUTO-COMMIT:") ? "yellow" : "white" }} flexShrink={0}>{terminalSafeText(line)}</text>
+          <box flexGrow={1} minHeight={0} flexDirection="column" overflow="hidden" flexShrink={1}>
+            {visibleActionResultLines.map((line, idx) => (
+              <text
+                key={actionResultScrollOffset + idx}
+                height={1}
+                wrapMode="none"
+                overflow="hidden"
+                style={{
+                  textColor: line.startsWith("⚠")
+                    ? THEME.accentAmber
+                    : line.toLowerCase().startsWith("error")
+                      ? THEME.accentRed
+                      : THEME.fgPrimary,
+                }}
+                flexShrink={0}
+              >
+                {middleEllipsis(terminalSafeText(line), actionResultViewport.innerWidth)}
+              </text>
             ))}
           </box>
 
-          <box justifyContent="center" borderStyle="single" border={["top"]} borderColor="#333333" paddingTop={1} marginTop={1} flexShrink={0} overflow="hidden">
-            <text style={{ textColor: "yellow" }} flexShrink={0}>
-              {actionResultMaxOffset > 0 ? `▲ ${actionResultScrollOffset + 1}-${Math.min(actionResultLines.length, actionResultScrollOffset + maxVisibleActionResultLines)}/${actionResultLines.length} ▼  ` : ""}
+          <box justifyContent="space-between" borderStyle="single" border={["top"]} borderColor={THEME.borderSubtle} paddingTop={1} marginTop={1} flexShrink={0} overflow="hidden" flexDirection="row">
+            <text height={1} wrapMode="none" style={{ textColor: THEME.fgMuted }} flexShrink={0}>
+              {actionResultMaxOffset > 0 ? `▲ ${actionResultScrollOffset + 1}-${Math.min(actionResultLines.length, actionResultScrollOffset + maxVisibleActionResultLines)}/${actionResultLines.length} ▼` : "Result summary"}
             </text>
-            <text style={{ textColor: "green" }} b flexShrink={0}>
-              Press [ENTER/RETURN] or [ESC] to continue
+            <text height={1} wrapMode="none" style={{ textColor: THEME.accentGreen }} b flexShrink={0} onMouseDown={() => setViewMode("main")}>
+              [ENTER / ESC] Continue
             </text>
           </box>
         </box>

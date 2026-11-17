@@ -26,6 +26,7 @@ export const defaultGhRunner: GhRunner = {
       encoding: "utf8",
       env: cleanGitEnvironment(options.env ?? {}),
       stdio,
+      windowsHide: true,
     })
     return {
       status: result.status,
@@ -125,7 +126,7 @@ export function extractHttpsHost(url: string): string | null {
 
 function runGhAsync(args: string[], env: NodeJS.ProcessEnv = process.env): Promise<GhRunResult> {
   return new Promise(resolve => {
-    execFile("gh", args, { encoding: "utf8", env: cleanGitEnvironment(env), maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
+    execFile("gh", args, { encoding: "utf8", env: cleanGitEnvironment(env), maxBuffer: 8 * 1024 * 1024, windowsHide: true }, (error, stdout, stderr) => {
       if (error && (error as NodeJS.ErrnoException).code === "ENOENT") {
         resolve({ status: null, stdout: "", stderr: "", error })
         return

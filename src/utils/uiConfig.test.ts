@@ -266,3 +266,16 @@ test("supports repeated save/reload and external read-only copies", () => {
   assert.equal(loadUiConfig(configDir(root)).readOnly, true)
   assert.throws(() => saveUiConfig(configDir(root), 0.64), /read-only/)
 })
+
+test("persists and validates optional reducedMotion flag backwards-compatibly", () => {
+  const root = tempRoot()
+  const rev1 = saveUiConfig(configDir(root), 0.65, undefined, { reducedMotion: true })
+  const loaded1 = loadUiConfig(configDir(root))
+  assert.deepEqual(loaded1.config, { listShare: 0.65, reducedMotion: true })
+
+  saveUiConfig(configDir(root), 0.65, rev1, { reducedMotion: false })
+  assert.deepEqual(loadUiConfig(configDir(root)).config, { listShare: 0.65 })
+
+  fs.writeFileSync(path.join(root, "manage-agents", "ui.json"), JSON.stringify({ version: 1, listShare: 0.65, reducedMotion: "yes" }))
+  assert.ok(loadUiConfig(configDir(root)).warning)
+})

@@ -6,14 +6,15 @@ description: How to create or change an OpenCode pack (agents, commands, skills,
 # Authoring OpenCode packs
 
 A pack is a directory laid out like `~/.config/opencode/`, with an `opencode-pack.json` manifest at its root. The
-full rules are in `CONTRACT.md` of manage-agents (contract 1.0). This skill is the working checklist.
+full rules are in `CONTRACT.md` of manage-agents (contract 1.1). This skill is the working checklist.
 
 ## Before you edit
 
-1. Find the pack: the nearest ancestor directory with `opencode-pack.json`. Read the manifest: `name`, `requires`,
-   `archetype`.
-2. Run `manage-agents pack validate <pack-dir>` and note the existing warnings, so you do not mistake them for
-   yours.
+1. Find the pack: the nearest ancestor directory with `opencode-pack.json` (or run `manage-agents pack onboard` to
+   onboard a raw folder of Markdown agents, a `.opencode/` project config, or a mixed application repository). Read the
+   manifest: `name`, `requires`, `archetype`, `flowDefaults`.
+2. Run `manage-agents pack doctor <pack-dir>` (or `manage-agents pack validate <pack-dir>`) and note any existing
+   warnings, so you do not mistake them for yours.
 
 ## Where files go
 
@@ -27,8 +28,11 @@ full rules are in `CONTRACT.md` of manage-agents (contract 1.0). This skill is t
 | any other content | `<dir>/<pack-name>/...`, e.g. `resources/<pack-name>/...` |
 | pack-wide guidance | `AGENTS.md` at the pack root |
 
+You can scaffold compliant starter files directly with `manage-agents pack add agent|skill|command <id> --dir <pack-dir>`.
+
 Never create: other root files, `instructions/`, `.manage-agents/`, the legacy singular directories (`agent/`,
-`plugin/`, ...), single-file plugins, or `node_modules/`.
+`command/`, `skill/`, `plugin/`, ...), single-file plugins, or `node_modules/`. Repository-local OpenCode authoring
+files under `.opencode/` and CI workflows under `.github/` are ignored by the pack installer and never shipped.
 
 ## References
 
@@ -46,19 +50,22 @@ and `experimental` flags. Never set the user's keys (`model`, `default_agent`, `
 
 ## Archetypes and models
 
-- To make subagent models follow the model the caller runs on, declare
-  `"archetype": {"callers": [...primary agents], "reference": "<one of them>"}` and optional `routingDefaults`.
+- To make subagent models and policies follow the model the caller runs on, declare
+  `"archetype": {"callers": [...primary agents], "reference": "<one of them>"}` and optional `routingDefaults` or
+  conditional `flowDefaults` (contract 1.1).
 - Give a subagent a fixed `model` in its frontmatter only when it truly needs one, for example a model with image
   input: that pins it and routing skips it.
 
 ## Versioning
 
-- Bump `version` (semver) for every change you ship: patch for fixes, minor for additions, major for removals or
-  renames of agents, commands, skills, plugins or paths that other packs reference.
+- Bump `version` (semver) for every change you ship (`manage-agents pack doctor <pack-dir> --bump patch|minor|major`):
+  patch for fixes, minor for additions, major for removals or renames of agents, commands, skills, plugins or paths
+  that other packs reference.
 - Adding or changing plugins, tool modules, skill scripts or MCP servers changes the pack's **executable surface**,
   and users are asked to confirm it. Mention it in the change description.
 
 ## Done means
 
-`manage-agents pack validate <pack-dir>` exits 0. Your change adds no new warnings, or you justify each one. Every
+`manage-agents pack validate <pack-dir>` exits 0 (`manage-agents pack doctor <pack-dir> --fix` repairs common V1,
+layout and namespace drift automatically). Your change adds no new warnings, or you justify each one. Every
 `unresolved` reference is provided by a pack listed in `requires`.

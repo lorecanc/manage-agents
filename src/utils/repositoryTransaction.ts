@@ -30,7 +30,7 @@ export function cleanGitEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.P
 }
 const defaultGitRunner: GitRunner = {
   run(root: string, args: string[], overrides: NodeJS.ProcessEnv = {}, input?: Buffer) {
-    return spawnSync("git", ["-C", root, ...args], { encoding: "utf8", env: cleanGitEnvironment(overrides), input })
+    return spawnSync("git", ["-C", root, ...args], { encoding: "utf8", env: cleanGitEnvironment(overrides), input, windowsHide: true })
   },
 }
 function git(runner: GitRunner, root: string, args: string[], overrides: NodeJS.ProcessEnv = {}, input?: Buffer) {

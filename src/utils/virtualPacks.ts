@@ -1,18 +1,15 @@
 import crypto from "node:crypto"
 import fs from "node:fs"
 import path from "node:path"
-import semver from "semver"
 import YAML from "yaml"
-import { atomicWriteRestrictedFile, extractFrontmatter, renderAgentFile } from "./agents.js"
-import { assertInsideRealWorkspace, realpathThroughExistingAncestor } from "./pathValidation.js"
+import { extractFrontmatter, renderAgentFile } from "./agents.js"
+import { initPackManifest, type InitPackOptions, type InitPackResult } from "./packOnboarding.js"
 import {
   DISCOVERY_DEPTH,
-  hasErrors,
   MANIFEST_FILE,
   MAX_SCANNED_BYTES,
   PACK_NAME_RE,
   SKIPPED_DIRS,
-  validatePack,
   type ExecutableSurface,
   type PackAgent,
   type PackIds,
@@ -23,6 +20,8 @@ import {
   type VirtualFileEntry,
 } from "./packs.js"
 import { detectFrontmatterVersion } from "./v2Compat.js"
+
+export { initPackManifest, type InitPackOptions, type InitPackResult }
 
 export const VIRTUAL_PACK_VERSION = "0.0.0-virtual"
 
@@ -52,7 +51,6 @@ const VIRTUAL_IGNORED_DIRS = new Set([
   ".git",
   "node_modules",
   ".manage-agents",
-  ".opencode",
   "bridges",
   "contract",
   "dist",
@@ -62,6 +60,7 @@ const VIRTUAL_IGNORED_DIRS = new Set([
   "resources",
   "runtime",
   "skills",
+  "skill",
   "test",
   "tests",
   "themes",
@@ -104,7 +103,7 @@ export function hasAgentFrontmatter(content: string): boolean {
 }
 
 export interface DiscoveredVirtualAgent {
-  /** Source-relative path on disk (POSIX slashes), e.g. "architect.md" or "agents/architect.md". */
+  /** Source-relative path on disk (POSIX slashes), e.g. "architect.md", "agents/architect.md", or ".opencode/agents/architect.md". */
   sourceRel: string
   /** Canonical agent ID without ".md", e.g. "architect" or "team/architect". */
   id: string
@@ -112,7 +111,33 @@ export interface DiscoveredVirtualAgent {
   containerKind: "agents" | "agent" | "mode" | "modes" | "loose"
 }
 
-function hasAnyManifestWithinDepth(root: string): boolean {
+export interface DiscoveredVirtualCommand {
+  sourceRel: string
+  id: string
+  canonicalRel: string
+}
+
+export interface DiscoveredVirtualSkillFile {
+  sourceRel: string
+  canonicalRel: string
+  isScript: boolean
+}
+
+export interface DiscoveredVirtualSkill {
+  id: string
+  sourceSkillRoot: string
+  files: DiscoveredVirtualSkillFile[]
+}
+
+export interface DiscoveredVirtualExtras {
+  commands: DiscoveredVirtualCommand[]
+  skills: DiscoveredVirtualSkill[]
+  agentsMdSourceRel: string | null
+  configSourceRel: string | null
+  skippedLinks: string[]
+}
+
+export function hasAnyManifestWithinDepth(root: string): boolean {
   const check = (dir: string, depth: number): boolean => {
     if (fs.existsSync(path.join(dir, MANIFEST_FILE))) return true
     if (depth >= DISCOVERY_DEPTH) return false
@@ -133,8 +158,8 @@ function hasAnyManifestWithinDepth(root: string): boolean {
 
 /**
  * Scans a manifest-free directory for Markdown agent files without following symlinks.
- * Inside `agents/`, `agent/`, `mode/` or `modes/`, any `.md` file is an agent; elsewhere, `.md` files must carry
- * recognized agent YAML frontmatter (skipping README, AGENTS.md, SKILL.md, tests, etc.).
+ * Inside `agents/`, `agent/`, `mode/`, `modes/` (including under `.opencode/`), any `.md` file is an agent;
+ * elsewhere, `.md` files must carry recognized agent YAML frontmatter (skipping README, AGENTS.md, SKILL.md, tests, etc.).
  */
 export function scanLooseAgentFiles(root: string): { agents: DiscoveredVirtualAgent[]; skippedLinks: string[] } {
   const resolvedRoot = path.resolve(root)
@@ -163,12 +188,32 @@ export function scanLooseAgentFiles(root: string): { agents: DiscoveredVirtualAg
         continue
       }
       if (entry.isDirectory()) {
+        if (!container && entry.name === ".opencode" && depth === 0) {
+          // Inspect only explicit agent containers inside `.opencode/` (never `.opencode/plans/` or unrelated markdown).
+          let dotEntries: fs.Dirent[] = []
+          try {
+            dotEntries = fs.readdirSync(full, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))
+          } catch {
+            dotEntries = []
+          }
+          for (const sub of dotEntries) {
+            const subFull = path.join(full, sub.name)
+            const subRel = path.relative(resolvedRoot, subFull).split(path.sep).join("/")
+            if (sub.isSymbolicLink()) {
+              skippedLinks.push(subRel)
+              continue
+            }
+            if (sub.isDirectory() && AGENT_CONTAINER_DIRS.has(sub.name)) {
+              walk(subFull, depth + 2, { kind: sub.name as "agents" | "agent" | "mode" | "modes", root: subFull })
+            }
+          }
+          continue
+        }
         if (!container && AGENT_CONTAINER_DIRS.has(entry.name)) {
           walk(full, depth + 1, { kind: entry.name as "agents" | "agent" | "mode" | "modes", root: full })
         } else if (container) {
           walk(full, depth + 1, container)
-        } else if (!VIRTUAL_IGNORED_DIRS.has(entry.name) && depth < DISCOVERY_DEPTH) {
-          // Skip subdirectories that hold their own opencode-pack.json.
+        } else if (!VIRTUAL_IGNORED_DIRS.has(entry.name) && entry.name !== ".opencode" && depth < DISCOVERY_DEPTH) {
           if (fs.existsSync(path.join(full, MANIFEST_FILE))) continue
           walk(full, depth + 1, null)
         }
@@ -200,6 +245,128 @@ export function scanLooseAgentFiles(root: string): { agents: DiscoveredVirtualAg
   return { agents, skippedLinks }
 }
 
+/** Scans optional commands, skills, AGENTS.md and opencode.json(c) (at root or inside `.opencode/`) without following symlinks. */
+export function scanVirtualExtras(
+  root: string,
+  options: { preferDotOpencode?: boolean } = {},
+): DiscoveredVirtualExtras {
+  const resolvedRoot = path.resolve(root)
+  const commands: DiscoveredVirtualCommand[] = []
+  const skills: DiscoveredVirtualSkill[] = []
+  const skippedLinks: string[] = []
+
+  const isRealDir = (candidate: string): boolean => {
+    const st = fs.lstatSync(candidate, { throwIfNoEntry: false })
+    if (st?.isSymbolicLink()) {
+      skippedLinks.push(path.relative(resolvedRoot, candidate).split(path.sep).join("/"))
+      return false
+    }
+    return Boolean(st?.isDirectory())
+  }
+
+  const dotOpencode = path.join(resolvedRoot, ".opencode")
+  const hasDotOpencode = isRealDir(dotOpencode)
+
+  let agentsMdSourceRel: string | null = null
+  const agentsMdCandidates =
+    options.preferDotOpencode && hasDotOpencode
+      ? [".opencode/AGENTS.md", "AGENTS.md"]
+      : ["AGENTS.md", ...(hasDotOpencode ? [".opencode/AGENTS.md"] : [])]
+  for (const rel of agentsMdCandidates) {
+    const full = path.join(resolvedRoot, ...rel.split("/"))
+    const st = fs.lstatSync(full, { throwIfNoEntry: false })
+    if (st?.isSymbolicLink()) skippedLinks.push(rel)
+    else if (st?.isFile()) {
+      agentsMdSourceRel = rel
+      break
+    }
+  }
+
+  let configSourceRel: string | null = null
+  const configCandidates =
+    options.preferDotOpencode && hasDotOpencode
+      ? [".opencode/opencode.json", ".opencode/opencode.jsonc", "opencode.json", "opencode.jsonc"]
+      : ["opencode.json", "opencode.jsonc", ...(hasDotOpencode ? [".opencode/opencode.json", ".opencode/opencode.jsonc"] : [])]
+  for (const rel of configCandidates) {
+    const full = path.join(resolvedRoot, ...rel.split("/"))
+    const st = fs.lstatSync(full, { throwIfNoEntry: false })
+    if (st?.isSymbolicLink()) skippedLinks.push(rel)
+    else if (st?.isFile()) {
+      configSourceRel = rel
+      break
+    }
+  }
+
+  const commandContainers = ["commands", "command", ...(hasDotOpencode ? [".opencode/commands", ".opencode/command"] : [])]
+  for (const containerRel of commandContainers) {
+    const containerFull = path.join(resolvedRoot, ...containerRel.split("/"))
+    if (!isRealDir(containerFull)) continue
+    const walkCommands = (dir: string) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+        if (entry.name === ".DS_Store") continue
+        const full = path.join(dir, entry.name)
+        const rel = path.relative(resolvedRoot, full).split(path.sep).join("/")
+        if (entry.isSymbolicLink()) {
+          skippedLinks.push(rel)
+          continue
+        }
+        if (entry.isDirectory()) walkCommands(full)
+        else if (entry.isFile() && entry.name.endsWith(".md") && !/\.test\.[^/]+$/i.test(entry.name)) {
+          const id = path.relative(containerFull, full).split(path.sep).join("/").slice(0, -3)
+          commands.push({ sourceRel: rel, id, canonicalRel: `commands/${id}.md` })
+        }
+      }
+    }
+    walkCommands(containerFull)
+  }
+
+  const skillContainers = ["skills", "skill", ...(hasDotOpencode ? [".opencode/skills", ".opencode/skill"] : [])]
+  for (const containerRel of skillContainers) {
+    const containerFull = path.join(resolvedRoot, ...containerRel.split("/"))
+    if (!isRealDir(containerFull)) continue
+    const rawFiles: string[] = []
+    const walkSkills = (dir: string) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+        if (entry.name === ".DS_Store" || entry.name === "node_modules") continue
+        const full = path.join(dir, entry.name)
+        const rel = path.relative(resolvedRoot, full).split(path.sep).join("/")
+        if (entry.isSymbolicLink()) {
+          skippedLinks.push(rel)
+          continue
+        }
+        if (entry.isDirectory()) walkSkills(full)
+        else if (entry.isFile() && !/\.test\.[^/]+$/i.test(entry.name)) rawFiles.push(rel)
+      }
+    }
+    walkSkills(containerFull)
+    const skillRoots = rawFiles
+      .filter(f => f.endsWith("/SKILL.md"))
+      .map(f => f.slice(0, -"/SKILL.md".length))
+      .sort((a, b) => b.length - a.length)
+    const filesBySkillRoot = new Map<string, string[]>()
+    for (const sr of skillRoots) filesBySkillRoot.set(sr, [])
+    for (const rel of rawFiles) {
+      const nearest = skillRoots.find(candidate => rel.startsWith(`${candidate}/`))
+      if (nearest) filesBySkillRoot.get(nearest)!.push(rel)
+    }
+    for (const sr of [...skillRoots].reverse()) {
+      const id = sr.slice(containerRel.length + 1)
+      if (!id) continue
+      const memberRels = filesBySkillRoot.get(sr) ?? []
+      const skillFiles: DiscoveredVirtualSkillFile[] = memberRels.map(sourceRel => {
+        const subRel = sourceRel.slice(sr.length + 1)
+        const canonicalRel = `skills/${id}/${subRel}`
+        const full = path.join(resolvedRoot, ...sourceRel.split("/"))
+        const isScript = SCRIPT_RE.test(sourceRel) || (fs.statSync(full).mode & 0o111) !== 0
+        return { sourceRel, canonicalRel, isScript }
+      })
+      skills.push({ id, sourceSkillRoot: sr, files: skillFiles })
+    }
+  }
+
+  return { commands, skills, agentsMdSourceRel, configSourceRel, skippedLinks }
+}
+
 export function isVirtualPackRoot(root: string): boolean {
   return scanLooseAgentFiles(root).agents.length > 0
 }
@@ -223,7 +390,8 @@ export function validateVirtualPack(
 
   const name = options.name && PACK_NAME_RE.test(options.name) ? options.name : derivePackSlug(path.basename(root))
   const { agents: discovered, skippedLinks } = scanLooseAgentFiles(root)
-  for (const link of skippedLinks) {
+  const extras = discovered.length > 0 ? scanVirtualExtras(root) : { commands: [], skills: [], agentsMdSourceRel: null, configSourceRel: null, skippedLinks: [] }
+  for (const link of new Set([...skippedLinks, ...extras.skippedLinks])) {
     issues.push({ level: "warning", code: "symlink-skipped", path: link, message: "symlink skipped in virtual pack" })
   }
   if (!discovered.length) {
@@ -293,191 +461,25 @@ export function validateVirtualPack(
     })
   }
 
-  // Include optional commands/*.md, skills/<id>/** and AGENTS.md if present in the folder without symlinks.
-  const agentsMd = path.join(root, "AGENTS.md")
-  if (fs.lstatSync(agentsMd, { throwIfNoEntry: false })?.isFile()) {
-    registerVirtual("AGENTS.md", { sourceRel: "AGENTS.md" })
+  if (extras.agentsMdSourceRel) {
+    registerVirtual("AGENTS.md", { sourceRel: extras.agentsMdSourceRel })
   }
-  const commandsDir = path.join(root, "commands")
-  if (fs.lstatSync(commandsDir, { throwIfNoEntry: false })?.isDirectory()) {
-    const walkCommands = (dir: string) => {
-      for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
-        if (entry.isSymbolicLink() || entry.name === ".DS_Store") continue
-        const full = path.join(dir, entry.name)
-        if (entry.isDirectory()) walkCommands(full)
-        else if (entry.isFile() && entry.name.endsWith(".md") && !/\.test\.[^/]+$/i.test(entry.name)) {
-          const rel = path.relative(root, full).split(path.sep).join("/")
-          if (registerVirtual(rel, { sourceRel: rel })) ids.commands.push(rel.slice("commands/".length, -3))
-        }
-      }
+  for (const cmd of extras.commands) {
+    if (registerVirtual(cmd.canonicalRel, { sourceRel: cmd.sourceRel })) {
+      ids.commands.push(cmd.id)
     }
-    walkCommands(commandsDir)
   }
-  const skillsDir = path.join(root, "skills")
-  if (fs.lstatSync(skillsDir, { throwIfNoEntry: false })?.isDirectory()) {
-    const skillFiles: string[] = []
-    const walkSkills = (dir: string) => {
-      for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
-        if (entry.isSymbolicLink() || entry.name === ".DS_Store" || entry.name === "node_modules") continue
-        const full = path.join(dir, entry.name)
-        if (entry.isDirectory()) walkSkills(full)
-        else if (entry.isFile() && !/\.test\.[^/]+$/i.test(entry.name)) skillFiles.push(path.relative(root, full).split(path.sep).join("/"))
-      }
+  for (const skill of extras.skills) {
+    let registeredAny = false
+    for (const sf of skill.files) {
+      if (!registerVirtual(sf.canonicalRel, { sourceRel: sf.sourceRel })) continue
+      registeredAny = true
+      if (sf.isScript) executable.skillScripts.push(sf.canonicalRel)
     }
-    walkSkills(skillsDir)
-    const skillRoots = skillFiles.filter(f => f.endsWith("/SKILL.md")).map(f => f.slice(0, -"/SKILL.md".length)).sort((a, b) => b.length - a.length)
-    for (const sr of skillRoots) ids.skills.push(sr.slice("skills/".length))
-    for (const rel of skillFiles) {
-      if (!skillRoots.some(sr => rel.startsWith(`${sr}/`))) continue
-      if (!registerVirtual(rel, { sourceRel: rel })) continue
-      const full = path.join(root, ...rel.split("/"))
-      if (SCRIPT_RE.test(rel) || (fs.statSync(full).mode & 0o111) !== 0) executable.skillScripts.push(rel)
-    }
+    if (registeredAny) ids.skills.push(skill.id)
   }
 
   for (const list of Object.values(ids)) list.sort()
   files.sort()
   return { root, manifest, files, agents: packAgents, ids, executable, unresolved: [], issues, virtualFiles }
-}
-
-export interface InitPackOptions {
-  name?: string
-  version?: string
-  description?: string
-  /** Moves loose/legacy .md agents into `agents/<id>.md` and normalizes V1 frontmatter to V2 (default: true). */
-  organize?: boolean
-}
-
-export interface InitPackResult {
-  manifestPath: string
-  manifest: PackManifest
-  movedAgents: Array<{ from: string; to: string }>
-  warnings: string[]
-}
-
-/** Scaffolds `opencode-pack.json` in a local folder of Markdown agents, optionally organizing `.md` files into `agents/`. */
-export function initPackManifest(packRoot: string, options: InitPackOptions = {}): InitPackResult {
-  const root = path.resolve(packRoot)
-  const stat = fs.lstatSync(root, { throwIfNoEntry: false })
-  if (!stat || !stat.isDirectory() || stat.isSymbolicLink()) {
-    throw new Error(`${root} is not a regular directory`)
-  }
-  const manifestPath = path.join(root, MANIFEST_FILE)
-  if (fs.existsSync(manifestPath)) {
-    throw new Error(`${MANIFEST_FILE} already exists in ${root}`)
-  }
-
-  const name = (options.name?.trim() || derivePackSlug(path.basename(root))).toLowerCase()
-  if (!PACK_NAME_RE.test(name)) {
-    throw new Error(`Invalid pack name "${name}": use lowercase letters, digits and hyphens (max 64)`)
-  }
-  const version = options.version?.trim() || "0.1.0"
-  if (semver.valid(version) !== version) {
-    throw new Error(`Invalid version "${version}": use full semver, e.g. "0.1.0"`)
-  }
-  const description = options.description?.trim() || `Agent pack ${name}`
-  const organize = options.organize !== false
-
-  const { agents: discovered } = scanLooseAgentFiles(root)
-  if (!discovered.length) {
-    throw new Error(`No Markdown agent files found in ${root}`)
-  }
-  if (!organize) {
-    const outsideAgentsDir = discovered.filter(item => item.containerKind !== "agents").map(item => item.sourceRel)
-    if (outsideAgentsDir.length > 0) {
-      throw new Error(
-        `Cannot initialize ${MANIFEST_FILE} with --no-organize while agents sit outside agents/ (${outsideAgentsDir.join(", ")}); omit --no-organize to move them into agents/.`,
-      )
-    }
-  }
-
-  const ensureRealSubdir = (relFile: string) => {
-    const parts = relFile.split("/").slice(0, -1)
-    let cur = root
-    for (const part of parts) {
-      cur = path.join(cur, part)
-      const st = fs.lstatSync(cur, { throwIfNoEntry: false })
-      if (st?.isSymbolicLink()) throw new Error(`Refusing to write through symlinked directory: ${cur}`)
-      if (st && !st.isDirectory()) throw new Error(`Cannot create directory "${cur}": a file is in the way`)
-      if (!st) fs.mkdirSync(cur)
-    }
-    assertInsideRealWorkspace(root, realpathThroughExistingAncestor(path.join(root, ...relFile.split("/"))), relFile)
-  }
-
-  const foldedTargets = new Map<string, string>()
-  for (const item of discovered) {
-    const destRel = `agents/${item.id}.md`
-    const key = foldKey(destRel)
-    const prev = foldedTargets.get(key)
-    if (prev && prev !== item.sourceRel) {
-      throw new Error(`Cannot organize agents: "${prev}" and "${item.sourceRel}" both map to "${destRel}"`)
-    }
-    foldedTargets.set(key, item.sourceRel)
-  }
-
-  const movedAgents: Array<{ from: string; to: string }> = []
-  if (organize) {
-    for (const item of discovered) {
-      const destRel = `agents/${item.id}.md`
-      const srcFull = path.join(root, ...item.sourceRel.split("/"))
-      const destFull = path.join(root, ...destRel.split("/"))
-      const raw = fs.readFileSync(srcFull, "utf8")
-      const { yamlText, body } = extractFrontmatter(raw)
-      let fm: Record<string, any> = {}
-      if (yamlText !== null) {
-        const parsed = YAML.parse(yamlText)
-        if (isPlain(parsed)) fm = parsed
-      }
-      const isMode = item.containerKind === "mode" || item.containerKind === "modes"
-      if (isMode && !fm.mode) fm = { ...fm, mode: "primary" }
-      const needsV2 = detectFrontmatterVersion(fm) === "v1" || isMode
-      const nextBytes = Buffer.from(needsV2 ? renderAgentFile(fm, body, "v2") : raw, "utf8")
-
-      if (item.sourceRel !== destRel) {
-        ensureRealSubdir(destRel)
-        if (fs.lstatSync(destFull, { throwIfNoEntry: false }) && foldKey(item.sourceRel) !== foldKey(destRel)) {
-          throw new Error(`Refusing to overwrite existing file "${destRel}"`)
-        }
-        atomicWriteRestrictedFile(destFull, nextBytes, 0o644)
-        if (path.resolve(srcFull) !== path.resolve(destFull)) fs.unlinkSync(srcFull)
-        movedAgents.push({ from: item.sourceRel, to: destRel })
-      } else if (needsV2) {
-        ensureRealSubdir(destRel)
-        atomicWriteRestrictedFile(destFull, nextBytes, 0o644)
-      }
-    }
-    for (const legacyDir of ["agent", "mode", "modes"]) {
-      const fullDir = path.join(root, legacyDir)
-      if (fs.lstatSync(fullDir, { throwIfNoEntry: false })?.isDirectory()) {
-        try {
-          if (fs.readdirSync(fullDir).length === 0) fs.rmdirSync(fullDir)
-        } catch {
-          /* non-empty directory stays */
-        }
-      }
-    }
-  }
-
-  const manifest: PackManifest = {
-    contract: "1.0",
-    name,
-    version,
-    description,
-    requires: {},
-  }
-  const manifestJson = {
-    $schema: "https://github.com/lorecanc/manage-agents/contract/opencode-pack.schema.json",
-    contract: manifest.contract,
-    name: manifest.name,
-    version: manifest.version,
-    description: manifest.description,
-  }
-  atomicWriteRestrictedFile(manifestPath, Buffer.from(`${JSON.stringify(manifestJson, null, 2)}\n`, "utf8"), 0o644)
-
-  const validation = validatePack(root)
-  const warnings = validation.issues.map(issue => `[${issue.level}]${issue.path ? ` ${issue.path}:` : ""} ${issue.message}`)
-  if (hasErrors(validation) && !organize) {
-    warnings.unshift("Note: run with --organize (or move files under agents/) so the pack passes strict contract validation.")
-  }
-  return { manifestPath, manifest, movedAgents, warnings }
 }

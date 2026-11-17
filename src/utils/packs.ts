@@ -83,16 +83,17 @@ export interface ValidatePackOptions {
 }
 
 export const PACK_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/
+export const CONTROL_CHAR_RE = /[\u0000-\u001f\u007f-\u009f]/
 export const DISCOVERY_DEPTH = 4
-export const SKIPPED_DIRS = new Set([".git", "node_modules"])
+export const SKIPPED_DIRS = new Set([".git", "node_modules", ".opencode"])
 const CONTRACT_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)$/
 const MANIFEST_KEYS = new Set(["$schema", "contract", "name", "version", "description", "requires", "archetype", "routingDefaults", "flowDefaults"])
-const ROOT_FILE_RE = /^(?:opencode-pack\.json|opencode\.jsonc?|AGENTS\.md|(?:README|LICENSE|LICENCE|CHANGELOG)(?:\.(?:md|txt|rst))?)$/i
-const NATIVE_DIRS = new Set(["agents", "commands", "skills", "plugins", "themes", "tools"])
-const LEGACY_DIRS = new Map([["agent", "agents"], ["mode", "agents"], ["modes", "agents"], ["command", "commands"], ["skill", "skills"], ["plugin", "plugins"], ["tool", "tools"]])
-const RESERVED_DIRS = new Set(["instructions", ".manage-agents"])
-const IGNORED_NAMES = new Set([".DS_Store", "node_modules"])
-const CONFIG_KEYS = new Set(["$schema", "plugins", "mcp", "skills", "instructions", "agents", "commands", "formatter", "lsp", "experimental"])
+export const ROOT_FILE_RE = /^(?:opencode-pack\.json|opencode\.jsonc?|AGENTS\.md|(?:README|LICENSE|LICENCE|CHANGELOG)(?:\.(?:md|txt|rst))?)$/i
+export const NATIVE_DIRS = new Set(["agents", "commands", "skills", "plugins", "themes", "tools"])
+export const LEGACY_DIRS = new Map([["agent", "agents"], ["mode", "agents"], ["modes", "agents"], ["command", "commands"], ["skill", "skills"], ["plugin", "plugins"], ["tool", "tools"]])
+export const RESERVED_DIRS = new Set(["instructions", ".manage-agents"])
+const IGNORED_NAMES = new Set([".DS_Store", "node_modules", ".opencode"])
+export const CONFIG_KEYS = new Set(["$schema", "plugins", "mcp", "skills", "instructions", "agents", "commands", "formatter", "lsp", "experimental"])
 const PLUGIN_ENTRY_RE = /^(?:index|server)\.(?:ts|js|mjs)$/
 const CODE_RE = /\.(?:ts|mts|cts|js|mjs|cjs)$/
 const SCRIPT_RE = /\.(?:sh|bash|zsh|py|rb|pl|ts|mts|js|mjs|cjs)$/
@@ -186,10 +187,13 @@ function walk(root: string, issues: PackIssue[]): string[] {
 }
 
 /** Reads a pack file for scanning, or reports it and returns null when it is too large. */
-function readText(root: string, rel: string, issues: PackIssue[]): string | null {
+function readText(root: string, rel: string, issues: PackIssue[], levelOnOversize: "warning" | "error" = "warning"): string | null {
   const full = path.join(root, rel)
   if (fs.statSync(full).size > MAX_SCANNED_BYTES) {
-    if (!issues.some(issue => issue.code === "file-too-large" && issue.path === rel)) issues.push({ level: "warning", code: "file-too-large", path: rel, message: `larger than ${MAX_SCANNED_BYTES} bytes; its content was not checked` })
+    const existing = issues.find(issue => issue.code === "file-too-large" && issue.path === rel)
+    if (existing) {
+      if (levelOnOversize === "error") existing.level = "error"
+    } else issues.push({ level: levelOnOversize, code: "file-too-large", path: rel, message: `larger than ${MAX_SCANNED_BYTES} bytes; its content was not checked` })
     return null
   }
   return fs.readFileSync(full, "utf8")
@@ -207,7 +211,7 @@ function readManifest(root: string, issues: PackIssue[], options: ValidatePackOp
   }
   let raw: unknown
   try {
-    const text = readText(root, MANIFEST_FILE, issues)
+    const text = readText(root, MANIFEST_FILE, issues, "error")
     if (text === null) return null
     raw = JSON.parse(text)
   } catch (error) {
@@ -321,12 +325,16 @@ export function validatePack(packRoot: string, options: ValidatePackOptions = {}
   result.manifest = manifest
   if (issues.some(issue => issue.code === "contract-unsupported")) return result
 
-  const files = walk(root, issues)
+  const error = (code: string, rel: string, message: string) => issues.push({ level: "error", code, path: rel, message })
+  const warning = (code: string, rel: string, message: string) => issues.push({ level: "warning", code, path: rel, message })
+  const files = walk(root, issues).filter(file => {
+    if (!CONTROL_CHAR_RE.test(file)) return true
+    error("invalid-path", file, "file paths must not contain control characters")
+    return false
+  })
   result.files = files
   const fileSet = new Set(files)
   const dirSet = new Set(files.flatMap(file => file.split("/").slice(0, -1).map((_, index, parts) => parts.slice(0, index + 1).join("/"))))
-  const error = (code: string, rel: string, message: string) => issues.push({ level: "error", code, path: rel, message })
-  const warning = (code: string, rel: string, message: string) => issues.push({ level: "warning", code, path: rel, message })
   const packName = manifest?.name
   const hasRequires = Object.keys(manifest?.requires ?? {}).length > 0
   const reference = (from: string, kind: UnresolvedReference["kind"], target: string | null, raw: string, exists: (target: string) => boolean) => {
@@ -424,7 +432,7 @@ export function validatePack(packRoot: string, options: ValidatePackOptions = {}
   if (configFile) {
     let config: unknown
     try {
-      const text = readText(root, configFile, issues)
+      const text = readText(root, configFile, issues, "error")
       if (text !== null) config = parseJsonc(text)
     } catch (parseError) {
       error("config-invalid", configFile, `invalid JSON: ${(parseError as Error).message}`)
@@ -440,6 +448,7 @@ export function validatePack(packRoot: string, options: ValidatePackOptions = {}
       if (value === undefined) return
       if (!Array.isArray(value) || !value.every(item => typeof item === "string")) return error("config-invalid", file, `"${key}" must be a list of paths or URLs`)
       for (const item of value) {
+        if (CONTROL_CHAR_RE.test(item)) { error("config-invalid", file, `"${key}" entries must not contain control characters`); continue }
         if (/^https?:\/\//.test(item)) continue
         if (isAbsoluteRef(item)) { error("absolute-path", file, `"${key}" entry "${item}" must be relative to the pack root`); continue }
         if (/[*?[]/.test(item)) continue
@@ -454,6 +463,7 @@ export function validatePack(packRoot: string, options: ValidatePackOptions = {}
       else for (const entry of config.plugins) {
         const spec = typeof entry === "string" ? entry : isObject(entry) && typeof entry.package === "string" ? entry.package : null
         if (spec === null || (isObject(entry) && entry.options !== undefined && !isObject(entry.options))) { error("config-invalid", file, '"plugins" entries are "<spec>" or {"package": "<spec>", "options": {...}}'); continue }
+        if (CONTROL_CHAR_RE.test(spec)) { error("config-invalid", file, '"plugins" entries must not contain control characters'); continue }
         const local = spec.startsWith("./") || spec.startsWith("../") || spec.startsWith("file:")
         if (!local) { if (isAbsoluteRef(spec)) error("absolute-path", file, `plugin "${spec}" must be relative to the pack root`); else executable.pluginPackages.push(spec); continue }
         const rel = spec.startsWith("file:") ? spec.replace(/^file:(?:\/\/)?/, "") : spec
@@ -468,9 +478,12 @@ export function validatePack(packRoot: string, options: ValidatePackOptions = {}
       const servers = isObject(config.mcp) ? config.mcp.servers : undefined
       if (!isObject(config.mcp) || Object.keys(config.mcp).some(key => key !== "servers") || (servers !== undefined && !isObject(servers))) error("config-invalid", file, 'MCP servers go under "mcp.servers.<name>"')
       else for (const [name, server] of Object.entries((servers ?? {}) as Record<string, unknown>)) {
+        if (CONTROL_CHAR_RE.test(name)) { error("config-invalid", file, "mcp.servers keys must not contain control characters"); continue }
         if (!isObject(server) || (server.type !== "local" && server.type !== "remote")) { error("config-invalid", file, `mcp.servers.${name} needs "type": "local" or "remote"`); continue }
         ids.mcpServers.push(name)
         if (server.type === "local") {
+          if (typeof server.command === "string" && CONTROL_CHAR_RE.test(server.command)) { error("config-invalid", file, `mcp.servers.${name}.command must not contain control characters`); continue }
+          if (Array.isArray(server.command) && server.command.some(part => typeof part === "string" && CONTROL_CHAR_RE.test(part))) { error("config-invalid", file, `mcp.servers.${name}.command entries must not contain control characters`); continue }
           const command = Array.isArray(server.command) && server.command.every(part => typeof part === "string") ? server.command as string[] : null
           if (!command?.length) { error("config-invalid", file, `mcp.servers.${name}.command must be a non-empty list of strings`); continue }
           executable.mcpServers.push({ name, type: "local", command })
@@ -493,6 +506,7 @@ export function validatePack(packRoot: string, options: ValidatePackOptions = {}
       if (section === undefined) continue
       if (!isObject(section)) { error("config-invalid", file, `"${key}" must be an object keyed by ID`); continue }
       for (const id of Object.keys(section)) {
+        if (CONTROL_CHAR_RE.test(id)) { error("config-invalid", file, `"${key}" keys must not contain control characters`); continue }
         const list = key === "agents" ? ids.agents : ids.commands
         if (list.includes(id)) warning("config-duplicate-id", file, `${key.slice(0, -1)} "${id}" is defined both as a file and in ${file}`)
         else {

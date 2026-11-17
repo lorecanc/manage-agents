@@ -10,6 +10,8 @@ dist/
 .opencode/
 .opencode-scratch/
 .agent-manager/
+.manage-agents/
+.release-key.pem
 .tmp/
 backups/
 artifacts/

@@ -3,14 +3,14 @@ import path from "node:path"
 import crypto from "node:crypto"
 import { engineConfigDir } from "./sources.js"
 
-export interface UiConfig { listShare: number }
+export interface UiConfig { listShare: number; reducedMotion?: boolean }
 export const DEFAULT_UI_CONFIG: UiConfig = { listShare: 2 / 3 }
 const MIN_LIST_SHARE = 0.60
 const MAX_LIST_SHARE = 0.75
 const MAX_CONFIG_BYTES = 64 * 1024
 export const MISSING_UI_CONFIG_REVISION = "missing"
 
-export interface UiConfigWriterDeps { renameSync?: typeof fs.renameSync; fstatSync?: typeof fs.fstatSync; beforeRename?: () => void }
+export interface UiConfigWriterDeps { renameSync?: typeof fs.renameSync; fstatSync?: typeof fs.fstatSync; beforeRename?: () => void; reducedMotion?: boolean }
 export interface UiConfigLoadResult {
   config: UiConfig
   warning?: string
@@ -65,7 +65,11 @@ export function loadUiConfig(configDir: string = engineConfigDir()): UiConfigLoa
   try {
     const parsed: any = JSON.parse(current.bytes.toString("utf8"))
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || parsed.version !== 1 || !validListShare(parsed.listShare)) throw new Error("invalid")
-    return { config: { listShare: parsed.listShare }, configPath, source, readOnly: !!configuredPath, revision: current.revision }
+    if (parsed.reducedMotion !== undefined && typeof parsed.reducedMotion !== "boolean") throw new Error("invalid")
+    const config: UiConfig = parsed.reducedMotion === true
+      ? { listShare: parsed.listShare, reducedMotion: true }
+      : { listShare: parsed.listShare }
+    return { config, configPath, source, readOnly: !!configuredPath, revision: current.revision }
   } catch {
     return { config: DEFAULT_UI_CONFIG, warning: "UI config is invalid; using defaults.", configPath, source: configuredPath ? source : "default", readOnly: !!configuredPath, revision: current.revision }
   }
@@ -111,7 +115,10 @@ export function saveUiConfig(configDir: string, listShare: number, expectedRevis
     let fd: number | undefined
     try {
       fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600); ownsTemporary = true
-      const bytes = Buffer.from(JSON.stringify({ version: 1, listShare }) + "\n")
+      const payload = deps.reducedMotion === true
+        ? { version: 1, listShare, reducedMotion: true }
+        : { version: 1, listShare }
+      const bytes = Buffer.from(JSON.stringify(payload) + "\n")
       writeAll(fd, bytes); fs.fchmodSync(fd, targetMode); fs.fsyncSync(fd); fs.closeSync(fd); fd = undefined
       const parentAfter = fs.statSync(managerDir)
       if (parentBefore.dev !== parentAfter.dev || parentBefore.ino !== parentAfter.ino) throw new Error("configuration directory changed")

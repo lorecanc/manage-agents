@@ -41,36 +41,49 @@ export interface AgentInfo {
   frontmatterVersion?: "v1" | "v2" | "unknown"
 }
 
-export type TuningField = "steps" | "temp" | "variant" | "mode" | "hidden"
+export const AGENT_TUNING_MODES = ["subagent", "primary", "all"] as const
+export type AgentTuningMode = (typeof AGENT_TUNING_MODES)[number]
+
+export type TuningField = "steps" | "variant" | "mode" | "hidden"
 
 export interface TuningInitialState {
   steps: { value: string; mixed: boolean; distinctValues: number[]; displayMixed: string }
-  temp: { value: string; mixed: boolean; distinctValues: number[]; displayMixed: string }
   variant: { value: string; mixed: boolean; distinctValues: string[]; displayMixed: string }
-  mode: { value: "subagent" | "primary"; mixed: boolean; distinctValues: string[]; displayMixed: string }
+  mode: { value: AgentTuningMode; mixed: boolean; distinctValues: AgentTuningMode[]; displayMixed: string }
   hidden: { value: boolean; mixed: boolean; distinctValues: boolean[]; displayMixed: string }
 }
 
+export function resolveAgentSteps(frontmatter: Record<string, any>): number {
+  const raw = frontmatter.steps ?? frontmatter.max_steps
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw
+  if (typeof raw === "string" && raw.trim() !== "") {
+    const parsed = Number(raw)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return 50
+}
+
+export function resolveAgentTuningMode(mode: unknown): AgentTuningMode {
+  if (mode === "primary" || mode === "all") return mode
+  return "subagent"
+}
+
 export function inspectTuningTargets(agents: AgentInfo[]): TuningInitialState {
-  const stepsDistinct = [...new Set(agents.map(agent => agent.frontmatter.steps ?? agent.frontmatter.max_steps ?? 50))].sort((a, b) => a - b)
+  const stepsDistinct = [...new Set(agents.map(agent => resolveAgentSteps(agent.frontmatter)))].sort((a, b) => a - b)
   const stepsMixed = stepsDistinct.length > 1
-  const stepsValue = stepsDistinct.length === 1 ? String(stepsDistinct[0]) : String(agents[0]?.frontmatter.steps ?? agents[0]?.frontmatter.max_steps ?? 50)
-  const tempDistinct = [...new Set(agents.map(agent => agent.frontmatter.temperature ?? 0.2))].sort((a, b) => a - b)
-  const tempMixed = tempDistinct.length > 1
-  const tempValue = tempDistinct.length === 1 ? String(tempDistinct[0]) : String(agents[0]?.frontmatter.temperature ?? 0.2)
+  const stepsValue = stepsDistinct.length === 1 ? String(stepsDistinct[0]) : String(agents[0] ? resolveAgentSteps(agents[0].frontmatter) : 50)
   const variantDistinct = [...new Set(agents.map(agent => typeof agent.frontmatter.variant === "string" ? agent.frontmatter.variant.trim() : ""))].sort()
   const variantMixed = variantDistinct.length > 1
   const variantValue = variantDistinct.length === 1 ? variantDistinct[0] : ""
-  const modeDistinct = [...new Set(agents.map(agent => agent.frontmatter.mode === "primary" ? "primary" : "subagent"))].sort()
+  const modeDistinct = [...new Set(agents.map(agent => resolveAgentTuningMode(agent.frontmatter.mode)))].sort() as AgentTuningMode[]
   const modeMixed = modeDistinct.length > 1
-  const modeValue = modeDistinct.length === 1 ? modeDistinct[0] as "primary" | "subagent" : agents[0]?.frontmatter.mode === "primary" ? "primary" : "subagent"
+  const modeValue = modeDistinct.length === 1 ? modeDistinct[0] : resolveAgentTuningMode(agents[0]?.frontmatter.mode)
   const hiddenDistinct = [...new Set(agents.map(agent => Boolean(agent.frontmatter.hidden)))].sort((a, b) => Number(a) - Number(b))
   const hiddenMixed = hiddenDistinct.length > 1
   const hiddenValue = hiddenDistinct.length === 1 ? hiddenDistinct[0] : Boolean(agents[0]?.frontmatter.hidden)
 
   return {
     steps: { value: stepsValue, mixed: stepsMixed, distinctValues: stepsDistinct, displayMixed: stepsMixed ? `(mixed: ${stepsDistinct.join(", ")} — unchanged)` : stepsValue },
-    temp: { value: tempValue, mixed: tempMixed, distinctValues: tempDistinct, displayMixed: tempMixed ? `(mixed: ${tempDistinct.join(", ")} — unchanged)` : tempValue },
     variant: { value: variantValue, mixed: variantMixed, distinctValues: variantDistinct, displayMixed: variantMixed ? `(mixed: ${variantDistinct.map(value => value || "default").join(", ")} — unchanged)` : variantValue },
     mode: { value: modeValue, mixed: modeMixed, distinctValues: modeDistinct, displayMixed: modeMixed ? `(mixed: ${modeDistinct.map(mode => mode.toUpperCase()).join(", ")} — unchanged)` : modeValue.toUpperCase() },
     hidden: { value: hiddenValue, mixed: hiddenMixed, distinctValues: hiddenDistinct, displayMixed: hiddenMixed ? `(mixed: ${hiddenDistinct.map(value => value ? "TRUE" : "FALSE").join(", ")} — unchanged)` : hiddenValue ? "TRUE" : "FALSE" }
@@ -78,28 +91,145 @@ export function inspectTuningTargets(agents: AgentInfo[]): TuningInitialState {
 }
 
 export function buildTuningUpdateParams(
-  draft: { steps: string; temp: string; variant: string; mode: "subagent" | "primary"; hidden: boolean },
+  draft: { steps: string; variant: string; mode: AgentTuningMode; hidden: boolean },
   dirtyFields: ReadonlySet<TuningField>,
   allowedVariants?: readonly string[]
-): { steps?: number; temperature?: number; mode?: "subagent" | "primary"; hidden?: boolean; variant?: string | null; allowedVariants?: readonly string[] } {
-  const params: { steps?: number; temperature?: number; mode?: "subagent" | "primary"; hidden?: boolean; variant?: string | null; allowedVariants?: readonly string[] } = {}
+): { steps?: number; mode?: AgentTuningMode; hidden?: boolean; variant?: string | null; allowedVariants?: readonly string[] } {
+  const params: { steps?: number; mode?: AgentTuningMode; hidden?: boolean; variant?: string | null; allowedVariants?: readonly string[] } = {}
   if (dirtyFields.has("steps")) {
-    const stepsNum = parseInt(draft.steps, 10)
-    if (isNaN(stepsNum) || stepsNum < 0) throw new Error("Steps must be a valid positive number.")
+    const trimmed = draft.steps.trim()
+    if (!/^[1-9]\d*$/.test(trimmed)) throw new Error("Steps must be a positive whole number (1 or greater).")
+    const stepsNum = Number(trimmed)
+    if (!Number.isSafeInteger(stepsNum) || stepsNum < 1) throw new Error("Steps must be a positive whole number (1 or greater).")
     params.steps = stepsNum
   }
-  if (dirtyFields.has("temp")) {
-    const tempNum = parseFloat(draft.temp)
-    if (isNaN(tempNum) || tempNum < 0 || tempNum > 1) throw new Error("Temperature must be a valid number between 0.0 and 1.0.")
-    params.temperature = tempNum
-  }
   if (dirtyFields.has("variant")) {
-    params.variant = draft.variant.trim() === "" ? null : draft.variant.trim()
+    params.variant = draft.variant.trim() === "" ? null : validateAgentVariantSyntax(draft.variant)
+    if (params.variant !== null && allowedVariants && allowedVariants.length > 0) {
+      params.variant = normalizeAgentVariant(params.variant, allowedVariants)
+    }
     if (allowedVariants && allowedVariants.length > 0) params.allowedVariants = allowedVariants
   }
-  if (dirtyFields.has("mode")) params.mode = draft.mode
+  if (dirtyFields.has("mode")) {
+    if (!AGENT_TUNING_MODES.includes(draft.mode)) throw new Error(`Mode must be one of: ${AGENT_TUNING_MODES.join(", ")}.`)
+    params.mode = draft.mode
+  }
   if (dirtyFields.has("hidden")) params.hidden = draft.hidden
   return params
+}
+
+export type ParsedTuneCliArgs =
+  | { kind: "help" }
+  | { kind: "error"; message: string }
+  | {
+      kind: "ok"
+      category: string
+      allCategories: boolean
+      params: { steps?: number; variant?: string | null; mode?: AgentTuningMode; hidden?: boolean }
+    }
+
+export function parseTuneCliArgs(args: readonly string[]): ParsedTuneCliArgs {
+  if (args.includes("--help") || args.includes("-h")) return { kind: "help" }
+
+  let stepsRaw: string | undefined
+  let variantRaw: string | undefined
+  let clearVariant = false
+  let modeRaw: string | undefined
+  let hidden: boolean | undefined
+  let category = ""
+  let allCategories = false
+  const dirty = new Set<TuningField>()
+
+  const takeValue = (flag: string, next: string | undefined): string | null => {
+    if (next === undefined || next.trim() === "" || next.startsWith("-")) return null
+    return next
+  }
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (arg === "--temp" || arg.startsWith("--temp=")) {
+      return {
+        kind: "error",
+        message: "--temp is no longer supported: OpenCode V2 ignores agent-level temperature. Configure sampling on a model variant and select it with --variant <name>.",
+      }
+    }
+    if (arg === "--steps") {
+      const val = takeValue(arg, args[i + 1])
+      if (val === null) return { kind: "error", message: "--steps requires a positive whole number." }
+      stepsRaw = val
+      dirty.add("steps")
+      i++
+    } else if (arg === "--pack" || arg === "--category" || arg === "-c") {
+      const val = takeValue(arg, args[i + 1])
+      if (val === null) return { kind: "error", message: `${arg} requires a pack name.` }
+      category = val.trim()
+      i++
+    } else if (arg === "--all") {
+      allCategories = true
+    } else if (arg === "--clear-variant" || arg === "--clear-effort") {
+      clearVariant = true
+    } else if (arg === "--variant" || arg === "--effort") {
+      const val = takeValue(arg, args[i + 1])
+      if (val === null) return { kind: "error", message: `${arg} requires a non-empty variant name.` }
+      variantRaw = val
+      i++
+    } else if (arg === "--mode") {
+      const val = takeValue(arg, args[i + 1])
+      if (val === null || !AGENT_TUNING_MODES.includes(val.trim() as AgentTuningMode)) {
+        return { kind: "error", message: `--mode must be one of: ${AGENT_TUNING_MODES.join(", ")}.` }
+      }
+      modeRaw = val.trim()
+      dirty.add("mode")
+      i++
+    } else if (arg === "--hidden") {
+      if (hidden === false) return { kind: "error", message: "--hidden cannot be combined with --no-hidden." }
+      hidden = true
+      dirty.add("hidden")
+    } else if (arg === "--no-hidden") {
+      if (hidden === true) return { kind: "error", message: "--hidden cannot be combined with --no-hidden." }
+      hidden = false
+      dirty.add("hidden")
+    } else {
+      return { kind: "error", message: `Unknown option: ${arg}` }
+    }
+  }
+
+  if (variantRaw !== undefined && clearVariant) {
+    return { kind: "error", message: "--variant/--effort cannot be used with --clear-variant/--clear-effort." }
+  }
+  if (allCategories && category) {
+    return { kind: "error", message: "--all cannot be combined with --pack/--category." }
+  }
+  if (variantRaw !== undefined || clearVariant) dirty.add("variant")
+
+  if (dirty.size === 0) {
+    return { kind: "error", message: "Specify at least one of --steps, --variant, --clear-variant, --mode, --hidden, or --no-hidden." }
+  }
+
+  try {
+    const built = buildTuningUpdateParams(
+      {
+        steps: stepsRaw ?? "50",
+        variant: clearVariant ? "" : (variantRaw ?? ""),
+        mode: (modeRaw as AgentTuningMode | undefined) ?? "subagent",
+        hidden: hidden ?? false,
+      },
+      dirty,
+    )
+    return {
+      kind: "ok",
+      category,
+      allCategories,
+      params: {
+        ...(built.steps !== undefined ? { steps: built.steps } : {}),
+        ...(built.variant !== undefined ? { variant: built.variant } : {}),
+        ...(built.mode !== undefined ? { mode: built.mode } : {}),
+        ...(built.hidden !== undefined ? { hidden: built.hidden } : {}),
+      },
+    }
+  } catch (error: any) {
+    return { kind: "error", message: error?.message || String(error) }
+  }
 }
 
 /** Where agents are discovered: the workspace itself when it is a single pack, else a catalog's packs/. */
@@ -583,9 +713,15 @@ export function applySafetyPreset(
 
 export function updateAgentParams(
   agents: AgentInfo[],
-  params: { steps?: number; temperature?: number; mode?: string; hidden?: boolean; variant?: string | null; allowedVariants?: readonly string[] },
+  params: { steps?: number; mode?: AgentTuningMode; hidden?: boolean; variant?: string | null; allowedVariants?: readonly string[] },
   writer = saveAgentFile,
 ) {
+  if (params.steps !== undefined && (!Number.isSafeInteger(params.steps) || params.steps < 1)) {
+    throw new Error("Steps must be a positive whole number (1 or greater).")
+  }
+  if (params.mode !== undefined && !AGENT_TUNING_MODES.includes(params.mode)) {
+    throw new Error(`Mode must be one of: ${AGENT_TUNING_MODES.join(", ")}.`)
+  }
   const variant = params.variant === undefined ? undefined : normalizeAgentVariant(params.variant, params.allowedVariants)
 
   for (const agent of agents) {
@@ -595,7 +731,6 @@ export function updateAgentParams(
       if (updatedFrontmatter.max_steps !== undefined) updatedFrontmatter.max_steps = params.steps
       if (updatedFrontmatter.steps === undefined && updatedFrontmatter.max_steps === undefined) updatedFrontmatter.steps = params.steps
     }
-    if (params.temperature !== undefined) updatedFrontmatter.temperature = params.temperature
     if (params.mode !== undefined) updatedFrontmatter.mode = params.mode
     if (params.hidden !== undefined) updatedFrontmatter.hidden = params.hidden
     if (variant === null) delete updatedFrontmatter.variant
@@ -607,17 +742,51 @@ export function updateAgentParams(
 }
 
 export const AGENT_EFFORT_VARIANTS = ["low", "medium", "high", "max"] as const
-export const KNOWN_MODEL_VARIANTS = ["minimal", "low", "medium", "high", "xhigh", "max", "none", "thinking"] as const
+export const KNOWN_MODEL_VARIANTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "thinking"] as const
+
+export function validateAgentVariantSyntax(value: unknown): string | null {
+  if (value === null) return null
+  if (typeof value !== "string") throw new Error(`Invalid agent variant "${value}".`)
+  const normalized = value.trim().toLocaleLowerCase("und")
+  if (!normalized || !/^[a-z0-9._-]+$/.test(normalized)) throw new Error(`Invalid agent variant "${value}".`)
+  return normalized
+}
 
 function normalizeAgentVariant(value: unknown, allowedVariants?: readonly string[]): string | null {
-  if (value === null) return null
-  if (typeof value !== "string") throw new Error("Invalid agent variant. Expected string or null.")
-  const normalized = value.trim().toLocaleLowerCase("und")
-  if (!normalized) throw new Error("Agent variant cannot be empty. Pass null to clear variant.")
-  if (!/^[a-z0-9._-]+$/.test(normalized)) throw new Error(`Invalid agent variant "${value}".`)
+  const normalized = validateAgentVariantSyntax(value)
+  if (normalized === null) return null
   const allowed = allowedVariants && allowedVariants.length > 0 ? allowedVariants : KNOWN_MODEL_VARIANTS
-  if (!allowed.includes(normalized)) throw new Error(`Invalid agent variant "${value}". Expected one of: ${allowed.join(", ")}.`)
+  const normalizedAllowed = allowed.map(item => item.trim().toLocaleLowerCase("und"))
+  if (!normalizedAllowed.includes(normalized)) throw new Error(`Invalid agent variant "${value}". Expected one of: ${allowed.join(", ")}.`)
   return normalized
+}
+
+export function resolveAllowedTuneVariants(
+  targetAgents: ReadonlyArray<Pick<AgentInfo, "model">>,
+  catalog?: { status: string; variants?: Record<string, string[]> },
+): string[] | undefined {
+  if (!catalog || catalog.status !== "verified" || !catalog.variants || targetAgents.length === 0) return undefined
+
+  const explicitModels = new Set<string>()
+  for (const agent of targetAgents) {
+    const model = agent.model?.trim()
+    if (model) explicitModels.add(model.split("#", 1)[0].trim())
+  }
+
+  const variants = new Set<string>(KNOWN_MODEL_VARIANTS)
+  if (explicitModels.size > 0) {
+    let sharedVariants: Set<string> | undefined
+    for (const baseModel of explicitModels) {
+      const modelVariants = new Set((catalog.variants[baseModel] ?? []).map(variant => variant.toLowerCase()))
+      sharedVariants = sharedVariants === undefined
+        ? modelVariants
+        : new Set([...sharedVariants].filter(variant => modelVariants.has(variant)))
+    }
+    for (const variant of sharedVariants ?? []) variants.add(variant)
+  } else {
+    for (const variant of Object.values(catalog.variants).flat()) variants.add(variant.toLowerCase())
+  }
+  return [...variants]
 }
 
 export interface PermissionOrderAnalysis {

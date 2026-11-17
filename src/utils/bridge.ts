@@ -245,6 +245,10 @@ function normalizedPermissions(frontmatter: Record<string, any>): Record<string,
   return perms
 }
 
+function isGlobalPermissionDeny(perms: Record<string, any>): boolean {
+  return Object.hasOwn(perms, "*") && (perms["*"] === "deny" || perms["*"] === false)
+}
+
 /** Servers carrying a whole-server (`${server}_*`) deny. */
 function serverScopedDeniedServers(frontmatters: Array<Record<string, any>>): Set<string> {
   const denied = new Set<string>()
@@ -299,13 +303,19 @@ function buildToolsString(
   }
 
   // Read tools
-  if (perms.read !== "deny" && perms.read !== false) {
+  const globalDeny = isGlobalPermissionDeny(perms)
+  const allowsReadTool = (value: unknown) => typeof value === "object" && value !== null
+    ? objectAllowsAny(value)
+    : globalDeny
+      ? value === "allow" || value === true || objectAllowsAny(value)
+      : value !== "deny" && value !== false
+  if (allowsReadTool(perms.read)) {
     tools.push("Read")
   }
-  if (perms.grep !== "deny" && perms.grep !== false) {
+  if (allowsReadTool(perms.grep)) {
     tools.push("Grep")
   }
-  if (perms.glob !== "deny" && perms.glob !== false) {
+  if (allowsReadTool(perms.glob)) {
     tools.push("Glob")
   }
 
@@ -432,6 +442,7 @@ function collectWarnings(frontmatter: Record<string, any>, enabledMcpServers?: S
 
   // Custom tools and built-in permissions have no plugin-agent equivalent.
   for (const key of Object.keys(perms)) {
+    if (key === "*") continue
     const value = perms[key]
     // A deny loses nothing, so only rules that grant something are reported.
     const grantsSomething = value === "allow" || value === true ||
@@ -524,6 +535,7 @@ function permissionMcpServers(frontmatter: Record<string, any>): string[] {
 
 function requiredMcpServersForAgent(agent: AgentInfo, knownMcpServers: Set<string>): string[] {
   const required = new Set(permissionMcpServers(agent.frontmatter))
+  if (isGlobalPermissionDeny(normalizedPermissions(agent.frontmatter))) return [...required]
   const searchable = `${agent.description}\n${agent.body}`.toLowerCase()
   for (const server of knownMcpServers) {
     // Only infer dependencies whose canonical name explicitly identifies an
@@ -585,7 +597,8 @@ function buildClaudeMcpConfig(
       const disabled = isServerDisabled(server)
       if (disabled && !requiredServers.has(name)) continue
       if (disabled) {
-        warnings.push(`[mcp] disabled server '${name}' in ${path.relative(workspaceRoot, sourcePath) || sourcePath} is required by translated agents; emitted because the agents require it`)
+        const relativeSource = (path.relative(workspaceRoot, sourcePath) || sourcePath).split(path.sep).join("/")
+        warnings.push(`[mcp] disabled server '${name}' in ${relativeSource} is required by translated agents; emitted because the agents require it`)
       }
       const commandParts = Array.isArray(server.command)
         ? server.command.map(String)
@@ -844,6 +857,9 @@ function writeCommandSkill(
   commandNames: ReadonlySet<string>
 ): { name: string; file: string; warning: string } {
   const name = path.basename(sourcePath).replace(/\.md$/i, "")
+  if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\\") || /[\u0000-\u001f\u007f-\u009f]/.test(name)) {
+    throw new Error(`Invalid command skill name: ${JSON.stringify(name)}`)
+  }
   const raw = fs.readFileSync(sourcePath, "utf-8")
   const { yamlText, body } = extractFrontmatter(raw)
   const description = commandDescription(yamlText)
@@ -977,9 +993,7 @@ export function convertAgent(
     requiredMcpServers,
     knownMcpServers.size > 0 ? knownMcpServers : undefined
   )
-  if (toolsStr) {
-    newFm.tools = toolsStr
-  }
+  newFm.tools = toolsStr || []
 
   // Claude Code plugin-shipped agents do not support OpenCode's
   // `permissionMode` frontmatter field. Permission differences are

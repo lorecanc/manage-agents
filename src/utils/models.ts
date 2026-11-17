@@ -8,7 +8,8 @@ export type CommandRunner = (command: string) => string
 
 const defaultRunner: CommandRunner = command => execSync(command, {
   encoding: "utf-8",
-  stdio: ["ignore", "pipe", "ignore"]
+  stdio: ["ignore", "pipe", "ignore"],
+  windowsHide: true,
 })
 
 const MODEL_LINE_PATTERN = /^[^/\s]+\/[^\s]+$/

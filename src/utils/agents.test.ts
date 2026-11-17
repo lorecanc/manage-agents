@@ -6,7 +6,7 @@ import { execFileSync, spawnSync } from "node:child_process"
 import test from "node:test"
 import YAML from "yaml"
 import { tempDir, writePack } from "../../test/helpers.js"
-import { extractFrontmatter, findAgentFiles, getExportDestination, parseAgentFile, renameAgent, saveAgentFile, repairAgentModels, updateAgentsModel, discoverAgentResources, updateAgentResources, updateAgentParams, applySafetyPreset, AGENT_EFFORT_VARIANTS, inspectTuningTargets, buildTuningUpdateParams } from "./agents.js"
+import { extractFrontmatter, findAgentFiles, getExportDestination, parseAgentFile, renameAgent, saveAgentFile, repairAgentModels, updateAgentsModel, discoverAgentResources, updateAgentResources, updateAgentParams, applySafetyPreset, AGENT_EFFORT_VARIANTS, KNOWN_MODEL_VARIANTS, inspectTuningTargets, buildTuningUpdateParams, resolveAgentSteps, resolveAgentTuningMode, parseTuneCliArgs, resolveAllowedTuneVariants, validateAgentVariantSyntax } from "./agents.js"
 import { AUTO_COMMIT_MESSAGES, repositoryTransaction } from "./repositoryTransaction.js"
 
 type PackFixture = { manifest?: Record<string, unknown>; files?: Record<string, string> }
@@ -770,7 +770,7 @@ test("legacy V1 max_steps survives parsing and writes V2 on tuning updates", (t)
   assert.equal(agent.frontmatter.max_steps, 12)
   assert.equal(Object.hasOwn(agent.frontmatter, "steps"), false)
 
-  updateAgentParams([agent], { temperature: 0.5 })
+  updateAgentParams([agent], { hidden: false })
   let content = fs.readFileSync(filePath, "utf8")
   assert.match(content, /\nsteps: 12\n/)
   assert.doesNotMatch(content, /\nmax_steps:/)
@@ -785,6 +785,7 @@ test("legacy V1 max_steps survives parsing and writes V2 on tuning updates", (t)
   const updated = parseAgentFile(filePath, workspace)!
   assert.equal(updated.frontmatterVersion, "v2")
   assert.equal(updated.frontmatter.max_steps, 20)
+  assert.equal(resolveAgentSteps(updated.frontmatter), 20)
   assert.equal(Object.hasOwn(updated.frontmatter, "steps"), false)
 })
 
@@ -805,16 +806,13 @@ test("multi-agent parameter tuning summarizes mixed values and only updates dirt
   const summary = inspectTuningTargets([subagent, orchestrator])
   assert.equal(summary.steps.mixed, true)
   assert.equal(summary.steps.displayMixed, "(mixed: 50, 120 — unchanged)")
-  assert.equal(summary.temp.mixed, false)
-  assert.equal(summary.temp.value, "0.2")
-  assert.equal(summary.temp.displayMixed, "0.2")
   assert.equal(summary.mode.mixed, true)
   assert.equal(summary.mode.displayMixed, "(mixed: PRIMARY, SUBAGENT — unchanged)")
   assert.equal(summary.hidden.mixed, true)
   assert.equal(summary.hidden.displayMixed, "(mixed: FALSE, TRUE — unchanged)")
 
   const params = buildTuningUpdateParams(
-    { steps: "50", temp: "0.2", variant: "high", mode: "subagent", hidden: true },
+    { steps: "50", variant: "high", mode: "subagent", hidden: true },
     new Set(["variant"])
   )
   assert.deepEqual(params, { variant: "high" })
@@ -833,6 +831,81 @@ test("multi-agent parameter tuning summarizes mixed values and only updates dirt
   assert.equal(updatedOrchestrator.frontmatter.hidden, false)
 })
 
+test("tuning supports mode 'all', strict positive steps, and CLI argument validation", (t) => {
+  const workspace = catalog(t, "agent-tuning-validation-")
+  const allModePath = agentPath(workspace, "versatile")
+  fs.mkdirSync(path.dirname(allModePath), { recursive: true })
+  saveAgentFile(allModePath, { description: "Versatile agent", mode: "all", steps: 32 }, "Body.")
+  const agent = parseAgentFile(allModePath, workspace)!
+
+  assert.equal(resolveAgentTuningMode(agent.frontmatter.mode), "all")
+  assert.equal(resolveAgentSteps(agent.frontmatter), 32)
+  assert.equal(inspectTuningTargets([agent]).mode.value, "all")
+
+  const originalBytes = fs.readFileSync(allModePath, "utf8")
+  for (const invalidSteps of ["0", "-4", "12abc", "3.5", ""]) {
+    assert.throws(
+      () => buildTuningUpdateParams({ steps: invalidSteps, variant: "", mode: "all", hidden: false }, new Set(["steps"])),
+      /Steps must be a positive whole number/
+    )
+  }
+  assert.throws(() => updateAgentParams([agent], { steps: 0 }), /Steps must be a positive whole number/)
+  assert.throws(() => updateAgentParams([agent], { mode: "invalid" as any }), /Mode must be one of/)
+  assert.equal(fs.readFileSync(allModePath, "utf8"), originalBytes)
+
+  updateAgentParams([agent], { steps: 45, mode: "all", hidden: true })
+  const reloaded = parseAgentFile(allModePath, workspace)!
+  assert.equal(resolveAgentSteps(reloaded.frontmatter), 45)
+  assert.equal(resolveAgentTuningMode(reloaded.frontmatter.mode), "all")
+  assert.equal(reloaded.frontmatter.hidden, true)
+
+  assert.deepEqual(parseTuneCliArgs(["--help"]), { kind: "help" })
+  assert.deepEqual(
+    parseTuneCliArgs(["--pack", "demo", "--steps", "25", "--variant", "high", "--mode", "all", "--hidden"]),
+    {
+      kind: "ok",
+      category: "demo",
+      allCategories: false,
+      params: { steps: 25, variant: "high", mode: "all", hidden: true },
+    }
+  )
+  assert.deepEqual(
+    parseTuneCliArgs(["--all", "--clear-effort", "--no-hidden"]),
+    {
+      kind: "ok",
+      category: "",
+      allCategories: true,
+      params: { variant: null, hidden: false },
+    }
+  )
+  assert.deepEqual(parseTuneCliArgs(["--variant", "provider-custom-tier"]), {
+    kind: "ok",
+    category: "",
+    allCategories: false,
+    params: { variant: "provider-custom-tier" },
+  })
+  assert.equal(parseTuneCliArgs(["--variant", "turbo"]).kind, "ok")
+  assert.equal(parseTuneCliArgs(["--variant", "bad space"]).kind, "error")
+
+  const tempRes = parseTuneCliArgs(["--temp", "0.4"])
+  assert.equal(tempRes.kind, "error")
+  assert.match(tempRes.message, /--temp is no longer supported.*OpenCode V2/)
+
+  for (const badArgs of [
+    [],
+    ["--steps", "12junk"],
+    ["--steps", "0"],
+    ["--steps"],
+    ["--mode", "bogus"],
+    ["--variant", "high", "--clear-variant"],
+    ["--hidden", "--no-hidden"],
+    ["--all", "--pack", "demo"],
+    ["--unknown"],
+  ]) {
+    assert.equal(parseTuneCliArgs(badArgs).kind, "error", `expected error for args: ${badArgs.join(" ")}`)
+  }
+})
+
 test("agent params accept known model variants and model-specific allowed variants", (t) => {
   const workspace = catalog(t, "agent-variant-model-")
   const agent = fixtureAgent(agentPath(workspace, "a"), workspace, "test/model")
@@ -841,6 +914,79 @@ test("agent params accept known model variants and model-specific allowed varian
   updateAgentParams([agent], { variant: "custom-mode", allowedVariants: ["custom-mode"] })
   assert.equal(agent.frontmatter.variant, "custom-mode")
   assert.throws(() => updateAgentParams([agent], { variant: "another-mode", allowedVariants: ["custom-mode"] }), /Expected one of: custom-mode/)
+  updateAgentParams([agent], { variant: "GOLD-TIER", allowedVariants: ["Gold-Tier"] })
+  assert.equal(agent.frontmatter.variant, "gold-tier")
+  assert.throws(() => updateAgentParams([agent], { variant: "turbo" }), /Expected one of:/)
+  assert.equal(validateAgentVariantSyntax(null), null)
+  assert.equal(validateAgentVariantSyntax(" Provider-Custom-Tier "), "provider-custom-tier")
+  assert.throws(() => validateAgentVariantSyntax("bad space"), { message: 'Invalid agent variant "bad space".' })
+
+  const built = buildTuningUpdateParams(
+    { steps: "50", variant: " GOLD-TIER ", mode: "subagent", hidden: false },
+    new Set(["variant"]),
+    ["Gold-Tier"],
+  )
+  assert.deepEqual(built, { variant: "gold-tier", allowedVariants: ["Gold-Tier"] })
+  assert.throws(() => buildTuningUpdateParams(
+    { steps: "50", variant: "turbo", mode: "subagent", hidden: false },
+    new Set(["variant"]),
+    ["Gold-Tier"],
+  ), /Expected one of: Gold-Tier/)
+})
+
+test("allowed tune variants come from verified catalogs and the target agents' models", () => {
+  const variants = {
+    "provider/one": ["gold-tier", "fast"],
+    "provider/two": ["eco"],
+  }
+  assert.deepEqual(
+    resolveAllowedTuneVariants([{ model: "provider/one#current" }], { status: "verified", variants }),
+    [...KNOWN_MODEL_VARIANTS, "gold-tier", "fast"],
+  )
+  assert.deepEqual(
+    resolveAllowedTuneVariants([{ model: "provider/one" }, { model: "" }], { status: "verified", variants }),
+    [...KNOWN_MODEL_VARIANTS, "gold-tier", "fast"],
+  )
+  assert.deepEqual(
+    resolveAllowedTuneVariants([{ model: "" }, { model: undefined }], { status: "verified", variants }),
+    [...KNOWN_MODEL_VARIANTS, "gold-tier", "fast", "eco"],
+  )
+  assert.deepEqual(
+    resolveAllowedTuneVariants([{ model: "provider/one" }, { model: "provider/missing" }], { status: "verified", variants }),
+    [...KNOWN_MODEL_VARIANTS],
+  )
+  assert.equal(resolveAllowedTuneVariants([{ model: "provider/one" }], { status: "loading", variants }), undefined)
+  assert.equal(resolveAllowedTuneVariants([{ model: "provider/one" }], { status: "verified" }), undefined)
+  assert.equal(resolveAllowedTuneVariants([], { status: "verified", variants }), undefined)
+})
+
+test("allowed tune variants are shared across explicit models before agent params are updated", (t) => {
+  const workspace = catalog(t, "agent-variant-intersection-")
+  const single = fixtureAgent(agentPath(workspace, "single"), workspace, "provider/model-a")
+  const a = fixtureAgent(agentPath(workspace, "a"), workspace, "provider/model-a")
+  const b = fixtureAgent(agentPath(workspace, "b"), workspace, "provider/model-b")
+  const variants = {
+    "provider/model-a": ["turbo", "Shared"],
+    "provider/model-b": ["mini", "shared"],
+  }
+  const catalogResult = { status: "verified", variants }
+  const sharedAllowed = resolveAllowedTuneVariants([a, b], catalogResult)!
+
+  assert.deepEqual(sharedAllowed, [...KNOWN_MODEL_VARIANTS, "shared"])
+  const singleAllowed = resolveAllowedTuneVariants([single], catalogResult)!
+  assert.ok(singleAllowed.includes("turbo"))
+  assert.equal(sharedAllowed.includes("turbo"), false)
+
+  updateAgentParams([single], { variant: "turbo", allowedVariants: singleAllowed })
+  assert.equal(single.frontmatter.variant, "turbo")
+
+  const originals = [a, b].map(agent => fs.readFileSync(agent.currentPath, "utf8"))
+  const frontmatter = [a.frontmatter, b.frontmatter]
+  assert.throws(() => updateAgentParams([a, b], { variant: "turbo", allowedVariants: sharedAllowed }), /Expected one of:/)
+  for (const [index, agent] of [a, b].entries()) {
+    assert.equal(fs.readFileSync(agent.currentPath, "utf8"), originals[index])
+    assert.strictEqual(agent.frontmatter, frontmatter[index])
+  }
 })
 
 test("agent params preserve or clear an existing effort variant", (t) => {
@@ -870,7 +1016,7 @@ test("agent params reject blank variants before modifying any agent", (t) => {
   const originalFrontmatter = [a.frontmatter, b.frontmatter]
 
   assert.throws(() => updateAgentParams([a, b], { variant: "   " }), {
-    message: "Agent variant cannot be empty. Pass null to clear variant."
+    message: 'Invalid agent variant "   ".'
   })
   for (const [index, agent] of [a, b].entries()) {
     assert.equal(fs.readFileSync(agent.currentPath, "utf8"), originalContents[index])
@@ -1126,7 +1272,7 @@ test("OpenCode V2 agent updates preserve frontmatter while changing params, mode
   const { env } = userConfig(t)
   const resources = discoverAgentResources(workspace, findAgentFiles(workspace)[0], undefined, env)
 
-  updateAgentParams([agent], { temperature: 0.4 })
+  updateAgentParams([agent], { steps: 16 })
   agent = parseAgentFile(filePath, workspace)!
   updateAgentsModel([agent], "new/model", ["new/model"])
   agent = parseAgentFile(filePath, workspace)!
@@ -1140,6 +1286,7 @@ test("OpenCode V2 agent updates preserve frontmatter while changing params, mode
     assert.deepEqual(saved.frontmatter[key], preserved[key], `${key} frontmatter should be preserved`)
   }
   assert.equal(saved.frontmatter.description, preserved.description)
+  assert.equal(resolveAgentSteps(saved.frontmatter), 16)
   assert.equal(saved.frontmatter.temperature, undefined)
   assert.equal(saved.frontmatter.top_p, undefined)
   assert.equal(saved.frontmatter.request, undefined)
@@ -1154,7 +1301,7 @@ test("updateAgentParams keeps the V2 global deny first", (t) => {
   const workspace = catalog(t, "agent-global-params-")
   const { filePath, agent } = globalDenyAgent(workspace)
 
-  updateAgentParams([agent], { temperature: 0.5 })
+  updateAgentParams([agent], { steps: 30 })
 
   assertGlobalDenyFirst(filePath)
 })

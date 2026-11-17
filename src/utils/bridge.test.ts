@@ -418,6 +418,58 @@ test("emits Claude tool names for the expanded OpenCode vocabulary", () => {
   }
 })
 
+test("a trailing V2 global deny emits no default tools or prose-inferred MCP tools", (t) => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "claude-global-deny-"))
+  t.after(() => fs.rmSync(workspace, { recursive: true, force: true }))
+  fs.writeFileSync(path.join(workspace, "opencode.json"), JSON.stringify({
+    mcp: { servers: { "codebase-memory-mcp": { type: "local", command: ["codebase-memory-mcp"] } } }
+  }))
+
+  const agent = fixture("pipeline-executor.md", "Use codebase-memory-mcp to search the repository.")
+  agent.description = "Use codebase-memory-mcp for repository context."
+  delete agent.frontmatter.permission
+  agent.frontmatter.permissions = [
+    { action: "read", resource: "*", effect: "allow" },
+    { action: "*", resource: "*", effect: "deny" },
+  ]
+  const output = path.join(workspace, "claude")
+
+  const result = bridgeToClaudeCode([agent], "pipeline", "pipeline-", output, workspace)
+
+  const generated = fs.readFileSync(path.join(output, "agents", "executor.md"), "utf8")
+  const toolsLine = generated.match(/^tools: (.*)$/m)?.[1]
+  assert.equal(toolsLine, "[]", `the global deny must emit an explicit empty allowlist; got ${generated}`)
+  assert.doesNotMatch(toolsLine || "", /Read|Grep|Glob|mcp__/)
+  assert.doesNotMatch(generated, /## MCP Tools/)
+  assert.equal(result.warnings.some(warning => warning.includes("permission '*'")), false)
+})
+
+test("a global V2 deny permits only explicitly allowed read tools", () => {
+  const agent = fixture("pipeline-executor.md")
+  delete agent.frontmatter.permission
+  agent.frontmatter.permissions = [
+    { action: "*", resource: "*", effect: "deny" },
+    { action: "read", resource: "*", effect: "allow" },
+  ]
+
+  const tools = buildClaudeCodePlugin([agent], "pipeline", "pipeline-").agents[0].frontmatter.tools
+
+  assert.equal(tools, "Read")
+})
+
+test("read, grep, and glob catch-all denies suppress default Claude tools", () => {
+  const agent = fixture("pipeline-executor.md")
+  agent.frontmatter.permission = {
+    read: { "*": "deny" },
+    grep: { "*": "deny" },
+    glob: { "*": "deny" },
+  }
+
+  const tools = buildClaudeCodePlugin([agent], "pipeline", "pipeline-").agents[0].frontmatter.tools
+
+  assert.deepEqual(tools, [])
+})
+
 test("honors last-match-wins for bash and edit permission objects", () => {
   const bashAgent = fixture("pipeline-executor.md")
   bashAgent.frontmatter.permission = { bash: { "*": "deny", "node *": "allow" } }
@@ -776,8 +828,8 @@ test("warns when a disabled MCP server is emitted because agents require it", ()
   const mcp = JSON.parse(fs.readFileSync(path.join(output, ".mcp.json"), "utf8")).mcpServers
   assert.ok(mcp.XcodeBuildMCP, `disabled but required server must still be emitted, got ${JSON.stringify(mcp)}`)
   assert.ok(
-    result.warnings.some(warning => /disabled.*XcodeBuildMCP/i.test(warning)),
-    `expected a disabled-server warning, got ${JSON.stringify(result.warnings)}`
+    result.warnings.some(warning => /disabled.*XcodeBuildMCP.*in opencode\.json/i.test(warning) && !warning.includes("\\")),
+    `expected a forward-slash disabled-server warning, got ${JSON.stringify(result.warnings)}`
   )
 })
 
@@ -991,6 +1043,19 @@ test("scopes sibling pipeline command references to the plugin", () => {
   const content = fs.readFileSync(path.join(output, "skills", "pipeline-ops", "SKILL.md"), "utf8")
   assert.match(content, /`\/decent-pipeline:pipeline-bug`/)
   assert.doesNotMatch(content, /`\/pipeline-bug`/)
+})
+
+test("bridge rejects command skill IDs containing control characters", (t) => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "claude-command-control-"))
+  t.after(() => fs.rmSync(workspace, { recursive: true, force: true }))
+  const name = "pipeline-\u0001unsafe"
+  fs.mkdirSync(path.join(workspace, "commands"), { recursive: true })
+  fs.writeFileSync(path.join(workspace, "commands", `${name}.md`), "---\ndescription: Unsafe ID\n---\nFix it.\n")
+
+  assert.throws(
+    () => bridgeToClaudeCode([fixture("pipeline-orchestrator.md")], "pipeline", "pipeline-", path.join(workspace, "claude"), workspace),
+    error => error instanceof Error && error.message === `Invalid command skill name: ${JSON.stringify(name)}`
+  )
 })
 
 test("copies companion skills into the plugin", () => {

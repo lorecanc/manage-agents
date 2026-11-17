@@ -346,7 +346,8 @@ function buildCodexMcpConfig(
       const disabled = isServerDisabled(server)
       if (disabled && !requiredServers.has(name)) continue
       if (disabled) {
-        warnings.push(`[mcp] disabled server '${name}' in ${path.relative(workspaceRoot, sourcePath) || sourcePath} is required by translated agents; emitted because the agents require it`)
+        const relativeSource = (path.relative(workspaceRoot, sourcePath) || sourcePath).split(path.sep).join("/")
+        warnings.push(`[mcp] disabled server '${name}' in ${relativeSource} is required by translated agents; emitted because the agents require it`)
       }
       const commandParts = Array.isArray(server.command)
         ? server.command.map(String)

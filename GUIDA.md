@@ -167,6 +167,20 @@ manage-agents update pipeline   # solo le sorgenti dei pack indicati
 di `requires`. Una sorgente git si muove in blocco: tutti i suoi pack seguono la nuova revisione. Accetta `--adopt`,
 `--yes`, `--dry-run` e `--json`.
 
+### Aggiornare il motore (`self-update`)
+
+```bash
+manage-agents version
+manage-agents self-update --check
+manage-agents self-update --yes
+```
+
+`self-update` aggiorna `manage-agents` stesso. Il comando interroga l'ultima GitHub Release pubblicata dai tag `v*` del
+repository del motore (o tramite l'alias `manage-agents update --self`), verifica SHA-256, manifest interno ed eventuale
+firma `Ed25519` configurata in `release-signing.json`, sostituisce in modo transazionale il pacchetto e riallinea il
+plugin router nel target OpenCode. Nella TUI la stessa funzione è accessibile con `Shift-U` o dalla Command Palette
+(`Ctrl-K`).
+
 ### Disinstallare
 
 ```bash
@@ -249,9 +263,9 @@ I valori sono YAML e `null` rimuove il campo. Per gli agenti sono ammessi `descr
 `permissions`, `hidden`, `color`, `steps`, `disabled`, `request`, `temperature` e `top_p`. Per i comandi (con
 `--command`) `description`, `agent`, `model` e `subagent`. Ambito e reconcile funzionano come per `models`.
 
-### Esportazione nel manifesto e pacchetti di soli `.md`
+### Onboarding guidato, Pack Doctor e pacchetti senza manifesto
 
-Il gestore funziona anche senza manifesto. Se colleghi una cartella locale o un repository GitHub che contiene semplici file `.md` con frontmatter agente (anche fuori da `agents/`), `manage-agents` sintetizza automaticamente un pack virtuale `0.0.0-virtual` così che tu possa ispezionarlo, configurarne i flussi condizionali in `routing.json` e installarlo subito in OpenCode con `e` o `manage-agents install`. Nella TUI premi `m` su qualsiasi cartella di pack per modificare chiamanti (`c`), trigger multipli in `OR` (`Space` o `Tab`), tool (`u`) e deleghe (`g`) nelle tue impostazioni utente; sui pack locali premi `w` (oppure esegui `manage-agents models export-pack <pack>`) per esportare `archetype`, `routingDefaults` e `flowDefaults` dentro `opencode-pack.json`, oppure premi `i` (`manage-agents pack init`) per generare e validare il manifesto partendo da una cartella di soli `.md`.
+Funziona subito anche senza manifesto. Se colleghi una cartella locale o un repository GitHub che contiene file `.md` sparsi con frontmatter agente oppure una directory `.opencode/` di progetto, `manage-agents` sintetizza un pack virtuale `0.0.0-virtual` e propone il wizard di onboarding (`i`, oppure `manage-agents pack onboard`) per trasformarlo in un pacchetto conforme al contratto `1.1` (alla radice nelle repo dedicate, oppure in `packs/<nome>/` quando rileva file applicativi come `package.json` o `src/`), clonando in locale la repo qualora provenga da GitHub. Durante le iterazioni successive, i tasti `d` (`manage-agents pack doctor --fix`) e `n` (`manage-agents pack add agent|skill|command <id>`) mantengono lo standard riparando frontmatter V1, directory singolari, namespace e versioni semver, e installano su richiesta la skill `.opencode/skills/opencode-pack-authoring/` insieme al workflow GitHub Actions di validazione. Nella TUI puoi inoltre premere `m` su qualunque cartella di pack per configurare i flussi `IF / OR` e `w` (`manage-agents models export-pack <pack>`) per salvarli dentro `opencode-pack.json`.
 
 ## Lavorare su un catalogo
 
@@ -275,7 +289,8 @@ alterare mai la cache git.
 | `/` | cerca per nome file (`Enter` mantiene il filtro, `Esc` lo cancella) |
 | `Space`, `a`, `s` | selezionano l'agente, tutto il pack, gli agenti del pack con lo stesso modello |
 | `m` | modello; su qualunque cartella pack, senza selezione, i flussi condizionali `IF / OR` |
-| `i` | inizializza `opencode-pack.json` su una cartella locale di soli file `.md` |
+| `i` | avvia il wizard di onboarding (su cartella virtuale locale o clonando in locale una repo GitHub) |
+| `d`, `n` | sui pack locali: Pack Doctor (auto-fix, kit repo, bump semver) e creazione guidata di agenti, skill o comandi |
 | `v` | ripara i modelli non validi |
 | `t`, `Shift-T` | parametri (selezione, cartella o agente), tier di traduzione |
 | `c`, `p`, `g` | colore, preset di permessi, deleghe |
@@ -283,8 +298,8 @@ alterare mai la cache git.
 | `r` | rinomina l'agente |
 | `e` | installa in OpenCode il pack sotto il cursore |
 | `b`, `Shift-B` | bridge Claude Code, bridge Codex |
-| `1`–`5` | schede dell'inspector: Info, Name, Sec, Graph, Res |
-| `F` | corregge l'ordine dei permessi (scheda 3) |
+| `1`-`6` | schede dell'inspector: Info, Prompt, Name, Sec, Graph, Res |
+| `F` | corregge l'ordine dei permessi (scheda 4) |
 | `Shift-L` | layout |
 | `Esc`, `Ctrl-C` | chiude le finestre, esce |
 
@@ -298,11 +313,11 @@ Alcuni dettagli utili:
 - **Skill, tool e MCP (`u`).** `Space` alterna `allow` e `deny` per una skill (o `* (All Skills)`), una famiglia di
   tool (`slide_*`), un singolo tool o un server MCP (`<server>_*`). L'elenco contiene ciò che offrono il pack
   dell'agente e i pack che richiede. `Enter` salva il file dell'agente e nient'altro.
-- **Parametri (`t`).** Imposta `steps`, `temperature`, `mode`, `hidden` e Thinking/Effort (`variant`). Nel campo
-  `variant`, `Space` o `←`/`→` scorrono `none`, `minimal`, `low`, `medium`, `high`, `xhigh` e `max`; puoi anche
-  scrivere un nome personalizzato. I variant sono definiti sul modello, come spiega la documentazione OpenCode su
-  [agenti](https://opencode.ai/docs/agents/#additional) e
-  [variant dei modelli](https://opencode.ai/docs/models/#variants).
+- **Parametri (`t`).** Imposta quattro parametri. La finestra regola `steps`, Thinking/Effort (`variant`), `mode`
+  (`subagent`, `primary` o `all`) e `hidden`, mentre nel campo `variant` i tasti `Space` o `←`/`→` scorrono i valori
+  esposti dal modello (oppure `none`, `low`, `medium`, `high` e `max`) e puoi anche digitare il nome di una variante
+  ammessa. I variant sono definiti sul modello nella configurazione di OpenCode: consulta la guida su
+  [agenti](https://opencode.ai/v2/docs/agents) e [modelli](https://opencode.ai/v2/docs/models).
 - **Layout (`Shift-L`).** Frecce o `h`/`l` cambiano la proporzione, `Home`/`End` vanno ai limiti, `R` ripristina,
   `Enter` salva in `~/.config/manage-agents/ui.json` (valori tra 0.60 e 0.75). Con
   `AGENT_MANAGER_UI_CONFIG=<file>` la TUI legge un altro file e il layout diventa di sola lettura.
@@ -320,16 +335,18 @@ raggruppati per famiglia e i server MCP che può usare, con il loro stato nell'`
 | `audit` | controlla ordine dei permessi e livelli di rischio, in sola lettura |
 | `tune` | aggiorna i parametri del modello |
 
-Opzioni di `tune`: `--steps <n>`, `--temp <n>`, `--variant <nome>` (alias `--effort`), `--clear-variant` (alias
-`--clear-effort`) e `--category <pack>` oppure `--all` per scegliere gli agenti:
+Scegli opzioni e pack. Il comando `tune` accetta `--steps <n>`, `--variant <nome>` (alias `--effort`), `--clear-variant`
+(alias `--clear-effort`), `--mode <primary|subagent|all>`, `--hidden` o `--no-hidden`, insieme a `--pack <pack>` (alias
+`--category`) oppure `--all` per selezionare gli agenti su cui scrivere:
 
 ```bash
-manage-agents tune --category pipeline --steps 40 --variant high
-manage-agents tune --category pipeline --clear-variant
+manage-agents tune --pack pipeline --steps 40 --variant high
+manage-agents tune --pack pipeline --clear-variant
 ```
 
-La `temperature` a livello di agente non ha effetto in OpenCode 2.2.5. Per cambiare il comportamento usa i variant
-del modello.
+OpenCode V2 ignora `temperature`. Il vecchio flag `--temp` restituisce un errore esplicito perché i parametri di
+campionamento a livello di singolo agente sono stati rimossi dal formato V2 e vanno invece definiti su un variant del
+modello tramite `opencode.jsonc` e richiamati con `--variant`.
 
 ## Bridge per Claude Code e Codex
 
@@ -386,9 +403,7 @@ il bridge cancella i file generati che non produce più.
 **Cosa non viene tradotto.** I plugin OpenCode e i tool personalizzati dei pack. Il README generato li elenca con
 l'equivalente Claude più vicino.
 
-Nella TUI, `b` e `Shift-B` aprono lo stesso bridge per il pack sotto il cursore. `Tab` passa tra nome del plugin,
-prefisso e `Map all models to`. L'ultimo campo imposta il catch-all `"*"` del target; vuoto, si torna alla mappatura
-per tier.
+Qui `Tab` alterna le sezioni. Nella TUI, `b` e `Shift-B` aprono la modale proponendo il pack sotto il cursore (scorribile su tutti gli altri con le frecce verticali e rimozione automatica di `<pack>-`), i modelli dei tier `planning`, `execution` e `light` e il catch-all `Map all to`. Nell'anteprima viva degli agenti del pack le frecce orizzontali o `Spazio` riassegnano il tier del singolo agente, mentre `Ctrl+S` salva subito le modifiche ai tier.
 
 ## Scrivere un pack
 

@@ -50,9 +50,10 @@ Rules (all enforced by `manage-agents pack validate`):
   Their imports are not checked, because they run on the merged layout of all packs (the installed tree) rather than
   on a single pack. They follow the namespace rule like any other file.
 - **Reserved paths**: `instructions/`, `.manage-agents/` and `plugins/manage-agents-router/` belong to the engine.
-- **Ignored**: `node_modules/` is never installed. Plugins may import only `@opencode/plugin`, Node built-ins and
-  their own files; vendor anything else as bundled files. OpenCode V2 does not document installing arbitrary
-  dependencies for local plugins.
+- **Ignored**: `node_modules/` and `.opencode/` are never installed. `.opencode/` holds repository-local OpenCode
+  authoring state (such as `.opencode/plans/` or `.opencode/skills/opencode-pack-authoring/`). Plugins may import only
+  `@opencode/plugin`, Node built-ins and their own files; vendor anything else as bundled files. OpenCode V2 does not
+  document installing arbitrary dependencies for local plugins.
 - **Symlinks**: a symlink must point to a file inside the pack. Symlinked directories, broken symlinks and links
   that leave the pack are rejected. The engine installs the content, not the link.
 - **Case**: two paths that differ only by case or Unicode normalization (`Foo.md` / `foo.md`) are rejected, because
