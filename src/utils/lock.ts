@@ -45,7 +45,35 @@ export interface ExecutableChange {
 export const defaultTarget = (env: NodeJS.ProcessEnv = process.env) => path.dirname(getExportDestination(env))
 
 export const targetStateDir = (target: string) => path.join(target, ".manage-agents")
-const lockPath = (target: string) => path.join(targetStateDir(target), "lock.json")
+
+export function assertSafeTargetRoot(target: string): string {
+  const resolved = path.resolve(target)
+  const stat = fs.lstatSync(resolved, { throwIfNoEntry: false })
+  if (stat && (stat.isSymbolicLink() || !stat.isDirectory())) throw new Error(`Refusing to manage symlink or non-directory target: ${target}`)
+  return resolved
+}
+
+export function assertSafeTargetSubpath(target: string, rel: string, options: { allowLeafSymlink?: boolean } = {}): string {
+  const root = assertSafeTargetRoot(target)
+  const segments = rel.split("/")
+  if (!rel || rel.startsWith("/") || rel.includes("\\") || /[\u0000-\u001f\u007f-\u009f]/.test(rel)
+    || segments.some(segment => !segment || segment === "." || segment === "..")) {
+    throw new Error(`Refusing unsafe relative path inside target: ${rel}`)
+  }
+  let curr = root
+  for (let i = 0; i < segments.length; i++) {
+    curr = path.join(curr, segments[i])
+    const stat = fs.lstatSync(curr, { throwIfNoEntry: false })
+    if (!stat) break
+    if (i < segments.length - 1 && (stat.isSymbolicLink() || !stat.isDirectory())) {
+      throw new Error(`Refusing symlink or non-directory path inside target: ${rel}`)
+    }
+    if (i === segments.length - 1 && options.allowLeafSymlink !== true && stat.isSymbolicLink()) {
+      throw new Error(`Refusing symlink state file or directory inside target: ${rel}`)
+    }
+  }
+  return path.join(root, ...segments)
+}
 
 /** Only a resolution without problems can be locked. */
 export function buildLock(resolution: Resolution): PackLock {
@@ -83,7 +111,7 @@ function lockProblem(name: string, pack: any): string | null {
 }
 
 export function readLock(target: string): PackLock | null {
-  const file = lockPath(target)
+  const file = assertSafeTargetSubpath(target, ".manage-agents/lock.json", { allowLeafSymlink: false })
   if (!fs.existsSync(file)) return null
   const lock = JSON.parse(fs.readFileSync(file, "utf8"))
   if (lock?.lockVersion !== 1 || typeof lock.contract !== "string" || !Array.isArray(lock.roots) || !lock.roots.every((root: unknown) => typeof root === "string") || typeof lock.packs !== "object" || lock.packs === null) throw new Error(`${file}: unsupported lock file`)
@@ -95,7 +123,10 @@ export function readLock(target: string): PackLock | null {
 }
 
 export function writeLock(target: string, lock: PackLock): void {
-  atomicWriteRestrictedFile(lockPath(target), Buffer.from(serializeLock(lock)), 0o644)
+  const file = assertSafeTargetSubpath(target, ".manage-agents/lock.json", { allowLeafSymlink: false })
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  assertSafeTargetSubpath(target, ".manage-agents/lock.json", { allowLeafSymlink: false })
+  atomicWriteRestrictedFile(file, Buffer.from(serializeLock(lock)), 0o644)
 }
 
 export function diffLocks(previous: PackLock | null, next: PackLock): { changes: LockChange[]; executable: ExecutableChange[] } {

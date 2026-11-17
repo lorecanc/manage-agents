@@ -118,13 +118,16 @@ function toEffect(value: string | boolean): V2PermissionRule["effect"] {
  * V1: { bash: "allow" }
  */
 export function translatePermissionsV2ToV1(perms: V2PermissionRule[]): V1PermissionObject {
-  // A global `{action:"*", resource:"*"}` rule maps back to the V1 `"*"` key
-  // and always comes first, mirroring the write-side ordering.
-  const globalRule = perms.find(rule => rule.action === "*" && rule.resource === "*")
+  // Keep only rules after the last global wildcard: it supersedes everything
+  // that came before it under V2's last-match-wins semantics.
+  const lastGlobalRuleIndex = perms.reduce(
+    (last, rule, index) => rule.action === "*" && rule.resource === "*" ? index : last,
+    -1
+  )
+  const globalRule = lastGlobalRuleIndex >= 0 ? perms[lastGlobalRuleIndex] : undefined
   const result: V1PermissionObject = globalRule ? { "*": globalRule.effect } : {}
 
-  for (const rule of perms) {
-    if (rule.action === "*" && rule.resource === "*") continue
+  for (const rule of perms.slice(lastGlobalRuleIndex + 1)) {
     // Fail closed: an action outside the V2 vocabulary is dropped instead of
     // copied verbatim, so a V1 spelling cannot smuggle a permission through.
     const key = resolveV2PermissionKey(rule.action)

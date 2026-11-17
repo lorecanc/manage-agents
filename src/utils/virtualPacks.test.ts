@@ -18,10 +18,25 @@ import {
   saveUserPackFlow,
 } from "./sourceCustomization.js"
 import { addSource, discoverPacks, pullSource, saveSources, sourceRoot, type SourceRegistry } from "./sources.js"
-import { derivePackSlug, initPackManifest, isVirtualPackRoot, validateVirtualPack, VIRTUAL_PACK_VERSION } from "./virtualPacks.js"
+import { derivePackSlug, initPackManifest, isVirtualPackRoot, scanVirtualExtras, validateVirtualPack, VIRTUAL_PACK_VERSION } from "./virtualPacks.js"
 
 const REPO_ROOT = fileURLToPath(new URL("../..", import.meta.url))
 const hasGit = spawnSync("git", ["--version"]).status === 0
+
+test("virtual extras can prefer .opencode AGENTS.md and config in mixed repositories", (t) => {
+  const root = tempDir(t, "virtual-extras-layout-")
+  fs.mkdirSync(path.join(root, ".opencode"), { recursive: true })
+  fs.writeFileSync(path.join(root, "AGENTS.md"), "# Host instructions\n")
+  fs.writeFileSync(path.join(root, ".opencode", "AGENTS.md"), "# Pack instructions\n")
+  fs.writeFileSync(path.join(root, "opencode.json"), "{}\n")
+  fs.writeFileSync(path.join(root, ".opencode", "opencode.json"), "{\"instructions\":[\"AGENTS.md\"]}\n")
+
+  assert.equal(scanVirtualExtras(root).agentsMdSourceRel, "AGENTS.md")
+  assert.equal(scanVirtualExtras(root).configSourceRel, "opencode.json")
+  const preferred = scanVirtualExtras(root, { preferDotOpencode: true })
+  assert.equal(preferred.agentsMdSourceRel, ".opencode/AGENTS.md")
+  assert.equal(preferred.configSourceRel, ".opencode/opencode.json")
+})
 
 function gitIn(cwd: string, ...args: string[]) {
   const result = spawnSync(

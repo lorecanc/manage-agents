@@ -199,3 +199,70 @@ test("describePackFlows works on packs without archetype and exportFlowsToPackMa
   assert.equal(exported.flowDefaults.length, 1)
   assert.equal(hasErrors(validatePack(slidesDir)), false)
 })
+
+test("describePackFlows carries static permission denials through tool aliases", (t) => {
+  const cases = [
+    { name: "V1 edit", frontmatter: "permission:\n  edit: deny\n", denied: ["edit", "write"] },
+    { name: "V2 edit", frontmatter: 'permissions:\n  - action: edit\n    resource: "*"\n    effect: deny\n', denied: ["edit", "write"] },
+    { name: "V1 shell", frontmatter: "permission:\n  shell: deny\n", denied: ["shell", "bash"] },
+    { name: "V1 bash", frontmatter: "permission:\n  bash: false\n", denied: ["bash", "shell"] },
+    { name: "V2 shell", frontmatter: 'permissions:\n  - action: shell\n    resource: "*"\n    effect: deny\n', denied: ["shell", "bash"] },
+    { name: "V2 wildcard", frontmatter: 'permissions:\n  - action: "*"\n    resource: "*"\n    effect: deny\n', denied: ["*"] },
+  ]
+
+  for (const { name, frontmatter, denied } of cases) {
+    const root = tempDir(t, `static-denial-${name.replaceAll(" ", "-")}-`)
+    writePack(path.join(root, "packs", "policy"), {
+      "agents/caller.md": agent(`mode: primary\n${frontmatter}`),
+    }, { name: "policy" })
+
+    const view = describePackFlows(root, "policy")!
+    for (const key of denied) assert.ok(view.staticDeniedTools.has(key), `${name} should deny ${key}`)
+    if (denied.includes("write")) {
+      assert.equal(view.availableTools.find(tool => tool.key === "write")?.staticallyDeniedByCaller, true, name)
+    }
+    if (denied.includes("bash") || denied.includes("shell")) {
+      assert.equal(view.availableTools.find(tool => tool.key === "bash")?.staticallyDeniedByCaller, true, name)
+    }
+    if (denied.includes("*")) assert.ok(view.availableTools.every(tool => tool.staticallyDeniedByCaller), name)
+  }
+})
+
+test("describePackFlows respects wildcard permission defaults and explicit tool exceptions", (t) => {
+  const cases = [
+    {
+      name: "V2 later allow",
+      frontmatter: 'permissions:\n  - action: edit\n    resource: "*"\n    effect: deny\n  - action: edit\n    resource: "*"\n    effect: allow\n',
+      expected: { edit: false, write: false },
+    },
+    {
+      name: "V1 permission wildcard allow",
+      frontmatter: 'permission:\n  "*": deny\n  edit: allow\n',
+      expected: { edit: false, write: false, read: true, bash: true, grep: true, glob: true },
+    },
+    {
+      name: "V2 wildcard deny followed by allow",
+      frontmatter: 'permissions:\n  - action: "*"\n    resource: "*"\n    effect: deny\n  - action: read\n    resource: "*"\n    effect: allow\n',
+      expected: { read: false, write: true, edit: true, bash: true, grep: true },
+    },
+    {
+      name: "V2 wildcard deny after allow",
+      frontmatter: 'permissions:\n  - action: read\n    resource: "*"\n    effect: allow\n  - action: "*"\n    resource: "*"\n    effect: deny\n',
+      expected: { read: true },
+    },
+  ]
+
+  for (const { name, frontmatter, expected } of cases) {
+    const root = tempDir(t, `static-allow-${name.replaceAll(" ", "-")}-`)
+    writePack(path.join(root, "packs", "policy"), {
+      "agents/caller.md": agent(`mode: primary\n${frontmatter}`),
+      ...Object.fromEntries(["read", "grep", "glob"].map(tool => [`tools/policy/${tool}.ts`, ""])),
+    }, { name: "policy" })
+
+    const view = describePackFlows(root, "policy")!
+    for (const [key, denied] of Object.entries(expected)) {
+      assert.equal(view.availableTools.find(tool => tool.key === key)?.staticallyDeniedByCaller, denied, `${name}: ${key}`)
+      assert.equal(view.staticDeniedTools.has(key), denied, `${name}: warning set for ${key}`)
+    }
+  }
+})

@@ -8,6 +8,7 @@ import test from "node:test"
 import { tempDir, writePack } from "../../test/helpers.js"
 import { applyPlan, changeTarget, installChange, planReconcile, readInstalled, reconcileChange, restoreBackup, rollbackInterrupted, targetStatus, uninstallChange, updateChange, withTargetLock, type ChangeOptions } from "./installer.js"
 import { readLock } from "./lock.js"
+import { MAX_SCANNED_BYTES } from "./packs.js"
 import { addSource, pullSource, type SourceRegistry } from "./sources.js"
 
 const BASE = {
@@ -364,6 +365,44 @@ test("a symlinked opencode.json is reported, never replaced", { skip: process.pl
   assert.equal(result.status, "failed")
   assert.match(result.plan!.conflicts.join("\n"), /opencode\.json is a symlink/)
   assert.ok(fs.lstatSync(path.join(target, "opencode.json")).isSymbolicLink())
+})
+
+test("symlinked state and resource directories are refused without writes through them", { skip: process.platform === "win32" }, async (t) => {
+  const { base, target, install, env, registry, options } = setup(t)
+  const outsideState = path.join(base, "outside-state")
+  fs.mkdirSync(outsideState)
+  fs.symlinkSync(outsideState, path.join(target, ".manage-agents"), "dir")
+  await assert.rejects(install(["flow"]), /Refusing symlink or non-directory path inside target/)
+  assert.deepEqual(fs.readdirSync(outsideState), [])
+
+  const target2 = path.join(base, "target-agents-link")
+  const outsideAgents = path.join(base, "outside-agents")
+  fs.mkdirSync(target2)
+  fs.mkdirSync(outsideAgents)
+  fs.symlinkSync(outsideAgents, path.join(target2, "agents"), "dir")
+  const blocked = await changeTarget(target2, "install", registry, installChange(registry, ["flow"], env), options).catch(error => error)
+  assert.ok(blocked instanceof Error, String(blocked))
+  assert.deepEqual(fs.readdirSync(outsideAgents), [])
+})
+
+test("dangling opencode.jsonc symlink is reported as a config conflict", { skip: process.platform === "win32" }, async (t) => {
+  const { target, install } = setup(t)
+  fs.symlinkSync("missing.json", path.join(target, "opencode.jsonc"))
+  const result = await install(["flow"])
+
+  assert.equal(result.status, "failed")
+  assert.equal(result.plan!.configFile, "opencode.jsonc")
+  assert.match(result.plan!.conflicts.join("\n"), /opencode\.jsonc is a symlink/)
+})
+
+test("oversized locked opencode config is rejected before it is read", async (t) => {
+  const { target, source, install, registry, options } = setup(t)
+  assert.equal((await install(["flow"])).status, "applied")
+  fs.writeFileSync(path.join(source, "flow", "opencode.json"), " ".repeat(MAX_SCANNED_BYTES + 1))
+
+  const result = await changeTarget(target, "reconcile", registry, reconcileChange, options)
+  assert.equal(result.status, "failed")
+  assert.ok(result.plan!.conflicts.includes(`flow: opencode.json exceeds maximum scanned size (${MAX_SCANNED_BYTES} bytes)`))
 })
 
 test("restore recreates an adopted symlink as a link", { skip: process.platform === "win32" }, async (t) => {

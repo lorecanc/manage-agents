@@ -4,7 +4,7 @@ import fs from "node:fs"
 import path from "node:path"
 import test from "node:test"
 import { tempDir, writePack } from "../../test/helpers.js"
-import { addSource, deriveSourceName, discoverPacks, ghCredentialArgs, loadSources, pullSource, removeSource, saveSources, sourceRevision, type SourceRegistry } from "./sources.js"
+import { addSource, deriveSourceName, discoverPacks, ghCredentialArgs, hasUrlCredentials, loadSources, pullSource, redactUrlCredentials, removeSource, saveSources, sourceRevision, type SourceRegistry } from "./sources.js"
 
 const emptyRegistry = (): SourceRegistry => ({ schemaVersion: 1, sources: [], prefer: {} })
 const envFor = (t: test.TestContext) => {
@@ -61,6 +61,36 @@ test("registry: hand-edited entries are validated on load, so a name cannot esca
   assert.throws(() => loadSources(env), /invalid "prefer" map/)
 })
 
+test("registry: rejects credential-bearing git URLs without echoing credentials", (t) => {
+  const env = envFor(t)
+  const file = path.join(env.XDG_CONFIG_HOME, "manage-agents", "sources.json")
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(file, JSON.stringify({
+    schemaVersion: 1,
+    sources: [{ name: "secret", kind: "git", url: "https://secret-token@github.com/org/repo.git", trusted: false }],
+    prefer: {},
+  }))
+
+  assert.throws(() => loadSources(env), error => {
+    assert.match((error as Error).message, /https:\/\/github\.com\/org\/repo\.git/)
+    assert.doesNotMatch((error as Error).message, /secret-token/)
+    return true
+  })
+})
+
+test("source URLs: redact credentials and query strings without changing public URLs", () => {
+  assert.equal(redactUrlCredentials("https://user:secret@github.com/org/repo.git?token=hidden"), "https://github.com/org/repo.git")
+  assert.equal(redactUrlCredentials("ssh://git:secret@github.com/org/repo.git?token=hidden"), "ssh://git@github.com/org/repo.git")
+  assert.equal(redactUrlCredentials("user:secret@github.com:org/repo.git"), "user@github.com:org/repo.git")
+  assert.equal(redactUrlCredentials("https://github.com/org/repo.git"), "https://github.com/org/repo.git")
+  assert.equal(redactUrlCredentials("git@github.com:org/repo.git"), "git@github.com:org/repo.git")
+  assert.equal(hasUrlCredentials("https://token@github.com/org/repo.git"), true)
+  assert.equal(hasUrlCredentials("ssh://git:secret@github.com/org/repo.git"), true)
+  assert.equal(hasUrlCredentials("user:secret@github.com:org/repo.git"), true)
+  assert.equal(hasUrlCredentials("ssh://git@github.com/org/repo.git"), false)
+  assert.equal(hasUrlCredentials("git@github.com:org/repo.git"), false)
+})
+
 test("discovery: finds packs, does not descend into a pack, reports broken manifests and unpulled git sources", (t) => {
   const env = envFor(t)
   const root = tempDir(t)
@@ -86,6 +116,37 @@ function gitIn(cwd: string, ...args: string[]) {
   assert.equal(result.status, 0, result.stderr)
   return result.stdout.trim()
 }
+
+test("git sources: reject credential-bearing source objects", (t) => {
+  const env = envFor(t)
+  const source = { name: "secret", kind: "git" as const, url: "https://secret-token@github.com/org/repo.git", trusted: false }
+  assert.throws(() => pullSource(source, env), error => {
+    assert.match((error as Error).message, /credentials in source URLs/)
+    assert.doesNotMatch((error as Error).message, /secret-token/)
+    return true
+  })
+})
+
+test("git sources: refuse a symlinked cache entry without mutating its external repository", { skip: !hasGit || process.platform === "win32" }, (t) => {
+  const env = envFor(t)
+  const external = tempDir(t)
+  gitIn(external, "init", "--quiet", "--initial-branch=main")
+  writePack(path.join(external, "packs", "flow"), {}, { name: "flow" })
+  gitIn(external, "add", "-A")
+  gitIn(external, "commit", "--quiet", "-m", "initial")
+  gitIn(external, "remote", "add", "origin", "https://example.com/original.git")
+  const originalRevision = gitIn(external, "rev-parse", "HEAD")
+  const originalRemote = gitIn(external, "remote", "get-url", "origin")
+
+  const cached = path.join(env.XDG_CACHE_HOME, "manage-agents", "sources", "linked")
+  fs.mkdirSync(path.dirname(cached), { recursive: true })
+  fs.symlinkSync(external, cached, "dir")
+  const source = { name: "linked", kind: "git" as const, url: `file://${external}`, trusted: false }
+
+  assert.throws(() => pullSource(source, env, { allowFileUrls: true }), /symlink/)
+  assert.equal(gitIn(external, "remote", "get-url", "origin"), originalRemote)
+  assert.equal(gitIn(external, "rev-parse", "HEAD"), originalRevision)
+})
 
 test("git sources: clone, follow a moving branch, pin a tag, reject unknown refs", { skip: !hasGit }, (t) => {
   const env = envFor(t)

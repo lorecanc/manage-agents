@@ -3,7 +3,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import test, { type TestContext } from "node:test"
-import { bridgePack, prepareBridgeWorkspace } from "./bridgeWorkspace.js"
+import { bridgeConfirmationsNeeded, bridgePack, prepareBridgeWorkspace, resolveBridgeWorkspaceTrust } from "./bridgeWorkspace.js"
 import { DEFAULT_TRANSLATION_CONFIG, type TranslationConfig } from "./translationConfig.js"
 
 const manifest = (name: string, requires: Record<string, string> = {}) =>
@@ -48,6 +48,17 @@ function tempDir(t: TestContext, prefix: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix))
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   return dir
+}
+
+function writeSourceRegistry(
+  t: TestContext,
+  sources: Array<{ name: string; kind: "local"; path: string; trusted: boolean }>
+): NodeJS.ProcessEnv {
+  const configHome = tempDir(t, "bridge-workspace-config-")
+  const engineConfig = path.join(configHome, "manage-agents")
+  fs.mkdirSync(engineConfig, { recursive: true })
+  fs.writeFileSync(path.join(engineConfig, "sources.json"), JSON.stringify({ schemaVersion: 1, sources, prefer: {} }))
+  return { ...process.env, XDG_CONFIG_HOME: configHome }
 }
 
 function listFiles(root: string): string[] {
@@ -138,6 +149,53 @@ test("bridgePack mirrors the Claude plugin into an output directory outside the 
   assert.match(readme, /tools\/lib\/lib_tool\.ts/)
   assert.match(readme, /claude plugin validate '\.\/app-plugin' --strict/)
   assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(path.join(outputDir, ".mcp.json"), "utf8")).mcpServers), ["shared", "lib-only"])
+})
+
+test("bridgePack refuses untrusted executable packs without creating the output directory", (t) => {
+  const catalog = writeCatalog(t)
+  const outputDir = path.join(tempDir(t, "bridge-workspace-untrusted-out-"), "app-plugin")
+
+  assert.throws(() => bridgePack({ workspaceRoot: catalog, pack: "app", target: "claude", outputDir, config, pluginName: "app-plugin", prefix: "app-", trusted: false }), /Refusing to bridge untrusted pack 'app' with executable content without confirmation \(--yes\)/)
+  assert.equal(fs.existsSync(outputDir), false)
+})
+
+test("bridgePack allows untrusted executable packs after explicit confirmation", (t) => {
+  const catalog = writeCatalog(t)
+  const outputDir = path.join(tempDir(t, "bridge-workspace-confirmed-out-"), "app-plugin")
+
+  bridgePack({ workspaceRoot: catalog, pack: "app", target: "claude", outputDir, config, pluginName: "app-plugin", prefix: "app-", trusted: false, allowUntrustedExecutable: true })
+
+  assert.ok(fs.existsSync(path.join(outputDir, "README.md")))
+})
+
+test("bridgePack does not require confirmation for an untrusted markdown-only pack", (t) => {
+  const catalog = writeCatalog(t, {
+    "packs/docs/opencode-pack.json": manifest("docs"),
+    "packs/docs/agents/docs-agent.md": agent("Documentation helper"),
+    "packs/docs/README.md": "# docs\n"
+  })
+  const outputDir = path.join(tempDir(t, "bridge-workspace-markdown-out-"), "docs-plugin")
+
+  bridgePack({ workspaceRoot: catalog, pack: "docs", target: "claude", outputDir, config, pluginName: "docs-plugin", prefix: "docs-", trusted: false })
+
+  assert.ok(fs.existsSync(path.join(outputDir, "README.md")))
+})
+
+test("resolveBridgeWorkspaceTrust defaults unknown workspaces to untrusted and matches registered source roots", (t) => {
+  const unregistered = writeCatalog(t)
+  const untrusted = writeCatalog(t)
+  const trusted = writeCatalog(t)
+  const env = writeSourceRegistry(t, [
+    { name: "untrusted-local", kind: "local", path: untrusted, trusted: false },
+    { name: "trusted-local", kind: "local", path: trusted, trusted: true }
+  ])
+
+  assert.deepEqual(resolveBridgeWorkspaceTrust(unregistered, env), { trusted: false })
+  assert.deepEqual(resolveBridgeWorkspaceTrust(untrusted, env), { trusted: false, sourceName: "untrusted-local" })
+  assert.deepEqual(resolveBridgeWorkspaceTrust(path.join(trusted, "packs", "app"), env), { trusted: true, sourceName: "trusted-local" })
+  const confirmations = bridgeConfirmationsNeeded(untrusted, "app", false, "untrusted-local")
+  assert.ok(confirmations.length > 0)
+  assert.ok(confirmations.every(reason => /untrusted source 'untrusted-local' pack '.*' contains executable content/.test(reason)))
 })
 
 test("bridgePack leaves unchanged files untouched on regeneration", (t) => {

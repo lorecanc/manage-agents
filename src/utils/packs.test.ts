@@ -5,7 +5,7 @@ import path from "node:path"
 import test from "node:test"
 import { fileURLToPath } from "node:url"
 import { BASE_MANIFEST, makePack } from "../../test/helpers.js"
-import { MANIFEST_FILE, hasErrors, parseJsonc, validatePack, type PackValidation } from "./packs.js"
+import { MANIFEST_FILE, MAX_SCANNED_BYTES, hasErrors, parseJsonc, validatePack, type PackValidation } from "./packs.js"
 
 const CONTRACT_DIR = fileURLToPath(new URL("../../contract/", import.meta.url))
 
@@ -155,6 +155,54 @@ test("opencode.json: user keys rejected, references resolved, escaped or recorde
   const withRequires = validatePack(makePack(t, { "opencode.json": config, "plugins/present/index.ts": "", "resources/demo/rules.md": "" }, { requires: { base: "^1.0.0" } }))
   assert.deepEqual(withRequires.unresolved.map(ref => `${ref.kind} ${ref.target}`).sort(), ["file resources/demo/greet.txt", "plugin plugins/absent", "skill skills"])
   assert.equal(codes(validatePack(makePack(t, { "opencode.json": JSON.stringify({ plugins: ["./tools/demo"] }), "tools/demo/x.js": "" }))).join(), "plugin-path")
+})
+
+test("oversized manifests and pack configs are errors", (t) => {
+  const configRoot = makePack(t, { "opencode.json": " ".repeat(MAX_SCANNED_BYTES + 1) })
+  const config = validatePack(configRoot)
+  assert.ok(config.issues.some(issue => issue.level === "error" && issue.code === "file-too-large" && issue.path === "opencode.json"))
+  assert.equal(hasErrors(config), true)
+
+  const manifestRoot = makePack(t, {})
+  fs.writeFileSync(path.join(manifestRoot, MANIFEST_FILE), " ".repeat(MAX_SCANNED_BYTES + 1))
+  const manifest = validatePack(manifestRoot)
+  assert.ok(manifest.issues.some(issue => issue.level === "error" && issue.code === "file-too-large" && issue.path === MANIFEST_FILE))
+  assert.equal(hasErrors(manifest), true)
+})
+
+test("control characters are rejected in resource paths and config identifiers or executable strings", (t) => {
+  const paths = validatePack(makePack(t, {
+    "agents/tainted\u0001.md": "agent",
+    "commands/tainted\u001b.md": "command",
+  }))
+  assert.deepEqual(paths.issues.filter(issue => issue.code === "invalid-path").map(issue => `${issue.level} ${issue.path}`).sort(), ["error agents/tainted\u0001.md", "error commands/tainted\u001b.md"])
+  assert.deepEqual(paths.ids.agents, [])
+  assert.deepEqual(paths.ids.commands, [])
+  assert.deepEqual(paths.agents, [])
+  assert.equal(hasErrors(paths), true)
+
+  const config = validatePack(makePack(t, {
+    "opencode.json": JSON.stringify({
+      agents: { ["bad\u0001agent"]: {} },
+      commands: { ["bad\u001bcommand"]: {} },
+      plugins: ["bad\u0001plugin"],
+      instructions: ["notes\u001b.md"],
+      mcp: { servers: {
+        ["bad\u0001server"]: { type: "remote", url: "https://example.com" },
+        scalar: { type: "local", command: "run\u0001" },
+        array: { type: "local", command: ["run", "arg\u001b"] },
+      } },
+    }),
+  }))
+  const configErrors = config.issues.filter(issue => issue.level === "error" && issue.code === "config-invalid")
+  assert.ok(configErrors.length >= 7)
+  assert.equal(config.ids.agents.includes("bad\u0001agent"), false)
+  assert.equal(config.ids.commands.includes("bad\u001bcommand"), false)
+  assert.equal(config.agents.some(agent => agent.id === "bad\u0001agent"), false)
+  assert.equal(config.ids.mcpServers.includes("bad\u0001server"), false)
+  assert.equal(config.executable.pluginPackages.length, 0)
+  assert.equal(config.executable.externalCommands.length, 0)
+  assert.equal(hasErrors(config), true)
 })
 
 test("code imports: relative imports checked, escapes rejected, foreign packages warned", (t) => {

@@ -6,8 +6,10 @@ import { bridgeToClaudeCode, type BridgeResult } from "./bridge.js"
 import { packDir, packsDir, resolvePackClosure } from "./catalog.js"
 import { bridgeToCodex, type CodexBridgeResult } from "./codexBridge.js"
 import { readMcpServers } from "./opencodeMcp.js"
-import { hasErrors, installableFiles, parseJsonc, validatePack } from "./packs.js"
+import { hasErrors, installableFiles, MAX_SCANNED_BYTES, parseJsonc, validatePack } from "./packs.js"
 import { isPathInsideWorkspace } from "./pathValidation.js"
+import { describeExecutable } from "./resolver.js"
+import { loadSources, sourceRoot } from "./sources.js"
 import type { TranslationConfig } from "./translationConfig.js"
 
 export type BridgeTarget = "claude" | "codex"
@@ -17,6 +19,8 @@ export interface BridgeWorkspace {
   root: string
   /** Agents of the requested pack only, parsed from `root`. */
   agents: AgentInfo[]
+  /** Executable content contributed by each pack in the resolved closure. */
+  executable: Array<{ pack: string; items: string[] }>
   cleanup(): void
 }
 
@@ -30,6 +34,8 @@ export interface BridgePackOptions {
   config: TranslationConfig
   pluginName: string
   prefix: string
+  trusted?: boolean
+  allowUntrustedExecutable?: boolean
 }
 
 const SKIPPED_SEGMENTS = new Set(["node_modules", "__pycache__"])
@@ -48,7 +54,9 @@ function requirePackDir(workspaceRoot: string, pack: string): string {
 function readPackConfig(root: string): Record<string, any> {
   const file = CONFIG_FILES.map(name => path.join(root, name)).find(candidate => fs.existsSync(candidate))
   if (!file) return {}
-  const parsed = parseJsonc(fs.readFileSync(file, "utf-8"))
+  const contents = fs.readFileSync(file)
+  if (contents.byteLength > MAX_SCANNED_BYTES) throw new Error(`${file}: larger than ${MAX_SCANNED_BYTES} bytes`)
+  const parsed = parseJsonc(contents.toString("utf-8"))
   return isPlainObject(parsed) ? parsed : {}
 }
 
@@ -61,6 +69,7 @@ export function prepareBridgeWorkspace(workspaceRoot: string, pack: string): Bri
     const servers: Record<string, unknown> = {}
     const lsp: Record<string, unknown> = {}
     const owners = new Map<string, string>()
+    const executable: Array<{ pack: string; items: string[] }> = []
     let agentFiles: string[] = []
     for (const name of closure) {
       const source = requirePackDir(workspaceRoot, name)
@@ -69,6 +78,8 @@ export function prepareBridgeWorkspace(workspaceRoot: string, pack: string): Bri
         const errors = validation.issues.filter(issue => issue.level === "error")
         throw new Error(`Pack '${name}' is invalid: ${errors.map(issue => `${issue.path ? `${issue.path}: ` : ""}${issue.message}`).join("; ")}`)
       }
+      const executableItems = describeExecutable(validation)
+      if (executableItems.length > 0) executable.push({ pack: name, items: executableItems })
       const files = installableFiles(validation)
         .filter(file => file.includes("/") && !file.split("/").some(segment => SKIPPED_SEGMENTS.has(segment)))
       for (const file of files) {
@@ -89,11 +100,51 @@ export function prepareBridgeWorkspace(workspaceRoot: string, pack: string): Bri
       .map(file => parseAgentFile(path.join(root, file), root))
       .filter((agent): agent is AgentInfo => agent !== null)
     for (const agent of agents) agent.category = pack
-    return { root, agents, cleanup }
+    return { root, agents, executable, cleanup }
   } catch (error) {
     cleanup()
     throw error
   }
+}
+
+export function inspectBridgeExecutableSurface(workspaceRoot: string, pack: string): Array<{ pack: string; items: string[] }> {
+  const workspace = prepareBridgeWorkspace(workspaceRoot, pack)
+  try {
+    return workspace.executable
+  } finally {
+    workspace.cleanup()
+  }
+}
+
+export function bridgeConfirmationsNeeded(workspaceRoot: string, pack: string, trusted: boolean, sourceLabel?: string): string[] {
+  if (trusted) return []
+  return inspectBridgeExecutableSurface(workspaceRoot, pack).map(entry =>
+    `untrusted${sourceLabel ? ` source '${sourceLabel}'` : ""} pack '${entry.pack}' contains executable content (${entry.items.join(", ")})`
+  )
+}
+
+function realPathOrResolved(dir: string): string {
+  try {
+    return fs.realpathSync(dir)
+  } catch {
+    return path.resolve(dir)
+  }
+}
+
+function isSameOrInside(parent: string, candidate: string): boolean {
+  const relative = path.relative(parent, candidate)
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+}
+
+export function resolveBridgeWorkspaceTrust(workspaceRoot: string, env: NodeJS.ProcessEnv = process.env): { trusted: boolean; sourceName?: string } {
+  const realWorkspace = realPathOrResolved(workspaceRoot)
+  const sources = loadSources(env).sources
+  const matches = sources
+    .map(source => ({ source, root: realPathOrResolved(sourceRoot(source, env)) }))
+    .filter(({ root }) => isSameOrInside(root, realWorkspace))
+    .sort((a, b) => b.root.length - a.root.length)
+  const matched = matches[0]?.source
+  return matched ? { trusted: matched.trusted, sourceName: matched.name } : { trusted: false }
 }
 
 /**
@@ -109,6 +160,9 @@ export function withGeneratedPackBridge<T>(
   const workspaceRoot = path.resolve(options.workspaceRoot)
   const workspace = prepareBridgeWorkspace(workspaceRoot, pack)
   try {
+    if (options.trusted === false && !options.allowUntrustedExecutable && workspace.executable.length > 0) {
+      throw new Error(`Refusing to bridge untrusted pack '${pack}' with executable content without confirmation (--yes): ${workspace.executable.map(entry => `${entry.pack} (${entry.items.join(", ")})`).join("; ")}`)
+    }
     if (workspace.agents.length === 0) throw new Error(`Pack '${pack}' has no agents to bridge`)
     const resolvedOutput = path.resolve(outputDir)
     const relative = isPathInsideWorkspace(workspaceRoot, resolvedOutput) ? path.relative(workspaceRoot, resolvedOutput) : path.basename(resolvedOutput)

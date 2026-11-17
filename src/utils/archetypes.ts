@@ -219,44 +219,96 @@ export function callersLabel(view: { callers: ArchetypeAgent[] }): string {
   return names.length > 1 ? `${names.slice(0, -1).join(", ")} or ${names[names.length - 1]}` : names[0]
 }
 
-function collectStaticDenials(agentInfos: AgentInfo[]): { tools: Set<string>; delegations: Set<string> } {
-  const tools = new Set<string>()
+interface StaticDenialPolicy {
+  denyAllByDefault: boolean
+  explicitlyAllowed: Set<string>
+  explicitlyDenied: Set<string>
+}
+
+function isToolStaticallyDenied(policy: StaticDenialPolicy, toolKey: string): boolean {
+  return policy.denyAllByDefault
+    ? !policy.explicitlyAllowed.has(toolKey)
+    : policy.explicitlyDenied.has(toolKey)
+}
+
+function collectStaticDenials(agentInfos: AgentInfo[]): { toolPolicies: StaticDenialPolicy[]; delegations: Set<string> } {
+  const toolPolicies: StaticDenialPolicy[] = []
   const delegations = new Set<string>()
   const isPlain = (v: unknown): v is Record<string, any> => typeof v === "object" && v !== null && !Array.isArray(v)
-  for (const agent of agentInfos) {
-    const fm = agent.frontmatter ?? {}
-    // V2 array permissions: [{ action, resource, effect: "deny" }]
-    if (Array.isArray(fm.permissions)) {
-      for (const rule of fm.permissions) {
-        if (!isPlain(rule) || rule.effect !== "deny" || typeof rule.action !== "string") continue
-        if (rule.action === "subagent" || rule.action === "task") {
-          if (typeof rule.resource === "string") delegations.add(rule.resource)
-        } else if (rule.resource === "*" || rule.resource === undefined) {
-          tools.add(rule.action)
-        }
-      }
-    } else if (isPlain(fm.permissions)) {
-      for (const [key, val] of Object.entries(fm.permissions)) {
-        if (val === "deny" || val === false) tools.add(key)
-        else if ((key === "subagent" || key === "task") && isPlain(val)) {
-          for (const [sub, subVal] of Object.entries(val)) if (subVal === "deny" || subVal === false) delegations.add(sub)
-        }
-      }
-    }
-    if (isPlain(fm.permission)) {
-      for (const [key, val] of Object.entries(fm.permission)) {
-        if (val === "deny" || val === false) {
-          tools.add(key)
-          if (key === "shell") tools.add("bash")
-          if (key === "bash") tools.add("shell")
-        }
-        else if ((key === "subagent" || key === "task") && isPlain(val)) {
-          for (const [sub, subVal] of Object.entries(val)) if (subVal === "deny" || subVal === false) delegations.add(sub)
-        }
+  const toolAliases = (rawKey: string): string[] => {
+    const aliases = new Set([rawKey])
+    if (rawKey === "shell") aliases.add("bash")
+    if (rawKey === "bash") aliases.add("shell")
+    if (rawKey === "edit") aliases.add("write")
+    return [...aliases]
+  }
+  const setToolEffect = (policy: StaticDenialPolicy, rawKey: string, effect: "allow" | "deny") => {
+    for (const key of toolAliases(rawKey)) {
+      if (effect === "allow") {
+        policy.explicitlyAllowed.add(key)
+        policy.explicitlyDenied.delete(key)
+      } else {
+        policy.explicitlyDenied.add(key)
+        policy.explicitlyAllowed.delete(key)
       }
     }
   }
-  return { tools, delegations }
+  const hasAllowPattern = (value: Record<string, any>) =>
+    Object.values(value).some(pattern => pattern === "allow" || pattern === true)
+  const hasDefaultDenyPattern = (value: Record<string, any>) =>
+    (value["*"] === "deny" || value["*"] === false) && !hasAllowPattern(value)
+  const applyV1Permissions = (policy: StaticDenialPolicy, permissions: Record<string, any>) => {
+    const starVal = permissions["*"]
+    if (starVal === "deny" || starVal === false || (isPlain(starVal) && hasDefaultDenyPattern(starVal))) {
+      policy.denyAllByDefault = true
+      policy.explicitlyAllowed.clear()
+      policy.explicitlyDenied.clear()
+    } else if (starVal === "allow" || starVal === true) {
+      policy.denyAllByDefault = false
+      policy.explicitlyAllowed.clear()
+      policy.explicitlyDenied.clear()
+    }
+
+    for (const [key, val] of Object.entries(permissions)) {
+      if (key === "*") continue
+      if ((key === "subagent" || key === "task") && isPlain(val)) {
+        for (const [sub, subVal] of Object.entries(val)) if (subVal === "deny" || subVal === false) delegations.add(sub)
+      } else if (val === "allow" || val === true || (isPlain(val) && hasAllowPattern(val))) {
+        setToolEffect(policy, key, "allow")
+      } else if (val === "deny" || val === false || (isPlain(val) && hasDefaultDenyPattern(val))) {
+        setToolEffect(policy, key, "deny")
+      }
+    }
+  }
+  for (const agent of agentInfos) {
+    const fm = agent.frontmatter ?? {}
+    const policy: StaticDenialPolicy = {
+      denyAllByDefault: false,
+      explicitlyAllowed: new Set<string>(),
+      explicitlyDenied: new Set<string>(),
+    }
+    // V2 array permissions: [{ action, resource, effect: "deny" }]
+    if (Array.isArray(fm.permissions)) {
+      for (const rule of fm.permissions) {
+        if (!isPlain(rule) || !["deny", "allow"].includes(rule.effect) || typeof rule.action !== "string") continue
+        if (rule.action === "subagent" || rule.action === "task") {
+          if (rule.effect === "deny" && typeof rule.resource === "string") delegations.add(rule.resource)
+        } else if (rule.action === "*" && (rule.resource === "*" || rule.resource === undefined)) {
+          policy.denyAllByDefault = rule.effect === "deny"
+          policy.explicitlyAllowed.clear()
+          policy.explicitlyDenied.clear()
+        } else if (rule.action !== "*") {
+          if (rule.effect === "allow") setToolEffect(policy, rule.action, "allow")
+          else if (rule.resource === "*" || rule.resource === undefined) setToolEffect(policy, rule.action, "deny")
+        }
+      }
+    } else if (isPlain(fm.permissions)) {
+      applyV1Permissions(policy, fm.permissions)
+    }
+    if (isPlain(fm.permission)) applyV1Permissions(policy, fm.permission)
+    toolPolicies.push(policy)
+  }
+  return { toolPolicies, delegations }
 }
 
 const BUILTIN_FLOW_TOOLS: Array<{ key: string; label: string }> = [
@@ -330,13 +382,14 @@ export function describePackFlows(
   const routableNames = new Set(related.map(a => a.name))
 
   const callerInfos = allEntries.filter(e => chosenCallerIds.includes(e.item.name)).map(e => e.info)
-  const { tools: staticDeniedTools, delegations: staticDeniedDelegations } = collectStaticDenials(callerInfos)
+  const { toolPolicies, delegations: staticDeniedDelegations } = collectStaticDenials(callerInfos)
+  const isDeniedByCaller = (toolKey: string) => toolPolicies.some(policy => isToolStaticallyDenied(policy, toolKey))
 
   const availableTools: FlowResourceOption[] = BUILTIN_FLOW_TOOLS.map(tool => ({
     key: tool.key,
     label: tool.label,
     group: "builtin",
-    staticallyDeniedByCaller: staticDeniedTools.has(tool.key) || staticDeniedTools.has("*"),
+    staticallyDeniedByCaller: isDeniedByCaller(tool.key),
   }))
   const seenKeys = new Set(availableTools.map(item => item.key))
   if (callerInfos[0]) {
@@ -349,13 +402,19 @@ export function describePackFlows(
           key: item.permissionKey,
           label: item.kind === "mcp" ? `${item.permissionKey} (MCP server)` : item.name,
           group: item.kind === "mcp" ? "mcp" : item.kind === "tool-family" ? "tool-family" : "tool",
-          staticallyDeniedByCaller: staticDeniedTools.has(item.permissionKey) || staticDeniedTools.has("*"),
+          staticallyDeniedByCaller: isDeniedByCaller(item.permissionKey),
         })
       }
     } catch {
       /* optional resource catalog */
     }
   }
+  const staticDeniedTools = new Set<string>()
+  for (const policy of toolPolicies) {
+    for (const key of policy.explicitlyDenied) staticDeniedTools.add(key)
+    if (policy.denyAllByDefault && policy.explicitlyAllowed.size === 0) staticDeniedTools.add("*")
+  }
+  for (const tool of availableTools) if (tool.staticallyDeniedByCaller) staticDeniedTools.add(tool.key)
 
   // Build unified flows: first merged routes, then pack flowDefaults, then user $rules
   const flows: UnifiedFlowItem[] = []

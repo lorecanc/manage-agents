@@ -79,11 +79,20 @@ test("translatePermissionsV1ToV2 lifts the global V1 wildcard to the first rule"
 
 test("translatePermissionsV2ToV1 restores the global wildcard as the first key", () => {
   const v1 = translatePermissionsV2ToV1([
-    { action: "read", resource: "*", effect: "allow" },
     { action: "*", resource: "*", effect: "deny" },
+    { action: "read", resource: "*", effect: "allow" },
   ])
   assert.deepEqual(v1, { "*": "deny", read: "allow" })
   assert.deepEqual(Object.keys(v1), ["*", "read"])
+})
+
+test("translatePermissionsV2ToV1 drops rules superseded by a trailing global wildcard", () => {
+  const v1 = translatePermissionsV2ToV1([
+    { action: "read", resource: "*", effect: "allow" },
+    { action: "*", resource: "*", effect: "deny" },
+  ])
+
+  assert.deepEqual(v1, { "*": "deny" })
 })
 
 test("global wildcard translation is idempotent and never duplicated", () => {
