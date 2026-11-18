@@ -7,8 +7,10 @@ source_files:
   - "src/utils/userSettings.ts"
   - "src/utils/sourceCustomization.ts"
   - "src/utils/values.ts"
+  - "src/App.tsx"
+  - "src/ui/PackFlowsModal.tsx"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-18"
 ---
 
 # Archetypes, Conditional Flows & User Settings
@@ -27,6 +29,8 @@ During [target reconciliation](./target-installer.md), these layers are compiled
 | `src/utils/userSettings.ts` | Loads, validates, prunes, and saves scoped `routing.json` and `overrides.json` files; patches Markdown frontmatter; compiles `RuntimeRouting` for `manage-agents-router`. |
 | `src/utils/sourceCustomization.ts` | Intercepts TUI/CLI edits on read-only sources via `runWithOverrideWriter`, persists minimal frontmatter diffs and user flows under lock, and triggers automatic target reconciliation. |
 | `src/utils/values.ts` | Provides prototype-safe property accessors (`own`, `setOwn`, `ownChild`), model/trigger regex validators, and `validateConditionalRule()`. |
+| `src/App.tsx` | Connects the TUI flow workspace and pack-folder action to settings-backed flow inspection, editing, export, and reconciliation. |
+| `src/ui/PackFlowsModal.tsx` | Renders the flow list, caller chooser, model editor, and tool, permission, and delegation policy subviews. |
 
 ## Module Dependencies
 
@@ -44,7 +48,7 @@ graph LR
     US -.->|"generates routing.json (v2)"| RT["manage-agents-router"]
 ```
 
-- **Internal consumers**: [`src/index.tsx`](../api/cli-reference.md) (`models` and `override` CLI subcommands), `src/App.tsx` ([TUI flow editor](../components/workspaces-flows-and-sources.md) and [agent frontmatter modals](../components/authoring-and-bridge-modals.md)), and [`src/utils/installer.ts`](./target-installer.md) (target staging and router plugin installation).
+- **Internal consumers**: [`src/index.tsx`](../api/cli-reference.md) (`models` and `override` CLI subcommands), `src/App.tsx` (the [TUI flow editor](../components/workspaces-flows-and-sources.md), opened from the Flows workspace or with `M` on a focused configurable pack folder, and [agent frontmatter modals](../components/authoring-and-bridge-modals.md)), and [`src/utils/installer.ts`](./target-installer.md) (target staging and router plugin installation).
 - **External packages**: Node built-ins (`node:fs`, `node:path`, `node:util`) and [`yaml`](../dependencies/runtime-and-tooling-stack.md) for lossless frontmatter serialization.
 
 ---
@@ -55,13 +59,15 @@ Historically, `describeArchetype()` and `setArchetypeConfig()` operated only on 
 
 ### Caller Resolution & Agent Partitioning
 
-When `describePackFlows(workspaceRoot, id, options)` inspects a pack, it discovers all `agents/*.md` files (or loose `.md` agent files via `scanLooseAgentFiles()` when no manifest exists) and determines active **caller** agents using a three-step fallback (`PackFlowsView["callerSource"]`):
+When `describePackFlows(workspaceRoot, id, options)` inspects a pack, it discovers all `agents/*.md` files (or loose `.md` agent files via `scanLooseAgentFiles()` when no manifest exists) and determines active **caller** agents using the selected non-empty source (`PackFlowsView["callerSource"]`):
 
-1. **`"user"`**: `options.userCallers` from `routing.json` (`$callers`), filtered to existing agents whose `mode !== "subagent"`.
-2. **`"manifest"`**: `manifest.archetype.callers` from `opencode-pack.json`, filtered to existing non-subagent entries.
+1. **`"user"`**: Non-empty `options.userCallers` from `routing.json` (`$callers`; configured target callers take precedence over global callers), filtered to existing agents whose `mode !== "subagent"`.
+2. **`"manifest"`**: If no non-empty user caller list was supplied, `manifest.archetype.callers` from `opencode-pack.json`, filtered to existing non-subagent entries.
 3. **`"inferred"`**: Explicit `mode === "primary"` agents first; otherwise any agent with `mode !== "subagent"`; otherwise the first discovered agent.
 
-During target reconciliation (`resolveEffectiveCallers()` and `inferPackCallers()` in `src/utils/userSettings.ts`), inference for packs without `manifest.archetype` activates only when user routes, `$rules`, or `flowDefaults` exist, and requires at least one subagent unless session-level rules (`then.tools` or `then.permissions`) are present.
+If the selected user or manifest caller list contains no discovered non-subagent after filtering, `describePackFlows()` falls back to inference rather than trying the next source. The UI's `callerCandidates` are non-subagent agents, or all discovered agents when none qualify.
+
+During target reconciliation, `resolveEffectiveCallers()` reads explicit `$callers` in target, global, then manifest scope. Without a non-empty explicit list, it infers callers only when user routes, user `$rules`, or manifest `flowDefaults` exist. `inferPackCallers()` normally requires at least one subagent; a rule with `then.tools` or `then.permissions` permits a single caller even without subagents.
 
 Once callers are selected, `describePackFlows()` classifies every discovered agent (`ArchetypeAgent`, with short role computed via `roleOfPackAgent(pack, agent)` by stripping any `<pack>-` prefix):
 
@@ -70,9 +76,15 @@ Once callers are selected, `describePackFlows()` classifies every discovered age
 - **`related`**: Routable subagents (`!agent.model`) whose models can be dynamically assigned by routes or rules.
 - **`pinned`**: Subagents with a fixed `model` string in their effective frontmatter; dynamic model routing skips them.
 
+### TUI Pack-Flow Editor
+
+`App.tsx` opens the editor only when `isConfigurablePack()` finds at least one agent, so the flow workflow is not restricted to packs with a manifest `archetype`; it also supports manifestless virtual `.md` folders. The `M` action on a focused pack folder and the Flows workspace both open `PackFlowsModal`.
+
+The modal presents the unified routes and rules, active caller source, pinned agents, and editors for model assignments plus tool, permission, and delegation policies. App handlers save caller or flow changes to user `routing.json` and request target reconciliation. Writable packs can initialize a missing manifest or export the configured flow view to `opencode-pack.json`; the export controls are hidden for read-only Git sources, which remain settings-backed.
+
 ### Static Denials & Resource Discovery
 
-`collectStaticDenials()` inspects caller frontmatter across both [OpenCode V2 permission arrays and V1 permission maps](./agent-editing-and-v2-compat.md) (`permissions: [{ action, resource, effect: "deny" }]` and `permissions` / `permission` objects, normalizing `shell` <-> `bash`) to compute:
+`collectStaticDenials()` inspects caller frontmatter across both [OpenCode V2 permission arrays and V1 permission maps](./agent-editing-and-v2-compat.md) (`permissions: [{ action, resource, effect: "deny" }]` and `permissions` / `permission` objects, normalizing `shell` <-> `bash` and `edit` -> `write`) to compute:
 
 - `staticDeniedTools`: Tools statically denied by caller frontmatter (`effect: "deny"` with `resource: "*"` or `undefined`).
 - `staticDeniedDelegations`: Subagents statically denied under `subagent` or `task` permission actions.

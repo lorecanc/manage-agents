@@ -11,7 +11,7 @@ source_files:
   - "src/utils/helpGuide.ts"
   - "src/utils/markdownLayout.ts"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-18"
 ---
 
 # Command Palette, Help & Markdown View
@@ -21,7 +21,7 @@ last_updated: "2026-11-13"
 These UI components and layout utilities provide keyboard- and mouse-driven command discovery, contextual shortcut hints, interactive reference documentation, and cell-exact Markdown rendering inside the [OpenTUI](../dependencies/runtime-and-tooling-stack.md) interface:
 
 - **`CommandPaletteModal` & `commandPalette.ts`** expose every [workspace switch](./workspaces-flows-and-sources.md), [agent mutation](../modules/agent-editing-and-v2-compat.md), [pack workflow](./authoring-and-bridge-modals.md), [target](../modules/target-installer.md)/[bridge](../modules/bridges.md) operation, and agent jump target through a global fuzzy search overlay (`Ctrl+K` / `Ctrl+P`), alongside a slim, context-aware shortcut chip bar in the TUI footer.
-- **`HelpModal` & `helpGuide.ts`** render a four-tab interactive shortcut and mouse guide (`?`) that adapts to terminal dimensions, prevents orphaned section headings during scrolling, and dispatches bound TUI actions directly from help rows.
+- **`HelpModal` & `helpGuide.ts`** render a four-tab interactive shortcut and mouse guide (`?`) that adapts to terminal dimensions, prevents orphaned section headings during scrolling, and routes clickable help rows through a parent-provided activation callback.
 - **`PromptMarkdownView`, `markdownLayout.ts` & `markdownStyle.ts`** sanitize, wrap, and render [untrusted](../concepts/security-and-trust-model.md) agent Markdown bodies (primarily in *[Inspector]* (see [Glossary](../glossary.md)) Tab `2` `Prompt` inside the [TUI Shell](./tui-shell-and-catalog.md)) into terminal-safe, grapheme- and CJK/emoji-width-accurate styled spans without overflowing narrow split panes.
 
 ```mermaid
@@ -36,7 +36,7 @@ graph TD
     Diff["OpenTUI <diff> Previews"] --> MS_Util["markdownStyle.ts (getMarkdownSyntaxStyle)"]
 ```
 
-Each visual component in `src/ui/` delegates pure scoring, pagination, and text-wrapping calculations to a companion module in `src/utils/`.
+The UI modules keep terminal presentation and mouse interaction callbacks in `src/ui/`, while their companion helpers in `src/utils/` own command filtering and shortcut generation, help content and viewport calculations, and Markdown layout. `markdownStyle.ts` is the exception: it lazily caches OpenTUI syntax colors for native diff rendering.
 
 ## Source Files
 
@@ -46,7 +46,7 @@ Each visual component in `src/ui/` delegates pure scoring, pagination, and text-
 | `src/utils/commandPalette.ts` | Multi-field fuzzy matcher (`filterPaletteCommands`) and contextual footer chip builder (`buildContextualShortcuts`) |
 | `src/ui/HelpModal.tsx` | Four-tab keyboard and mouse guide overlay with responsive chrome, orphan-heading guard, and clickable action rows |
 | `src/utils/helpGuide.ts` | Tab definitions (`HELP_TABS`), context-aware shortcut groups, viewport math, and scroll/focus clamping helpers |
-| `src/ui/PromptMarkdownView.tsx` | Virtualized OpenTUI Markdown viewer with styled inline spans, mouse-wheel scrolling, and fractional scroll progress bar |
+| `src/ui/PromptMarkdownView.tsx` | Viewport-sliced OpenTUI Markdown viewer with styled inline spans, mouse-wheel scrolling, and fractional scroll progress bar |
 | `src/utils/markdownLayout.ts` | Block and inline Markdown parser, GFM table/code-frame formatter, and grapheme cell-budget word wrapper |
 | `src/ui/markdownStyle.ts` | Singleton `@opentui/core` `SyntaxStyle` theme mapping used by unified `<diff>` previews |
 
@@ -57,6 +57,8 @@ Each visual component in `src/ui/` delegates pure scoring, pagination, and text-
 ### Opening, Navigation & Modal Chrome
 
 `CommandPaletteModal` (`src/ui/CommandPaletteModal.tsx`) can be toggled from any workspace via **`Ctrl+K`** or **`Ctrl+P`**, or by clicking the header `⌘K` badge or the footer `Ctrl+K Palette` pill. Pressing `Ctrl+K`, `Ctrl+P`, or `Esc` while the modal is open—or clicking outside the modal box—closes the overlay.
+
+The modal is a controlled view: its parent supplies the query, filtered command rows, focus and scroll state, and callbacks. It renders the results and handles row hover, row execution on click, wheel deltas (`±2`), and outside/close clicks; query entry, keyboard navigation, command availability, and action dispatch are coordinated outside the component. `filterPaletteCommands` performs the filtering and ranking, while `buildContextualShortcuts` builds the footer chips.
 
 Inside the modal:
 - Printable ASCII characters append to the live search query; `Backspace` deletes the last character and resets focus/scroll to index `0`.
@@ -160,6 +162,8 @@ Pressing **`?`** opens `HelpModal` (`src/ui/HelpModal.tsx`), automatically selec
 
 Users can switch tabs via number keys `1`–`4` (`helpTabByNumber`), `Tab` / `Shift+Tab`, `◀` / `▶` (`h` / `l`) via `cycleHelpTab`, or by clicking tab pills.
 
+Like the palette, `HelpModal` receives its active tab, prebuilt content, focus and scroll state, and callbacks as props. It renders the guide and handles clicks on tab pills and shortcut rows; the parent maps keyboard input to the tab helpers and activation callbacks. `helpGuide.ts` centralizes tab metadata, context-sensitive groups, flattened display rows, viewport sizing, and scroll/focus clamping.
+
 `calculateHelpViewport(termWidth, termHeight)` computes modal geometry with up to `TARGET_MAX_LIST_ROWS = 18` content rows and switches to `compactChrome` (`7` chrome rows instead of `9`) when `termHeight < 20`. Inside `HelpModal`, additional width thresholds progressively simplify chrome:
 - `innerWidth < 66`: switches tab pills from full `label` to `shortLabel`
 - `innerWidth < 72`: hides the `Tab / 1–4 ⇄` hint
@@ -213,7 +217,7 @@ Help rows are interactive launchers rather than read-only documentation:
 
 ### PromptMarkdownView & Syntax Styling
 
-`PromptMarkdownView` (`src/ui/PromptMarkdownView.tsx`) renders Markdown bodies inside fixed-width OpenTUI panes. In [`src/App.tsx`](./tui-shell-and-catalog.md), it powers:
+`PromptMarkdownView` (`src/ui/PromptMarkdownView.tsx`) renders Markdown bodies inside fixed-width OpenTUI panes. The view memoizes the layout returned by `layoutMarkdownDocument`, clamps the requested scroll offset, and renders only the visible row slice; parsing and reflow remain in the utility rather than the React component. In [`src/App.tsx`](./tui-shell-and-catalog.md), it powers:
 - **Inspector Tab `2` (`Prompt`)**: Renders the focused agent's system prompt body (extracted below YAML frontmatter via [`extractFrontmatter`](../modules/agent-editing-and-v2-compat.md)`(rawContent).body.trim()`) with mouse-wheel scrolling (`±3` lines) and a bottom progress footer.
 - **Compact previews (`showFooter={false}`)**: Renders agent `description` text in Inspector Tab `1` (`Info`) and pack descriptions when a pack folder is focused.
 

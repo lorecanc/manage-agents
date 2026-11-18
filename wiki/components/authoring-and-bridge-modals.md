@@ -8,8 +8,9 @@ source_files:
   - "src/ui/PackOnboardingModal.tsx"
   - "src/ui/BridgeModal.tsx"
   - "src/utils/bridgePrompt.ts"
+  - "src/utils/packOnboarding.ts"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-18"
 ---
 
 # Authoring, Tuning & Bridge Modals
@@ -25,6 +26,7 @@ The [OpenTUI](../dependencies/runtime-and-tooling-stack.md) modal suite in `src/
 | `src/ui/PackOnboardingModal.tsx` | Guided Contract `1.1` pack initialization wizard supporting `root` vs. `subpack` layouts and clone-and-onboard flows for read-only Git sources. |
 | `src/ui/BridgeModal.tsx` | Adaptive two-column/compact modal for configuring Claude Code and Codex model tiers, role mappings, and bridge plugin generation. |
 | `src/utils/bridgePrompt.ts` | Pure state, pack filtering, field stepping, draft validation, and live per-agent model resolution preview helpers backing `BridgeModal`. |
+| `src/utils/packOnboarding.ts` | Onboarding inspection and application, remote Git clone registration, Doctor findings and fixes, authoring-kit installation, version bumps, and safe resource scaffolding. |
 
 ---
 
@@ -106,7 +108,7 @@ If every option fits on one line within `safeMax`, a single row is returned. Oth
 ### Numeric `steps` Entry & Variant Prefix Typing
 
 Keyboard handling in `src/App.tsx` pairs with `ParameterTuningModal` for fast keyboard-only or mouse-assisted input:
-- **`steps` controls**: Typing digits `0–9` appends directly to the draft value (replacing `mixed` on first keystroke); `-`/`_` and `+`/`=` or `←`/`→` step by `±1` (`Shift+←/→` steps by `±10`); mouse pills apply `−5` and `+5`; `Backspace` deletes the last digit; `Delete` or `Ctrl+U` clears the input. When `cardInnerWidth >= 56` and not mixed, a 10-cell `gaugeBar(Math.min(1, parsedSteps / 100), 10)` visualizes the turn budget.
+- **`steps` controls**: Typing digits `0–9` appends directly to the draft value (replacing `mixed` on first keystroke); `-`/`_` and `+`/`=` or `←`/`→` step by `±1` (`Shift+←/→` steps by `±10`); mouse pills apply `−5` and `+5`; `Backspace` deletes the last digit; `Delete` or `Ctrl+U` clears the input. The modal displays the mouse `−5` / `+5` buttons only when `cardInnerWidth >= 34`; when width is at least `56` and the value is not untouched-mixed, a 10-cell `gaugeBar(Math.min(1, parsedSteps / 100), 10)` visualizes the turn budget.
 - **`variant` controls**: `←`/`→`/`Space` cycle through `variantChoices`; typing `[a-zA-Z0-9._-]` enters partial-variant typing mode, highlighting matching pills via `isPrefixMatch` (`opt.value.startsWith(variant)`) and snapping to the first/last prefix match on `←`/`→`; `Delete` or `Ctrl+U` resets to `""` (`default`).
 
 ### Saving to Local Files vs. Read-Only `overrides.json`
@@ -123,7 +125,7 @@ Defined in `src/ui/PackDoctorModal.tsx` and rendered when `viewMode === "pack-do
 
 ### Props & Sizing Helpers
 
-- `getDoctorModalHeight(termHeight)` clamps modal height between `14` and `26` rows depending on terminal height.
+- `getDoctorModalHeight(termHeight)` calculates a terminal-bounded height (normally `14`–`26` rows), using `Math.min(Math.max(14, termHeight - 2), Math.max(16, Math.min(26, termHeight - 4)))`.
 - `getDoctorMaxFindingRows(termHeight)` reserves `11` chrome rows and allocates `Math.max(2, modalHeight - 11)` scrollable lines for diagnostic findings.
 - `getScaffoldFieldOrder(kind)` returns `["kind", "id", "desc", "mode"]` when `kind === "agent"` and `["kind", "id", "desc"]` for `"skill"` or `"command"`.
 
@@ -143,14 +145,14 @@ Defined in `src/ui/PackDoctorModal.tsx` and rendered when `viewMode === "pack-do
 ### `Doctor` Tab (`[D] Contract Doctor`)
 
 The `Doctor` tab inspects `PackDoctorReport` produced by [`inspectPackDoctor`](../modules/pack-onboarding-and-doctor.md):
-- **Summary Header**: Displays `Contract <version>`, counts of validated `agents`, `skills`, and `commands`, and Authoring Kit presence (`✓ skill` / `○ skill` for `.opencode/skills/opencode-pack-authoring/SKILL.md` and `✓ CI` / `○ CI` for `.github/workflows/validate-pack.yml`).
+- **Summary Header**: Displays the manifest's contract value (or `?`), counts of validated `agents`, `skills`, and `commands`, and Authoring Kit presence (`✓ skill` / `○ skill` for `.opencode/skills/opencode-pack-authoring/SKILL.md` and `✓ CI` / `○ CI` for `.github/workflows/validate-pack.yml`). With no findings, the viewport reports that the pack satisfies Contract `1.1` with zero warnings or drift.
 - **Findings Viewport**: Scrollable via `↑`/`↓`, `j`/`k`, or mouse wheel (`onMouseScroll`). Findings render severity badges (`✗` red for `error`, `!` amber for `warning`, `◆` cyan for `suggestion`), issue code (`[<code>]`), file path, message, and an `[auto-fix]` suffix when `item.autoFixable` is `true`. Diagnostics cover strict `validatePack` Contract `1.1` errors/warnings alongside authoring checks:
   - Legacy [V1 agent frontmatter](../modules/agent-editing-and-v2-compat.md) keys (`agent-deprecated-key` and `agent-v1-frontmatter` detected via `detectFrontmatterVersion(parsed) === "v1"`).
-  - Manifest contract upgrades from `1.0` to `1.1` (`contract-upgrade`) for conditional [`flowDefaults`](../concepts/conditional-routing-and-archetypes.md) support.
-  - Missing `archetype` metadata when primary callers and subagents are present (`archetype-missing`), legacy directories (`legacy-directory`), unnamespaced files (`namespace`), disallowed `opencode.json` keys (`config-key`), and missing skill descriptions (`skill-description`).
+  - A `contract-upgrade` suggestion when the manifest says `1.0`, and an `archetype-missing` suggestion when primary callers and subagents exist but the manifest has no archetype.
+  - Validation findings such as legacy directories (`legacy-directory`), unnamespaced files (`namespace`), disallowed `opencode.json` keys (`config-key`), and missing skill descriptions (`skill-description`).
 - **Maintenance Actions**:
-  - **`[F] Auto-Fix (N)`**: Runs `fixPackDoctor`, automatically rewriting V1 agent frontmatter to V2, migrating legacy directories/namespaces, upgrading `"contract": "1.0"` to `"1.1"`, or populating inferred `archetype` metadata, then refreshes `report`.
-  - **`[A] Authoring Kit`**: Runs `installPackAuthoringKit`, installing the bundled `opencode-pack-authoring` skill and GitHub Actions pack validation workflow.
+  - **`[F] Auto-Fix (N)`**: Runs `fixPackDoctor` and refreshes the report. Repairs include moving legacy resources into canonical directories, upgrading V1 agent frontmatter, adding missing skill descriptions, namespacing files, backing up and stripping user-only `opencode.json(c)` keys, upgrading a `1.0` manifest, and inferring a missing archetype when possible.
+  - **`[A] Authoring Kit`**: Runs `installPackAuthoringKit`, which installs the bundled `opencode-pack-authoring` skill, adds the GitHub Actions validation workflow if absent, and creates a starter `README.md` if the pack has no README.
   - **`[1] +patch` · `[2] +minor` · `[3] +major`**: Header pills (and number keys `1`, `2`, `3`) invoke `bumpPackVersion` to increment `version` in `opencode-pack.json`.
 
 ### `Scaffold` Tab (`[N] New Agent / Skill / Cmd`)
@@ -160,9 +162,9 @@ Pressing `N` in the `Doctor` tab (or clicking `[N] New Agent / Skill / Cmd`) swi
   - `agent` → `agents/<id>.md`
   - `skill` → `skills/<id>/SKILL.md`
   - `command` → `commands/<id>.md`
-- `Tab` / `Shift+Tab` / `↑` / `↓` step through `getScaffoldFieldOrder(scaffoldKind)`.
+- `Tab` / `Shift+Tab` / `↑` / `↓` step through `getScaffoldFieldOrder(scaffoldKind)`; the `mode` field is present only for agents.
 - `Space` / `←` / `→` cycle `Resource` (`agent`, `skill`, `command`) and `Agent Mode` (`subagent`, `primary`, `all`), while `D` on non-text fields returns to the `Doctor` tab.
-- `ID / Slug` accepts `[a-zA-Z0-9._/-]` characters; `Description` accepts printable ASCII; `Enter` calls `scaffoldPackResource`, reloads catalog data, re-runs `inspectPackDoctor`, and shows `✓ Created <relativePath>`.
+- `Enter` calls `scaffoldPackResource`. The helper removes a trailing `.md` and surrounding slashes from the ID, then validates it as path segments of letters, digits, `.`, `_`, or `-` (no `..`), refuses to overwrite an existing or case-fold-colliding resource, writes the V2 agent, skill, or command starter, and returns a fresh pack validation. The parent refreshes catalog data and the Doctor report and shows `✓ Created <relativePath>`.
 
 ---
 
@@ -173,8 +175,8 @@ Defined in `src/ui/PackOnboardingModal.tsx` and rendered when `viewMode === "pac
 ### Discovery Banner & Context Line
 
 At the top of the modal, `PackOnboardingModal` summarizes the [`OnboardingInspection`](../modules/pack-onboarding-and-doctor.md) scan of the target directory:
-- **Discovery banner**: Lists discovered agent count (plus `(N V1->V2)` when V1 frontmatter agents are detected), skill count, command count, `.opencode/` presence, count of user-level keys to strip from `opencode.json`, and any `inferredArchetype.reference`.
-- **Context line**: Explains whether onboarding will clone a remote Git source (`Remote Git (<label>): clones locally & switches active source`), isolate pack files inside a mixed software project (`Mixed repo (<files>): packs/<name>/ keeps project root clean`), or initialize the local workspace directly.
+- **Discovery banner**: Lists discovered agent count (plus `(N V1->V2)` when V1 frontmatter agents are detected), non-zero skill and command counts, `.opencode/` presence, the number of user-level config keys found, and any `inferredArchetype.reference`.
+- **Context line**: Explains whether onboarding will clone a remote Git source (`Remote Git (<label>): clones locally & switches active source`), isolate pack files inside a mixed software project (`Mixed repo (<first files>): packs/<name>/ keeps project root clean`), or initialize the local workspace directly. The modal uses a compact layout below 28 terminal rows.
 
 ### Props & Field Order (`getOnboardingFieldOrder`)
 
@@ -194,9 +196,11 @@ export function getOnboardingFieldOrder(isRemoteGit: boolean): OnboardingField[]
 | `name` | Slug input | Lowercase `[a-z0-9-]` pack slug (capped at 64 chars), defaulting to `derivePackSlug`. |
 | `version` | Semver input | Initial pack version string (e.g., `0.1.0`, spaces rejected). |
 | `desc` | Text input | Human-readable `description` written to `opencode-pack.json`. |
-| `layout` | Toggle pills (`Pack Root`) | Chooses `"root"` (`Root ./`) vs. `"subpack"` (`packs/<slug>/`). Appends `(auto)` to `inspection.recommendedLayout` (`"subpack"` is recommended automatically when application markers such as `package.json`, `Cargo.toml`, or `src/` are detected at root). |
-| `organize` | Toggle pills (`Normalize`) | `"V2 + agents/ + archetype"` (`true`) vs. `"Keep in place"` (`false`). When enabled, `applyPackOnboarding` upgrades V1 frontmatter to V2, moves loose agents/skills/commands into canonical `agents/`, `skills/`, and `commands/` directories, backs up non-pack user keys from `opencode.json` into `.opencode/opencode.user-backup.json`, namespaces non-native root directories under `<dir>/<name>/`, and writes inferred `archetype` metadata. |
-| `kit` | Toggle pills (`Author Kit`) | `".opencode skill + CI"` (`true`) vs. `"Skip"` (`false`); installs `.opencode/skills/opencode-pack-authoring/SKILL.md` and `.github/workflows/validate-pack.yml`. |
+| `layout` | Toggle pills (`Pack Root`) | Chooses `"root"` (`Root ./`) vs. `"subpack"` (`packs/<slug>/`). Appends `(auto)` to `inspection.recommendedLayout`; a subpack is recommended for application markers (such as `package.json`, `Cargo.toml`, or `src/`) and mixed top-level project files. |
+| `organize` | Toggle pills (`Normalize`) | `"V2 + agents/ + archetype"` (`true`) vs. `"Keep in place"` (`false`). When enabled, `applyPackOnboarding` upgrades V1/mode-directory agents to V2 as needed and moves loose agents, skills, commands, and recognized config/resources into canonical locations. For a root layout it also namespaces non-native resource directories under `<dir>/<name>/`; it infers archetype metadata when primary and subagent roles are present. Non-pack keys are backed up to `.opencode/opencode.user-backup.json` (with that file added to `.opencode/.gitignore`) when the config is being converted into pack config. |
+| `kit` | Toggle pills (`Author Kit`) | `".opencode skill + CI"` (`true`) vs. `"Skip"` (`false`); installs `.opencode/skills/opencode-pack-authoring/SKILL.md`, adds `.github/workflows/validate-pack.yml` if missing, and creates a starter `README.md` only when the pack has no README. |
+
+`applyPackOnboarding` refuses a workspace that already contains a pack manifest or has no Markdown agents. With `organize: false`, only the root layout is allowed and all discovered agents must already be under `agents/`; otherwise the helper reports why onboarding cannot proceed. Organizing a mixed application repository at the root is also rejected when application markers would be affected, so select the subpack layout to keep those files outside the pack.
 
 ### Local Onboarding vs. Remote Git Clone-and-Onboard
 
@@ -231,6 +235,7 @@ Pack selection helpers in `src/utils/bridgePrompt.ts`:
 - `collectBridgeablePacks(agents, isPackValid)` counts agents per category, filters valid packs, and sorts `"general"` last via `comparePackCategories`.
 - `resolveInitialBridgePack` pre-selects the currently focused [catalog](./tui-shell-and-catalog.md)/[flows](./workspaces-flows-and-sources.md) pack when opening the modal (marking it `· current`).
 - When `focusedField === "pack"`, the pack row switches into a live filter `<input>` backed by `reconcileBridgePackQuery` (preserving the current selection if it still matches `packQuery`) and `stepBridgePackSelection` (`↑`/`↓` cyclic scrolling with `clampListScroll`).
+- Search is case-insensitive; when the current choice is unavailable, the first filtered pack is selected. If there is no focused pack, `resolveInitialBridgePack` starts with the first available pack.
 
 ### Inline Tier Editing (`planning`, `execution`, `light`)
 
@@ -256,7 +261,7 @@ const draftConfig = applyBridgeDraftToConfig(baseConfig ?? DEFAULT_TRANSLATION_C
 const index = buildInferenceIndex(packAgents, draftConfig)
 ```
 
-For each agent in `selectedPack`, `resolveModelTarget(agent, index, draftConfig, target)` resolves its role, effective tier, target model (plus `:reasoningEffort` on Codex), and provenance source. `BridgeModal` renders each row as:
+For agents in `selectedPack` (sorted by filename), `resolveModelTarget(agent, index, draftConfig, target)` resolves the role, effective tier, target model (plus `:reasoningEffort` on Codex), and provenance source. The pack prefix is removed from the displayed filename only when that filename begins with the derived `<pack>-` prefix. `BridgeModal` renders each row as:
 
 ```text
   <strippedName>                        [<tier>] → <model(:effort)> <srcTag>

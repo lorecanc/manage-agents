@@ -1,15 +1,16 @@
 ---
 title: "Runtime & Tooling Dependencies"
-description: "External npm packages, esbuild bundling externals, Node FFI/Bun runtime requirements, and optional host CLI integrations"
+description: "Runtime requirements, npm package contents, build and test dependencies, CI, release tooling, and optional host CLI integrations"
 category: "dependencies"
 source_files:
   - "package.json"
   - "manage-agents.mjs"
+  - ".github/workflows/ci.yml"
   - "src/build.mjs"
   - "tsconfig.json"
   - "runtime/plugins/manage-agents-router/index.ts"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-17"
 ---
 
 # Runtime & Tooling Dependencies
@@ -39,12 +40,22 @@ OpenTUI (`@opentui/core`) renders terminal frames through a native Zig core load
 
 On Windows (`process.platform === "win32"`), `manage-agents.mjs` also runs `chcp 65001` best-effort before booting to pin the console codepage to UTF-8 as a fallback alongside OpenTUI's `WriteConsoleW` output path.
 
+## Package Entry Point & Published Files
+
+`package.json` identifies the package as `manage-agents` version `1.0.0`, declares native ESM with `"type": "module"`, points `main` to `dist/index.js`, and exposes `./manage-agents.mjs` as the `manage-agents` executable. Its `files` allowlist explicitly names:
+
+- `manage-agents.mjs` and `dist`
+- `assets/plugin-icon.png`, `contract`, and `runtime`
+- `README.md`, `GUIDA.md`, and `LICENSE`
+
+The allowlist does not include `src/`. The launcher therefore treats the bundled `dist/index.js` as the runnable entry point for a published package, while a source checkout can rebuild from `src/` (see [Launcher, Build & Self-Update](../modules/launcher-and-build.md)). This describes the manifest's `files` field; it does not infer extra package contents or transitive dependencies.
+
 ### Launcher Bootstrap & Auto-Rebuild
 
 Before importing `./dist/index.js`, `manage-agents.mjs` (detailed in [Launcher, Build & Self-Update](../modules/launcher-and-build.md)) performs two preflight checks when running from a source checkout (or when `package-lock.json` is present):
 
-1. **Dependency verification**: Compares installed `node_modules/<pkg>/package.json` versions against `package.json` `dependencies` (and `devDependencies` when a build is needed). Unless `MANAGE_AGENTS_SKIP_AUTO_INSTALL=1` (see [User Settings, Target State & Environment Variables](../config/user-and-target-files.md)) is set, missing or mismatched packages trigger `npm ci --ignore-scripts --no-audit --no-fund` (or `npm install` / `bun install --ignore-scripts`).
-2. **Staleness rebuild**: Recursively checks modification times under `src/` and `package.json`. When `src/` exists and `dist/index.js` is missing or older than the newest source file, the launcher runs `npm run build` (or `bun run build`) prior to dynamic `import()`. Published npm tarballs omit `src/` and ship prebuilt `dist/`, skipping rebuilds.
+1. **Dependency verification**: Compares installed `node_modules/<pkg>/package.json` versions against the manifest's `dependencies`, and also `devDependencies` when a source build is needed. Unless `MANAGE_AGENTS_SKIP_AUTO_INSTALL=1` (see [User Settings, Target State & Environment Variables](../config/user-and-target-files.md)) is set, a failed check triggers the available installer: Bun uses `bun install --frozen-lockfile --ignore-scripts` when `bun.lock` exists or `bun install --ignore-scripts` otherwise; Node uses `npm ci --ignore-scripts --no-audit --no-fund` when `package-lock.json` exists or `npm install --ignore-scripts --no-audit --no-fund` otherwise.
+2. **Staleness rebuild**: Recursively checks modification times under `src/` and also checks `package.json`. When `src/` exists and `dist/index.js` is missing or older than the newest `src/` file or `package.json`, the launcher runs `npm run build` (or `bun run build`) prior to dynamic `import()`. Published npm tarballs omit `src/` and ship prebuilt `dist/`, skipping rebuilds.
 
 ### Module Format & TypeScript Configuration
 
@@ -73,7 +84,7 @@ All runtime packages declared under `dependencies` in `package.json`:
 
 | Package | Version Spec | Role in `manage-agents` |
 |---------|--------------|-------------------------|
-| `@opentui/core` | `0.5.7` | Native Zig-backed terminal renderer (`createCliRenderer`), syntax styling (`SyntaxStyle`), animation easing types (`EasingFunctions`), and headless TUI test harness (`@opentui/core/testing` `createTestRenderer`). Ships platform-specific native binaries via `optionalDependencies` (`@opentui/core-darwin-arm64`, `@opentui/core-linux-x64`, `@opentui/core-win32-x64`, etc.). |
+| `@opentui/core` | `0.5.7` | Native Zig-backed terminal renderer (`createCliRenderer`), syntax styling (`SyntaxStyle`), animation easing types (`EasingFunctions`), and headless TUI test harness (`@opentui/core/testing` `createTestRenderer`). |
 | `@opentui/react` | `0.5.7` | React bindings for OpenTUI (`createRoot`, `useKeyboard`, `useRenderer`, `useTerminalDimensions`, `useTimeline`) used by `src/index.tsx`, `src/App.tsx`, and `src/ui/*` components and modals (see [TUI Shell, Catalog Tree & Inspector](../components/tui-shell-and-catalog.md)). |
 | `react` | `^19.0.0` | Component state, memoization, refs, effects, and JSX runtime (`react/jsx-runtime`) for the interactive TUI (`src/App.tsx`, `src/ui/*.tsx`) and component tests. |
 | `react-dom` | `^19.0.0` | Companion React 19 peer package installed alongside `react` and `react-reconciler` to satisfy React ecosystem peer expectations. |
@@ -99,6 +110,12 @@ Packages declared under `devDependencies` in `package.json` support static verif
 - `npm test`: `npm run typecheck && node --experimental-ffi --no-warnings=ExperimentalWarning --import tsx --test "src/utils/*.test.ts" "runtime/**/*.test.mjs"`
 - `npm run build`: `node src/build.mjs`
 - `npm run validate`: `npm test && npm run build && node manage-agents.mjs pack validate contract/examples/minimal-pack` (validating against the [OpenCode Pack Contract 1.1 Reference](../api/pack-contract-reference.md))
+
+## GitHub Actions CI & Release Workflow
+
+`.github/workflows/ci.yml` runs the `test` job for pushes and pull requests on Ubuntu, macOS, and Windows. Each matrix job checks out the repository, sets up Node major version 26 with npm caching, runs `npm ci --ignore-scripts` and `npm run validate`, then smoke-checks `manage-agents --help` and `--version`. The job also installs Bun through `oven-sh/setup-bun`, runs `bun install --ignore-scripts`, `bun run typecheck`, `bun run build`, and `bun manage-agents.mjs --help`. The workflow does not specify a Bun version; the declared runtime floors remain Node `>=26.4.0` and Bun `>=1.3.0`.
+
+The `release` job depends on the test matrix and runs only for pushed tags matching `v*`. It checks out full history and verifies the tagged commit is an ancestor of `origin/main`, then installs Node 26 dependencies and builds `dist`. The packaging step stages `git archive` contents plus the freshly built `dist`, writes a release version manifest with `manage-agents --no-auto-commit version --write-manifest`, touches `dist/index.js`, and creates a `.tar.gz` archive. It then invokes `manage-agents --no-auto-commit release sign` with the tag, commit SHA, release-assets directory, and repository slug; `RELEASE_SIGNING_PRIVATE_KEY` is provided to that step. Finally, `gh release create --verify-tag --generate-notes` publishes the archive and `release-metadata.json`, adding `release-metadata.json.sig` when that file exists. The release job has `contents: write` permission; the workflow's default permission is `contents: read`.
 
 ## Bundling Externals Architecture
 

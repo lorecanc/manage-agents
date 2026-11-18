@@ -9,7 +9,7 @@ source_files:
   - "contract/examples/minimal-pack/opencode.jsonc"
   - "src/utils/packs.ts"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-17"
 ---
 
 # OpenCode Pack Contract 1.1 Reference
@@ -26,7 +26,7 @@ The engine implements contract version **`1.1`** (`CONTRACT_VERSION = { major: 1
 
 - **Format**: `"MAJOR.MINOR"` string matching `^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$` (no leading zeroes, no patch component).
 - **Major version mismatch**: If `MAJOR !== 1`, validation fails immediately with error code `contract-unsupported` and halts filesystem scanning.
-- **Newer minor version**: Minor revisions may only introduce optional features. If `MAJOR === 1` and `MINOR > 1`, validation continues and emits warning `contract-newer-minor` (`newer optional features are ignored`).
+- **Newer minor version**: Contract revisions may only add optional features. If `MAJOR === 1` and `MINOR > 1`, validation continues and emits warning `contract-newer-minor`. The validator still checks known fields and rejects unknown top-level manifest keys; it does not accept arbitrary future fields as ignored extensions.
 - **`"1.0"` vs. `"1.1"`**:
   - All `"1.0"` packs remain valid without modification.
   - Contract `"1.1"` adds the optional `flowDefaults` array on `opencode-pack.json` for [conditional multi-trigger `IF / OR` policies](../concepts/conditional-routing-and-archetypes.md) over models, tools, permissions, and delegations. Declaring `flowDefaults` in a pack with `"contract": "1.0"` fails validation (`"flowDefaults" requires contract "1.1" or newer`).
@@ -86,7 +86,7 @@ Declares the pack as a routable multi-agent [archetype](../concepts/conditional-
 ```
 
 - Closed object (`additionalProperties: false`); both `callers` and `reference` are required.
-- **`callers`**: Non-empty array of unique, non-empty strings (`minItems: 1`, `uniqueItems: true`). Semantic validation (`checkArchetype` in `src/utils/packs.ts:550`) verifies that every caller ID is defined as an agent in the same pack and does **not** set `mode: "subagent"` (callers must be primary agents).
+- **`callers`**: Non-empty array of unique strings (`minItems: 1`, `uniqueItems: true`). Semantic validation (`checkArchetype` in `src/utils/packs.ts:564`) verifies that every caller ID is defined as an agent in the same pack and is not explicitly `mode: "subagent"`; an omitted `mode` is not rejected by this check.
 - **`reference`**: Non-empty string that must appear in `archetype.callers`. Used by the engine and UI as the canonical primary agent representing the archetype.
 
 ### `routingDefaults`
@@ -162,7 +162,7 @@ Provides conditional `IF / OR` rules (`dependentRequired: ["archetype"]`, `contr
 
 ### OpenCode-Native Plural Directories
 
-Top-level native directory names are strictly lowercase (`NATIVE_DIRS` in `src/utils/packs.ts:91`):
+Top-level native directory names and the specially namespaced `tools/` directory must be lowercase (`NATIVE_DIRS` in `src/utils/packs.ts:92`):
 
 - **`agents/`**: Holds `.md` files only (non-Markdown files fail with `not-markdown`). Nested relative paths without `.md` become canonical agent IDs (e.g., `agents/team/reviewer.md` -> `team/reviewer`). YAML frontmatter must parse to a mapping:
   - `mode`, when present, must be `"primary"`, `"subagent"`, or `"all"` (error `agent-mode`).
@@ -180,7 +180,7 @@ Because all installed packs share a single target directory tree, every path out
 
 - **General directories (`<dir>/<pack-name>/**`)**: Any custom top-level directory (such as `resources/`, `office/`, `templates/`) must place all files beneath `<dir>/<pack-name>/...` (`rest[0] === packName && rest.length > 1`).
 - **Tool modules (`tools/`)**: Accepts either the directory form `tools/<pack-name>/**` or the flat file prefix form `tools/_<pack-name>_*` (`rest.length === 1 && rest[0].startsWith("_" + packName + "_")`). Code files matching `\.(?:ts|mts|cts|js|mjs|cjs)$` (excluding `*.test.*`) are recorded in `executable.toolModules`.
-- **Shared files**: Two packs cannot install the same file path unless its content is identical or one pack owns it and the other declares that pack in `requires` (see [Pack Lifecycle & Target Safety](../concepts/pack-lifecycle-and-target-safety.md)).
+- **Shared files**: Two packs cannot install the same file path. Put a shared file in one pack and have the other pack declare it in `requires` and reference it; `requires` does not permit duplicate file ownership (see [Pack Lifecycle & Target Safety](../concepts/pack-lifecycle-and-target-safety.md)).
 
 ### Root Files, Non-Installed Metadata, and Ignored Paths
 
@@ -272,7 +272,7 @@ All installed packs merge into a single target directory (default `$XDG_CONFIG_H
 
 ### Canonical Resource Identities
 
-Across all installed packs in a target, resource IDs and paths must be unique (conflicts fail before any disk write unless resolved via `requires` or identical shared content):
+Across all installed packs in a target, resource IDs and file paths must not collide; the engine detects conflicts before writing. To share a file, keep it in one pack and let dependent packs reference it through `requires` rather than duplicating it:
 
 | Resource Kind | Canonical Identity |
 |---|---|
@@ -302,7 +302,7 @@ Across all installed packs in a target, resource IDs and paths must be unique (c
 - **Cross-pack references via `requires`**: If a path stays within the shared root tree (for example, `../../tools/shared-pack/helper.js` imported from `plugins/my-plugin/index.ts` normalizes to `tools/shared-pack/helper.js`) and does not exist in the current pack:
   - When `requires` is empty, validation fails with error `reference-missing`.
   - When `requires` is non-empty, `validatePack()` records an `UnresolvedReference` (`{ from, kind, target }`), and [`manage-agents resolve` / `install`](./cli-reference.md) (backed by the [Dependency Resolver](../modules/resolver-and-lock.md)) requires one of the declared `requires` packs to provide `target`.
-- **Large file guard (`MAX_SCANNED_BYTES`)**: Files exceeding `2 MiB` (`2,097,152` bytes) are not read into memory; validation skips content scanning and emits warning `file-too-large`.
+- **Large file guard (`MAX_SCANNED_BYTES`)**: Files exceeding `2 MiB` (`2,097,152` bytes) are not read into memory. Oversized manifests and config contributions produce an error; oversized files read for other scanning produce warning `file-too-large` and their content scan is skipped.
 
 ### Opaque References & Heuristic Checks
 
@@ -314,7 +314,7 @@ Content that cannot be statically guaranteed across runtime environments is trea
 | Plugin package specs in `opencode.json(c)` | Non-local specs (npm or git packages in `plugins`) are allowed, skipped by local file checks, and reported in `executable.pluginPackages` requiring [user trust confirmation](../concepts/security-and-trust-model.md). |
 | `@subagent` mentions & Markdown bodies | Opaque; prose references inside `agents/*.md`, `commands/*.md`, and `SKILL.md` are not resolved against `PackIds`. |
 | Model IDs (`provider/model#variant`) | Checked syntactically against `^[^\s/#]+\/[^\s#]+(?:#[^\s#]+)?$` in `opencode-pack.json`, never queried against live provider catalogs during `pack validate`. |
-| Template literals, dynamic imports, globs | Template-literal non-relative strings (`${...}`) and `skills`/`instructions` globs (`*`, `?`, `[`) are skipped without error. |
+| Template literals, runtime-computed references, and globs | Quoted relative import specifiers, including `import("./x")`, are scanned; template literals and runtime-computed references are not parsed. `skills`/`instructions` globs (`*`, `?`, `[`) skip existence checking. |
 | Hardcoded config paths in text files | Best-effort regex scan (`ABSOLUTE_CONFIG_RE`) across non-test text files flags `~/.config/opencode`, `$XDG_CONFIG_HOME/opencode`, and `/.config/opencode/` with **warning** `absolute-config-path`. |
 
 ---

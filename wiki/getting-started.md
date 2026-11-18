@@ -8,10 +8,11 @@ source_files:
   - "src/build.mjs"
   - "tsconfig.json"
   - "README.md"
+  - "GUIDA.md"
   - ".github/workflows/ci.yml"
   - "test/helpers.ts"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-17"
 ---
 
 # Getting Started
@@ -52,7 +53,7 @@ You can invoke the tool via `manage-agents` (if linked), `./manage-agents.mjs`, 
 
 ### Installing from GitHub Releases
 
-Tagged releases (`v*`) publish a [prebuilt `manage-agents-<tag>.tar.gz` archive](./modules/launcher-and-build.md) alongside `release-metadata.json` (and `release-metadata.json.sig` when [release signing](./config/translation-and-release-config.md) is configured). Because release archives already contain `dist/index.js` without `src/`, they run directly without requiring TypeScript or `esbuild` compilation.
+For pushes of `v*` tags, CI publishes a [prebuilt `manage-agents-<tag>.tar.gz` archive](./modules/launcher-and-build.md) and `release-metadata.json`; it attaches `release-metadata.json.sig` when that file is generated. The release job runs only after the test job passes and checks that the tagged commit is an ancestor of `origin/main`. It builds and stages `dist/` in the archive, so the published archive includes the prebuilt `dist/index.js` bundle. See [release signing](./config/translation-and-release-config.md) for signing configuration.
 
 ### Automatic Dependency Install and Build on Launch
 
@@ -79,7 +80,7 @@ manage-agents self-update --check    # check for newer releases without modifyin
 manage-agents self-update            # alias: manage-agents update --self
 ```
 
-[`self-update`](./modules/launcher-and-build.md) verifies the release archive SHA-256, inner bundle hash, and Ed25519 signature (when [`release-signing.json`](./config/translation-and-release-config.md) is configured), performs an atomic backup and rollback on failure, and automatically reconciles the [router plugin](./modules/runtime-router-plugin.md) across managed targets (configurable via `--reconcile` / `--no-reconcile`, `--yes` / `-y`, `--force`, `--repo <owner/repo>`, and `--json`).
+[`self-update`](./modules/launcher-and-build.md) checks `v*` GitHub Releases and verifies the archive SHA-256 and inner bundle hash, plus the Ed25519 signature when [`release-signing.json`](./config/translation-and-release-config.md) is configured. It updates the engine and reconciles the [router plugin](./modules/runtime-router-plugin.md) across managed targets by default; `--no-reconcile` disables reconciliation. Use `--yes` / `-y` for non-interactive confirmation; `--reconcile`, `--force`, `--repo <owner/repo>`, and `--json` are also available.
 
 ## CLI Quickstart
 
@@ -207,11 +208,11 @@ test("validates a minimal synthetic pack", (t) => {
 GitHub Actions runs two jobs defined in `.github/workflows/ci.yml`:
 
 1. **`test` (Push and Pull Request Matrix)**:
-   Executes across `ubuntu-latest`, `macos-latest`, and `windows-latest`, verifying both supported runtimes on every operating system:
-   - **Node.js 26**: Runs `npm ci --ignore-scripts`, `npm run validate` (typecheck + `node:test` suites + `esbuild` bundle + `minimal-pack` validation), `node manage-agents.mjs --help`, and `node manage-agents.mjs --version`.
-   - **Bun**: Runs `bun install --ignore-scripts`, `bun run typecheck`, `bun run build`, and `bun manage-agents.mjs --help`.
+    Executes across `ubuntu-latest`, `macos-latest`, and `windows-latest`, checking both supported runtimes on every operating system:
+    - **Node.js 26**: Runs `npm ci --ignore-scripts`, `npm run validate` (typecheck + `node:test` suites + `esbuild` bundle + `minimal-pack` validation), `node manage-agents.mjs --help`, and `node manage-agents.mjs --version`.
+    - **Bun**: Runs `bun install --ignore-scripts`, `bun run typecheck`, `bun run build`, and `bun manage-agents.mjs --help`.
 2. **`release` (Tag Pushes `refs/tags/v*`)**:
-   Runs on `ubuntu-latest` gated on `test` passing. Verifies that the tagged commit is an ancestor of `origin/main`, builds `dist/` on Node.js 26, writes the embedded engine version manifest (`version --write-manifest`), packages `manage-agents-<tag>.tar.gz`, signs release metadata (`release sign`), and publishes the GitHub Release via `gh release create`.
+    Runs on `ubuntu-latest` only after `test` passes. It verifies that the tagged commit is an ancestor of `origin/main`, builds `dist/` on Node.js 26, writes the embedded engine version manifest (`version --write-manifest`), packages `manage-agents-<tag>.tar.gz`, runs `release sign`, and publishes the archive and `release-metadata.json` with `gh release create`. The `.sig` asset is included only when present. This describes the workflow; it does not prescribe additional manual release steps.
 
 ## Related Pages
 

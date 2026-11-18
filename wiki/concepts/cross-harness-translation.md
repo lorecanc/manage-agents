@@ -5,11 +5,14 @@ category: "concepts"
 source_files:
   - "src/utils/translationConfig.ts"
   - "src/utils/bridge.ts"
+  - "src/utils/bridgePrompt.ts"
+  - "src/utils/bridgeWorkspace.ts"
   - "src/utils/codexBridge.ts"
+  - "src/utils/claudePluginCli.ts"
   - "src/utils/bridgeToolReferences.ts"
   - "src/utils/v2Compat.ts"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-18"
 ---
 
 # Cross-Harness Pack Translation
@@ -40,7 +43,9 @@ graph LR
     CodexOut --> Verify
 ```
 
-During execution, `withGeneratedPackBridge` (see [Claude Code & Codex Bridges](../modules/bridges.md)) stages the pack closure in an OS temporary directory, normalizes V2 frontmatter through [`src/utils/v2Compat.ts`](../modules/agent-editing-and-v2-compat.md), runs either `bridgeToClaudeCode` or `bridgeToCodex`, and hands the generated tree to `mirrorTree` (which updates changed files and prunes stale artifacts) or `compareTrees` (which computes `missing`, `changed`, and `extra` paths without modifying disk). Interactive previews and exports in the TUI run through the [Authoring, Tuning & Bridge Modals](../components/authoring-and-bridge-modals.md). Every output write verifies symlink-free containment via `realpathThroughExistingAncestor` and `assertInsideRealWorkspace` (see [Security & Trust Model](./security-and-trust-model.md)).
+During execution, `prepareBridgeWorkspace` validates each pack in the resolved `requires` closure, copies installable files into an OS temporary tree, and rejects duplicate file paths. It parses agents only from the requested pack, while merging MCP and LSP declarations from the closure into a generated `opencode.json` (later entries in closure order replace earlier declarations with the same name). `withGeneratedPackBridge` (see [Claude Code & Codex Bridges](../modules/bridges.md)) refuses untrusted executable content unless explicitly allowed, runs either `bridgeToClaudeCode` or `bridgeToCodex`, and always cleans up the temporary workspace. `bridgePack` mirrors generated files to the destination, rewriting changed files and pruning stale entries; preview/check paths can compare trees without modifying the destination. Interactive previews and exports in the TUI run through the [Authoring, Tuning & Bridge Modals](../components/authoring-and-bridge-modals.md). Output paths are checked for symlink-free containment via `realpathThroughExistingAncestor` and `assertInsideRealWorkspace` (see [Security & Trust Model](./security-and-trust-model.md)).
+
+The Claude CLI helper is a separate post-generation step: `validatePlugin` runs `claude plugin validate <dir> --strict` and reports pass, fail, skipped (CLI missing), or execution error. `registerPlugin` adds the local marketplace and then installs the plugin, tracking “already present” results separately for those two steps. These helpers do not change the canonical pack or generated translation rules.
 
 ## Cross-Harness Concept Mapping
 
@@ -98,6 +103,12 @@ For each agent in a pack, `resolveModelTarget` determines the target `ModelTarge
 5. **Default tier fallback (`source: "default"`)**: Falls back to `config.defaultTier` (`"execution"` by default, or the first key in `config.tiers` if `defaultTier` is missing).
 
 Whenever an agent resolves via step 4 (`inferred`) or step 5 (`default`), the bridge appends a diagnostic warning (`[<agent>] model assignment source: inferred|default`) so authors can verify or pin the choice in `roles` or `overrides`.
+
+### TUI Draft Editing and Preview
+
+The bridge editor works on a draft rather than mutating the persisted configuration while the user is editing. `applyBridgeDraftToConfig` clones the tier, role, and per-target maps, trims the plugin name, derives the agent prefix from the selected pack, and updates or removes the selected target's wildcard model-map entry. Draft validation requires at least one tier and a non-empty Claude and Codex model for every tier; the Claude model is additionally checked against the Claude model-name rules when Claude is the selected target. Blank Codex reasoning effort is removed from the draft.
+
+`buildPackBridgePreview` filters and sorts agents belonging to the selected pack, then runs the same `resolveModelTarget` logic used by generation. The preview reports each agent's role, tier, target model, resolution source, optional inferred source model, and Codex reasoning effort, plus counts by tier. It is a model-mapping preview for that pack's agents, not a generated artifact or a preview of the entire `requires` closure.
 
 ## Permission Granularity and Lossiness Handling
 

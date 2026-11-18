@@ -3,22 +3,37 @@ title: "Flows & Data Sources Workspaces"
 description: "Interactive TUI workspaces for conditional IF/OR routing & delegation graphs and GitHub/local source & target management"
 category: "components"
 source_files:
+  - "src/App.tsx"
   - "src/ui/FlowsWorkspace.tsx"
   - "src/ui/SourcesTargetWorkspace.tsx"
-  - "src/App.tsx"
+  - "src/ui/PackFlowsModal.tsx"
+  - "src/utils/sources.ts"
+  - "src/utils/github.ts"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-18"
 ---
 
 # Flows & Data Sources Workspaces
 
-The `manage-agents` terminal interface is organized into three top-level workspaces switched via `Tab` / `Shift+Tab`, clickable header pills, or the [Command Palette](./navigation-help-and-markdown.md) (`Ctrl+K` / `Ctrl+P`):
+The `manage-agents` terminal interface is organized into three top-level workspaces under a shared header. `Tab` / `Shift+Tab` cycles between them, the header pills select one directly, and the [Command Palette](./navigation-help-and-markdown.md) (`Ctrl+K` / `Ctrl+P`) also exposes workspace navigation:
 
 1. **[Catalog](./tui-shell-and-catalog.md)** (`workspaceTab === "catalog"`) — Agent tree and 6-tab agent/pack inspector.
 2. **Flows & Graph** (`workspaceTab === "flows"`, implemented in `src/ui/FlowsWorkspace.tsx`) — Pack-level [conditional `IF / OR` routing](../concepts/conditional-routing-and-archetypes.md) topology and per-agent inbound/outbound `@subagent` call graphs.
 3. **Sources & Target** (`workspaceTab === "sources"`, implemented in `src/ui/SourcesTargetWorkspace.tsx`) — [Local and GitHub repository connection](../modules/sources-and-github.md), `gh` CLI authentication, OpenCode target drift inspection, [target reconciliation](../modules/target-installer.md), and [engine self-updates](../modules/launcher-and-build.md).
 
-`src/App.tsx` owns the shared state, keyboard routing (`useKeyboard`), async mutations, and [overlay modals](./authoring-and-bridge-modals.md) (`routing-*`, `delegation-manager`, `pack-init`, `install-confirm`, `self-update`) that back both workspace components.
+`src/App.tsx` owns the shared workspace and pane focus state, data loading, keyboard routing (`useKeyboard`), async mutations, and [overlay modals](./authoring-and-bridge-modals.md) (`routing-*`, `delegation-manager`, `pack-init`, `install-confirm`, `self-update`). A modal overlays the selected workspace; opening or closing the flow editor does not itself change the active workspace or source.
+
+---
+
+## Shared Workspace Shell & Pane Focus
+
+`WorkspaceTopbar` sits above the active workspace and reports the active workspace/source. `App` supplies common responsive list and inspector widths and a shared `activePane` (`"list"` or `"inspector"`) to the Flows and Sources/Target workspaces. When the current layout has no inspector, `effectivePane` falls back to the list. Selecting a pane by mouse or keyboard updates the shared focus state and the corresponding pane border/title.
+
+- **Workspace order**: `Catalog` → `Flows` → `Sources` → `Catalog` with `Tab`; `Shift+Tab` moves in reverse. The header and palette can select workspaces directly. `O` opens Sources from Catalog or Flows. Keyboard navigation applies when a text-input field does not own the keystrokes.
+- **Pane focus**: `[` / `Shift+Left` selects the list; `]` / `Shift+Right` selects the inspector when shown. In Flows, arrows navigate the list or inspector items according to the focused pane. In Sources, arrows navigate source rows or scroll installed packs in the target inspector.
+- **Startup**: `App` selects Catalog when a local workspace or initial source is supplied; otherwise it starts in Sources so a repository can be connected.
+
+Both split-pane workspaces keep their row list and inspector content separate: Flows pairs pack/agent graph navigation with topology details, while Sources pairs repository discovery with OpenCode target status. The Catalog workspace uses the same responsive shell and pane focus state for its agent tree and inspector.
 
 ---
 
@@ -70,10 +85,13 @@ How `buildFlowsNavRows` constructs the graph:
 | `listRows` | `number` | yes | Height budget for visible rows (`wsViewports.flowsRows`) |
 | `leftWidth` / `rightWidth` / `gutterWidth` | `number` | yes | Split-pane column widths computed from terminal dimensions |
 | `showInspector` | `boolean` | yes | Whether terminal width permits rendering the right-hand topology pane |
+| `activePane` | `"list" \| "inspector"` | yes | Pane currently receiving keyboard navigation |
+| `inspectorFocusIndex` | `number` | yes | Focused flow or subagent row in the topology inspector |
 | `focusBorderBlend` | `number` | yes | Animated border interpolation factor (`0..1`) |
+| `onSelectPane` / `onFocusInspectorItem` / `onScrollInspectorDelta` | callbacks | yes | Selects the pane, focuses an inspector item, and scrolls the inspector selection |
 | `onFocusIndex` | `(index: number) => void` | yes | Updates `flowsFocusIndex` on mouse click |
 | `onScrollDelta` | `(delta: number) => void` | yes | Scrolls viewport by `±2` rows on mouse wheel |
-| `onOpenPackFlows` | `(pack: string) => void` | yes | Opens the `routing-configs` modal for `pack` |
+| `onOpenPackFlows` | `(pack: string, initialFlowIndex?: number) => void` | yes | Opens `routing-configs` for the pack, optionally focused on a selected flow |
 | `onOpenDelegations` | `(agent: AgentInfo) => void` | yes | Opens the [`delegation-manager` modal](./authoring-and-bridge-modals.md) for `agent` |
 | `onJumpToCatalogAgent` | `(agentPath: string) => void` | yes | Switches to [Catalog](./tui-shell-and-catalog.md) and focuses `agentPath` |
 
@@ -81,34 +99,38 @@ How `buildFlowsNavRows` constructs the graph:
 
 When `showInspector` is true, the right-hand `Topology & IF/OR Rules` panel renders two stacked cards for the focused row's pack (`currentRow.pack`):
 
-- **Pack `IF / OR` Card**: Shows active callers and their origin (`Callers (user | manifest | inferred): ...`) plus up to three flow summaries (`├─ IF <triggers> ──▶ <N> models + <M> policies`), paired with a clickable `[M] Edit Flows` action.
+- **Pack `IF / OR` Card**: Shows active callers and their origin (`Callers (user | manifest | inferred): ...`) plus the flow summaries that fit the card's row budget (`├─ IF <triggers> ──▶ <N> models + <M> policies`), paired with a clickable `[M] Edit Flows` action.
 - **Agent Delegation Tree Card**: Resolves `activeAgent` to `currentRow.agent` (or, when a `"pack"` row is focused, the first agent in that pack with outbound subagents, falling back to the first pack agent). Displays:
   - **Inbound callers**: `◀── Called by: @callerA, @callerB`, or `◀── Primary / Entry-point agent` when `inbound.length === 0`.
   - **Outbound `@subagents`**: Up to six branches rendered with `├─▶` / `╰─▶` connectors (`╰─ (leaf agent)` when empty). Valid targets render in cyan as `@<subName> (click)`; unresolved targets render in red as `❌ @<subName> [Dead Ref]`. Clicking `[G] Delegations` opens the interactive `@subagent` checklist (`viewMode === "delegation-manager"`).
 
-**Filtering and Cross-Workspace Jumping**:
+**Inspector Navigation, Filtering & Catalog Jumping**:
 - `FlowsWorkspace` displays the full sorted call graph across all packs without an inline filter bar. Fuzzy filtering by agent name, category, or model is handled via the global [Command Palette](./navigation-help-and-markdown.md) (`Ctrl+K` / `Ctrl+P`, which indexes every agent as `jump:<currentPath>`) or by pressing `/` in the Catalog tab.
-- Pressing `Enter` (or double-clicking) on an `"agent"` row—or single-clicking any resolved `@subagent` node in the outbound delegation tree—calls `jumpToCatalogAgent(agentPath)` in `src/App.tsx`. This switches `workspaceTab` to `"catalog"`, clears `searchQuery`, expands `targetAgent.category`, focuses the target agent row, and scrolls it into the viewport. Pressing `Enter` (or double-clicking) on a `"pack"` row opens `openPackFlowsModal(row.pack)`.
+- In the inspector, arrow keys move through the focused pack's flow rows followed by the active agent's outbound subagent rows. `Enter` on a flow opens the editor at that flow; `Enter` on a resolved subagent jumps to it in Catalog. A mouse click first focuses an inspector row; clicking an already focused flow opens it, and clicking an already focused resolved subagent jumps to it.
+- Pressing `Enter` (or clicking an already focused row) on an `"agent"` row—or activating a resolved `@subagent` node in the outbound delegation tree—calls `jumpToCatalogAgent(agentPath)` in `src/App.tsx`. This switches `workspaceTab` to `"catalog"`, clears `searchQuery`, expands `targetAgent.category`, focuses the target agent row, and scrolls it into the viewport. Pressing `Enter` on a `"pack"` row opens `openPackFlowsModal(row.pack)`.
 
 ### `FlowsWorkspace` Keybindings (`src/App.tsx`)
 
 | Key | Action |
 |-----|--------|
 | `↑` / `k`, `↓` / `j`, `PageUp` / `PageDown` | Navigate `FlowsNavRow` items |
-| `Enter` | Open pack flows modal on a `"pack"` row, or jump to agent in Catalog on an `"agent"` row |
+| `Enter` | In the list, open pack flows on a `"pack"` row or jump to an agent in Catalog; in the inspector, edit the focused flow or jump to a resolved subagent |
+| `[` / `]` or `Shift+←` / `Shift+→` | Focus the list / inspector when the inspector is shown |
+| `Esc` | Return focus from inspector to list; from the list, return to Catalog |
 | `M` | Open Conditional `IF / OR` Flows editor (`routing-configs`) for the focused row's pack |
 | `G` | Open `@subagent` Delegation Manager (`delegation-manager`) for the focused agent |
 | `E` | Preview & install focused pack into the [OpenCode target](../concepts/pack-lifecycle-and-target-safety.md) (`install-confirm`) |
 | `B` / `Shift+B` | Open [Claude Code / OpenAI Codex bridge](../modules/bridges.md) generator pre-scoped to the focused pack |
 | `I` | Open [Pack Onboarding wizard](../modules/pack-onboarding-and-doctor.md) (`pack-init`, *[virtual packs]* only; see [Glossary](../glossary.md)) |
 | `D` / `N` | Open Pack Doctor / Resource Scaffolder (`pack-doctor`, writable local packs only) |
-| `Tab` / `Shift+Tab` / `O` / `Esc` | Switch workspace (`Sources`, `Catalog`, `Sources`, `Catalog` respectively) |
+| `Tab` / `Shift+Tab` | Switch to Sources / Catalog, respectively |
+| `O` | Open Sources |
 
 ---
 
 ## Interactive `IF / OR` Flow & Archetype Routing Editor
 
-Pressing `M` on an unmarked pack folder in [Catalog](./tui-shell-and-catalog.md) or on any row in `FlowsWorkspace` invokes `openPackFlowsModal(pack)` in `src/App.tsx`. Any pack or [virtual `.md` folder](../modules/pack-validation-and-virtual-packs.md) with at least one discovered agent (`isConfigurablePack(workspaceRoot, pack)`) can be configured—not only packs with a pre-existing `archetype` block in [`opencode-pack.json`](../api/pack-contract-reference.md).
+Pressing `M` on an unmarked pack folder in [Catalog](./tui-shell-and-catalog.md) or on a row in `FlowsWorkspace` invokes `openPackFlowsModal(pack)` in `src/App.tsx`. `Enter` on a pack row or a focused flow row in the Flows inspector also opens it; the latter passes the flow index so the selected branch is focused. The editor is an overlay above the current workspace, and `Esc` from the configuration list closes it back to that workspace. Any pack or [virtual `.md` folder](../modules/pack-validation-and-virtual-packs.md) with at least one discovered agent (`isConfigurablePack(workspaceRoot, pack)`) can be configured—not only packs with a pre-existing `archetype` block in [`opencode-pack.json`](../api/pack-contract-reference.md).
 
 ```mermaid
 graph LR
@@ -122,6 +144,8 @@ graph LR
     Editor -->|"[U]"| Tools["routing-tools"]
     Editor -->|"[P]"| Perms["routing-permissions"]
     Editor -->|"[G]"| Dels["routing-delegations"]
+    Editor -->|"[Esc]"| Configs
+    Configs -->|"[Esc] close"| Main
 ```
 
 ### Flow List & Caller Selection (`routing-configs` & `routing-callers`)
@@ -172,6 +196,10 @@ const exportRoutingToManifest = () => {
 - **User-Scope Default (`routing.json`)**: Every change in `routing-callers`, `routing-editor`, `routing-tools`, `routing-permissions`, and `routing-delegations` saves immediately via `applyRoutingDraft` → `saveUserPackFlow` into user settings (`~/.config/manage-agents/routing.json`) and triggers [`reconcileTargetIfInstalled("models")`](../modules/target-installer.md) so installed OpenCode targets update automatically. Read-only Git sources write exclusively to user settings.
 - **Pack Manifest Export (`[W]`)**: On writable local workspaces where `routingView.hasManifest` is true, pressing `W` in `routing-configs` runs `exportFlowsToPackManifest` inside [`repositoryTransaction`](../modules/agent-editing-and-v2-compat.md) (`mutate`), writing callers, `routingDefaults`, and conditional rules back into the pack's `opencode-pack.json`. If the local folder is a virtual pack (`!routingView.hasManifest`), `[I]` opens [Pack Onboarding](../modules/pack-onboarding-and-doctor.md) instead to initialize `opencode-pack.json` first.
 
+### Active Source & Target Integration
+
+The modal loads its pack definition from the active workspace root, including the currently activated local or Git source. It does not switch to Sources while editing. For a read-only Git source, `App` enables source overrides: flow and caller edits remain in user `routing.json`, and the manifest export / pack-init actions are hidden. For a writable local pack, `[W]` exports to its manifest when one exists, while `[I]` offers onboarding for a virtual pack. Saving user-scope changes requests a target reconcile, reported in the modal status; after closing it, Sources provides the target drift/status view and explicit `[R]` reconcile or `[Ctrl+R]` refresh actions.
+
 ---
 
 ## SourcesTargetWorkspace (`src/ui/SourcesTargetWorkspace.tsx`)
@@ -202,7 +230,10 @@ export type SourceWorkspaceRow =
 | `sourcesStatus` | `string \| null` | yes | Inline status or error banner below the input box |
 | `targetStatusInfo` | `TargetStatus \| null` | yes | Read-only health, lock, and drift report for the OpenCode target |
 | `leftWidth` / `rightWidth` / `gutterWidth` / `showInspector` | `number` / `boolean` | yes | Responsive split-pane layout measurements |
+| `activePane` | `"list" \| "inspector"` | yes | Shared pane focus |
+| `inspectorScrollOffset` / `termHeight` | `number` | yes | Target-list scroll position and height used to budget installed-pack rows |
 | `focusBorderBlend` | `number` | yes | Animated left-pane border highlight (`0..1`) |
+| `onSelectPane` / `onScrollInspectorDelta` | callbacks | yes | Focuses a pane and scrolls the installed-pack list in the inspector |
 | `onFocusIndex` / `onActivateRow` / `onScrollDelta` | callbacks | yes | Row focus, row activation (`Enter` / double-click), and mouse scroll handlers |
 | `onToggleInputFocus` | `(focused: boolean) => void` | yes | Focuses/blurs the search & connect input bar |
 | `onPullSelected` | `() => void` | yes | Pulls focused/active Git source or refreshes repo discovery |
@@ -228,10 +259,26 @@ export type SourceWorkspaceRow =
 - **Switching Active Source (`[Enter]`)**: Pressing `Enter` (or double-clicking) on a `registered` row calls `activateRegisteredSource`, pulling the cache first if `.git` is missing, persisting `registry.active = source.name` in `sources.json`, and switching to Catalog. Pressing `Enter` on a `gh-repo` row attaches `github:<nameWithOwner>` and activates it immediately.
 - **Toggling Trust (`[T]`) & Source Preferences (`prefer`)**:
   - Pressing `T` on a `registered` row (`toggleFocusedSourceTrust`) flips `source.trusted` in `sources.json` (displayed as `· trusted` in the row badge). Trusted sources bypass untrusted-executable confirmation prompts when installing packs with plugins or custom tools, though changes to a pack's executable hash still require confirmation.
+  - Sources created by the workspace begin untrusted; trust is an explicit setting persisted in the source registry.
   - `SourceRegistry.prefer` (`pack -> source` in `sources.json`, configured via [`manage-agents source prefer <pack> <source> [--clear]`](../api/cli-reference.md)) disambiguates multi-source pack names during [target resolution](../modules/resolver-and-lock.md) (`targetStatus`, `reconcile`, `update`). `saveSources` preserves `prefer` sorted on disk, `removeSource` (`[X]`) automatically prunes any `prefer` entries pointing to a deleted source, and TUI installs via `[E]` explicitly qualify requests as `<sourceName>/<pack>` (`installRequest`).
 - **Pulling Git Updates (`[P]`)**: Calls `pullSelectedOrActiveSource()`. For a focused (or active) Git source, `pullSource` runs `git fetch --force --tags --prune` (injecting `!gh auth git-credential` automatically when `gh` is authenticated for the HTTPS host) and checks out the configured `ref` or remote `HEAD` detached, refreshing `activeRevision` and reloading agents. On local rows, `[P]` refreshes registered sources and the `gh` repository list.
 - **Removing Sources (`[X]` / `Delete` / `Backspace`)**: Calls `removeFocusedSource()`, deleting the entry from `sources.json` and falling back to the next registered source (or clearing `activeDataSource` if none remain).
 - **Virtual Pack Onboarding (`[I]` & Proactive Wizard)**: Whenever `switchToDataSource` activates a local folder or Git repository containing agent `.md` files without an `opencode-pack.json` manifest ([`isVirtualPackRoot(root)`](../modules/pack-validation-and-virtual-packs.md)), `App.tsx` automatically opens [`PackOnboardingModal`](./authoring-and-bridge-modals.md) (`viewMode === "pack-init"`) once per root per session—or on demand when pressing `I`. Onboarding a read-only Git source clones it into a writable local working tree (`cloneGitSourceForOnboarding`), generates a [Contract 1.1 `opencode-pack.json`](../api/pack-contract-reference.md), registers the new local source, and switches the TUI to it.
+
+### Source & Target Workspace Interactions
+
+| Key / Gesture | Focus / Scope | Action |
+|---------------|---------------|--------|
+| `/` or `A` | Sources list | Focus the filter/connect field; typing filters rows and offers a connect action for the entered spec |
+| `Enter` | Source list / connect row | Activate a registered source, attach a discovered GitHub repository, or connect the entered spec |
+| `Enter` | Target inspector | Reconcile the OpenCode target |
+| `T` / `X`, `Delete`, `Backspace` | Registered source row | Toggle trust / remove the source |
+| `P` | Sources | Pull the focused Git source (or active Git source); otherwise refresh sources and GitHub discovery |
+| `G` / `Ctrl+G` | Sources | Run interactive GitHub CLI web login |
+| `R` / `Ctrl+R` | Sources | Reconcile target / refresh source, GitHub, and target status |
+| `[` / `]` or `Shift+←` / `Shift+→` | Sources pane | Focus the source list / target inspector when shown |
+
+The target inspector's installed-pack list also scrolls with the inspector pane's arrow or page keys and mouse wheel. With the connect input unfocused, `Tab` / `Shift+Tab` from Sources switches to Catalog / Flows; opening Sources from another workspace refreshes its source and target information. While the input is focused, printable keys edit the query and `Enter` acts on the focused row.
 
 ---
 
@@ -242,7 +289,7 @@ export type SourceWorkspaceRow =
 The right-hand inspector of `SourcesTargetWorkspace` renders `TargetStatus` produced by [`targetStatus(target, registry)`](../modules/target-installer.md) for `defaultTarget()` (`~/.config/opencode` by default):
 
 - **Sync Banner & Target Metadata**: Shows `● Target In Sync` (green) when `drift.length === 0`, or `⚠ <N> Drift Notices` (amber with `THEME.borderWarn` panel border) alongside total locked pack count, resolved target directory (`Dir: ...`), and engine version (`Engine: <displayVersion>`).
-- **Installed Packs (`desired` vs. `lock`)**: Lists up to seven entries from `targetStatusInfo.lock.packs`. Pack names requested directly in [`.manage-agents/desired.json`](../config/user-and-target-files.md) (`desired.roots`, parsed via `parsePackRequest`) highlight in cyan; [transitive `requires` dependencies](../modules/resolver-and-lock.md) append `(dep)` alongside `<version> · <source>[@<rev7>]`.
+- **Installed Packs (`desired` vs. `lock`)**: Lists as many entries from `targetStatusInfo.lock.packs` as fit the inspector's height budget; the list scrolls when additional packs exist. Pack names requested directly in [`.manage-agents/desired.json`](../config/user-and-target-files.md) (`desired.roots`, parsed via `parsePackRequest`) highlight in cyan; [transitive `requires` dependencies](../modules/resolver-and-lock.md) append `(dep)` alongside `<version> · <source>[@<rev7>]`.
 - **Drift Detection**: Cross-checks `desired.json`, `lock.json`, and `installed.json` against on-disk hashes and Git caches, displaying up to four actionable notices in the `Drift / Pending Updates` box:
   - [Pending interrupted transactions](../concepts/pack-lifecycle-and-target-safety.md) (`.manage-agents/journal.json` exists, rolled back automatically on the next target operation).
   - Checked-out or fetched Git source revisions diverging from `lock.packs[name].revision` (prompting [`manage-agents update <name>`](../api/cli-reference.md), mirrored by `↑ update` badges on [Catalog](./tui-shell-and-catalog.md) folders).

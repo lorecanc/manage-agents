@@ -6,7 +6,7 @@ source_files:
   - "src/utils/resolver.ts"
   - "src/utils/lock.ts"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-18"
 ---
 
 # Dependency Resolver & Lockfile
@@ -154,7 +154,7 @@ Hashing the structured JSON alongside code bytes ensures that argv boundary muta
 
 ### Confirmation Triggers (`confirmationsNeeded`)
 
-`confirmationsNeeded(next, previous)` (`src/utils/lock.ts:124-136`) inspects a candidate `PackLock` against the existing lock (`null` on first install) and returns every reason requiring interactive approval or `--yes` (see [Security & Trust Model](../concepts/security-and-trust-model.md)):
+`confirmationsNeeded(next, previous)` (`src/utils/lock.ts:155-167`) inspects a candidate `PackLock` against the existing lock (`null` on first install) and returns every reason requiring interactive approval or `--yes` (see [Security & Trust Model](../concepts/security-and-trust-model.md)):
 
 1. **Untrusted source carrying executable content**: For each pack in `next.packs` where `!pack.trusted && pack.executable.length > 0`, a prompt `<name>: source "<source>" is not trusted and the pack carries executable content` is emitted unless `previous?.packs[name]` already accepted the exact same `(trusted, source, executableHash)` tuple.
 2. **New executable surface**: For each entry in `diffLocks(previous, next).executable` with `change.added.length > 0`, emits `<name>: new executable surface: <added...>`.
@@ -164,7 +164,7 @@ Hashing the structured JSON alongside code bytes ensures that argv boundary muta
 
 ### `PackLock` v1 Structure
 
-`writeLock(target, lock)` persists `<target>/.manage-agents/lock.json` atomically (`0o644` permissions) with sorted `roots`, sorted `packs` keys, and sorted `requires` maps so identical resolutions serialize byte-for-byte identically:
+`buildLock(resolution)` (`src/utils/lock.ts:79-95`) constructs sorted `roots`, `packs` keys, and `requires` maps. `serializeLock(lock)` (`src/utils/lock.ts:97`) then applies `JSON.stringify(lock, null, 2)` and appends a newline; it does not reorder or normalize an arbitrary `PackLock`. `writeLock(target, lock)` (`src/utils/lock.ts:125-130`) writes those serialized bytes atomically to `<target>/.manage-agents/lock.json` with `0o644` permissions. Thus the stable ordering comes from `buildLock`, while serialization preserves the supplied lock's property order:
 
 ```json
 {
@@ -193,25 +193,28 @@ Hashing the structured JSON alongside code bytes ensures that argv boundary muta
 }
 ```
 
-When `readLock(target)` (`src/utils/lock.ts:85-95`) loads an existing lockfile, `lockProblem()` verifies every entry:
+`buildLock()` copies each resolved pack's `revision`, `manifestHash`, `contentHash`, and `executableHash` into the lock; it does not recalculate those values. When `readLock(target)` (`src/utils/lock.ts:113-123`) loads an existing lockfile, `lockProblem()` verifies every entry's shape and digest format, but does not recompute hashes or validate them against pack files:
 - Pack key and `source` match `PACK_NAME_RE`; `sourceKind` is `"local"` or `"git"`; `path` is a string.
 - `version` equals `semver.valid(pack.version)` (canonical semver only).
-- `revision` is either `null` or a 40-to-64-character lowercase hex digest (`/^[0-9a-f]{40,64}$/`).
-- `manifestHash`, `contentHash`, and `executableHash` match `/^[0-9a-f]{64}$/`.
+- `revision` is either `null` or a 40-to-64-character lowercase hex digest (`/^[0-9a-f]{40,64}$/`); it records the resolved source revision, when available.
+- `manifestHash`, `contentHash`, and `executableHash` each match `/^[0-9a-f]{64}$/`.
 - `trusted` is boolean, `requires` is a string-to-string plain object, and `executable` is a `string[]`.
+
+The lock stores all four revision/hash values, but `diffLocks()` uses only `revision` and `contentHash` for its primary pack change and checks `executableHash` separately for executable-surface changes. `manifestHash` is persisted and format-validated but is not itself a diff criterion.
 
 ### Lockfile Diffing (`diffLocks`)
 
-`diffLocks(previous, next)` (`src/utils/lock.ts:101-121`) iterates the sorted union of pack names in `previous?.packs` and `next.packs` and produces two parallel arrays:
+`diffLocks(previous, next)` (`src/utils/lock.ts:132-152`) iterates the sorted union of pack names in `previous?.packs` and `next.packs` and produces two parallel arrays:
 
 1. **`changes: LockChange[]`** — At most one primary change per pack, evaluated in strict precedence order:
    - `"added"`: Absent in `previous`, present in `next` (`to: "<source>@<version>"`).
    - `"removed"`: Present in `previous`, absent in `next` (`from: "<source>@<version>"`).
    - `"source"`: `old.source !== now.source` (`from`, `to`).
    - `"upgrade"` / `"downgrade"`: `old.version !== now.version`, classified with `semver.gt(now.version, old.version)`.
-   - `"revision"`: `old.revision !== now.revision` (`from` / `to`, using `"none"` for `null`).
-   - `"content"`: `old.contentHash !== now.contentHash` (for example, edited local pack files at the same version).
-2. **`executable: ExecutableChange[]`** — Recorded whenever `now` is present, `now.executableHash !== old?.executableHash`, and `(now.executable.length || old?.executable.length)` is truthy. Each entry carries `{ name, added, removed, changed: true }`, tracking both added/removed `describeExecutable()` labels and silent code/config edits where `added` and `removed` are empty.
+   - `"revision"`: `old.revision !== now.revision` (`from` / `to`, using `"none"` for `null`). This takes precedence over a simultaneous content-hash change.
+   - `"content"`: `old.contentHash !== now.contentHash` (for example, edited local pack files at the same version), when no earlier primary change matched.
+   Only the first matching primary change is emitted. Fields such as `manifestHash`, `sourceKind`, `path`, `trusted`, `requires`, and root requests do not produce a `LockChange` on their own; in particular a source/version change masks later revision/content changes in this array.
+2. **`executable: ExecutableChange[]`** — Recorded independently when `now` is present, `now.executableHash !== old?.executableHash`, and at least one of the old or new `executable` label arrays is non-empty. Each entry carries `{ name, added, removed, changed: true }`, tracking both added/removed `describeExecutable()` labels and silent code/config edits where `added` and `removed` are empty. If both label arrays are empty, an executable-hash difference alone does not produce an entry.
 
 ## Dependencies
 

@@ -6,14 +6,15 @@ source_files:
   - "contract/CONTRACT.md"
   - "src/utils/installer.ts"
   - "src/utils/lock.ts"
+  - "src/utils/fsWindows.ts"
   - "src/utils/resolver.ts"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-18"
 ---
 
 # Pack Lifecycle & Target Safety
 
-`manage-agents` installs OpenCode *[packs]* (see [Glossary](../glossary.md)) directly into a live [OpenCode configuration directory](../config/user-and-target-files.md) (`$XDG_CONFIG_HOME/opencode` by default, typically `~/.config/opencode`) via the [Transactional Target Installer](../modules/target-installer.md) (see [System Architecture](../architecture.md)). Because packs do not run in isolated sandboxes, the engine enforces strict ownership tracking, pre-flight conflict detection, TOCTOU verification, and crash-safe filesystem transactions so pack operations never corrupt or silently overwrite user-authored files and settings.
+`manage-agents` installs OpenCode *[packs]* (see [Glossary](../glossary.md)) directly into a live [OpenCode configuration directory](../config/user-and-target-files.md) (`$XDG_CONFIG_HOME/opencode` by default, typically `~/.config/opencode`) via the [Transactional Target Installer](../modules/target-installer.md) (see [System Architecture](../architecture.md)). Because packs do not run in isolated sandboxes, the engine tracks ownership, preflights conflicts, checks expected hashes, stages writes, and records a journal to support rollback after interrupted applies. Applying a plan is a sequence of filesystem operations, not an atomic multi-path commit; recovery depends on the journal and the required transaction files remaining available.
 
 ## Why Target Safety Matters
 
@@ -29,7 +30,7 @@ Without explicit boundaries, installing, updating, or uninstalling a pack could 
 Two additional boundary checks protect the target before any file mutation:
 
 1. **Symlinked configuration protection**: `planConfig` inspects `opencode.json` (or `opencode.jsonc`) with `fs.lstatSync`. If the configuration file is a symlink, planning records a conflict rather than replacing the link or writing through it blindly, prompting the user to pass the symlink's destination via `--target` or use a regular file. Similarly, `isSafeRel` rejects any state-recorded path containing `..`, backslashes, NUL bytes, or absolute prefixes.
-2. **Executable surface confirmation**: `confirmationsNeeded` in [`src/utils/lock.ts`](../modules/resolver-and-lock.md) compares the incoming `PackLock` against the previous lock. Installing a pack with executable content (plugins, plugin npm/git specs, `tools/**` modules, skill scripts, MCP servers, or external formatter/LSP/MCP commands) from an untrusted source—or updating any pack whose `executableHash` changed—requires explicit confirmation interactively or via `--yes` (see [Security & Trust Model](./security-and-trust-model.md)).
+2. **Executable surface confirmation**: `confirmationsNeeded` in [`src/utils/lock.ts`](../modules/resolver-and-lock.md) compares the incoming `PackLock` against the previous lock. Installing untrusted executable content (plugins, plugin npm/git specs, `tools/**` modules, skill scripts, MCP servers, or external formatter/LSP/MCP commands), or changing executable content while the resulting pack still has an executable surface, requires explicit confirmation interactively or via `--yes` (see [Security & Trust Model](./security-and-trust-model.md)).
 
 ## Three-File State Model
 
@@ -61,7 +62,7 @@ Separating user intent (`desired.json`), exact resolution (`lock.json`), and mat
 - **`resolve <pack>...`**: Runs [`resolvePacks`](../modules/resolver-and-lock.md) (`src/utils/resolver.ts`) to reach a constraint fixpoint across `requires` ranges, checks for dependency cycles (`findCycle`) and unresolved cross-pack references (`providesTarget`), orders packs topologically (`orderByRequires`: dependencies first, ties alphabetical), and diffs against the existing `lock.json` without writing anything. The resolver never guesses between ambiguous sources or versions on its own.
 - **`install <pack>...`** (`installChange`): Appends or updates the requested root specs in `desired.json` while passing `pinsFrom(lock, name => !requested.has(name))` to the resolver so already-locked packs keep their exact source and version.
 - **`uninstall <pack>...`** (`uninstallChange`): Verifies each named pack is a root in `desired.json` (refusing to directly uninstall a transitive dependency still required by an installed root), removes the root from `desired.json`, and calls `pruneLock` to drop unreachable packs without re-resolving remaining dependencies.
-- **`update [<pack>...]`** (`updateChange`): Pulls the [git sources](../modules/sources-and-github.md) of the selected packs (or all locked packs when none are named) and re-resolves `desired.roots`. A git source moves as an atomic unit: every pack originating from a pulled git source is unpinned and re-evaluated at the new commit together, while unselected sources stay pinned.
+- **`update [<pack>...]`** (`updateChange`): Pulls the [git sources](../modules/sources-and-github.md) of the selected packs (or all locked packs when none are named) and re-resolves `desired.roots`. For resolution, a git source moves as a unit: every pack originating from a pulled git source is unpinned and re-evaluated at the new commit together, while unselected sources stay pinned.
 - **`reconcile`** (`reconcileChange`): Rebuilds the target strictly from the existing `desired.json` and `lock.json`, applying current [user model-routing and frontmatter override settings](../modules/routing-and-user-settings.md) (see [Conditional Routing & Archetypes](./conditional-routing-and-archetypes.md)). In `loadLockedPacks`, git packs are read from a snapshot of their locked `revision` (`revisionSnapshot`), and every pack's `manifestHash`, `contentHash`, `executableHash`, and `opencode.json(c)` SHA-256 digest are verified against `lock.json` before planning proceeds.
 - **`status`** (`targetStatus`): Performs a read-only check comparing the filesystem and git sources against all three state files. It reports pending crash journals, checked-out or fetched git commits that diverge from `lock.json`, missing or locally edited managed files, conflicts, and pending `reconcile` changes (such as updated global overrides). When `planReconcile` finds zero writes, zero deletes, unchanged config, and identical state files, `changeTarget` returns `status: "unchanged"` without touching disk.
 
@@ -113,28 +114,28 @@ if (current === write.hash) {
   - If `current === owned.hash`, the file is scheduled in `plan.deletes`, removed during `applyPlan`, and any empty parent directories inside `<target>` are cleaned up via `removeEmptyParents`.
   - If `current !== owned.hash`, the user edited the file locally. Rather than deleting user work or blocking `uninstall`, `planReconcile` adds the path to `plan.released`, emits a warning (`"<rel> was changed locally and no pack provides it any more: left in place, no longer managed"`), leaves the file on disk, and removes it from `installed.json`.
 
-## Crash Recovery & Concurrency Invariants
+## Coordination, Journaled Apply & Recovery
 
-All mutating operations (`install`, `uninstall`, `update`, `reconcile`, `restore`) share `withTargetLock` and `applyPlan` in [`src/utils/installer.ts`](../modules/target-installer.md) to guarantee process exclusion, TOCTOU detection, and atomic rollback.
+All mutating target operations (`install`, `uninstall`, `update`, `reconcile`, and `restore`) acquire `withTargetLock`; `changeTarget` and `restoreBackup` then use `applyPlan` in [`src/utils/installer.ts`](../modules/target-installer.md) to stage and apply a sequence of path operations. The lock coordinates `manage-agents` processes using the same target. It is not a filesystem-wide lock, and the apply is not an atomic multi-path commit.
 
 ### Process Exclusion (`install.lock`)
 
 `withTargetLock` creates `<target>/.manage-agents/install.lock` with `flag: "wx"` containing `{ pid, host, command, started }`:
 
 - If `install.lock` already exists, the engine parses the holder metadata. If the holder runs on another host or `pidAlive(holder.pid)` returns `true` (`process.kill(pid, 0)` succeeds or returns `EPERM`), `withTargetLock` aborts immediately with a descriptive error. If the lock file cannot be parsed yet and its `mtimeMs` is newer than `STALE_LOCK_GRACE_MS` (10 seconds), it assumes another process is still writing it and aborts.
-- If the holder PID on the same host is dead, `withTargetLock` reclaims the stale lock without race conditions: it atomically renames `install.lock` to a unique sibling `.stale-<pid>-<rand>` file, verifies its contents still match the dead holder read moments earlier (restoring the link via `fs.linkSync` and aborting if a third process acquired a fresh lock in between), deletes the `.stale` file, and retries `wx` creation.
+- For a dead same-host holder—or an unparseable lock older than the grace period—`withTargetLock` renames `install.lock` to a unique sibling `.stale-<pid>-<rand>` file, verifies its contents still match the bytes read earlier, and then removes it before retrying `wx` creation. If the contents differ, it attempts to restore the moved file with `fs.linkSync` and aborts so a fresh lock is not discarded.
 
-### Same-Filesystem Staging and Expected-Hash TOCTOU Checks
+### Staging and Expected-Hash TOCTOU Checks
 
-`applyPlan` never writes directly over live target files from pack sources:
+`applyPlan` first stages planned writes rather than copying pack source bytes directly over live target files:
 
-1. **Staging (`txn/<id>/new/`)**: Every planned file write, `opencode.json`, and the updated `.manage-agents/{installed,lock,desired}.json` files are written or copied into `<target>/.manage-agents/txn/<id>/new/`. Because `.manage-agents/txn/` lives inside `<target>`, staged files reside on the same filesystem as their final destinations, guaranteeing atomic `rename` semantics. For source-backed files, `stage` hashes the copied staged file and aborts if the source mutated mid-copy (`hash !== expectedHash`).
-2. **Pre-journal TOCTOU verification (`plan.expected`)**: During `planReconcile`, the engine records `plan.expected[rel]`—the exact SHA-256 digest (`null` if absent, `symlink:<target>` if a symlink) of every target file and `opencode.json` that the plan will touch. Because an interactive confirmation prompt may sit open between planning and applying, `applyPlan` re-hashes every path in `plan.expected` after staging. If any path changed while waiting, `applyPlan` deletes `txn/<id>/` and aborts before writing `journal.json`.
-3. **Swap-time TOCTOU verification**: As existing files are moved out of the live tree into `txn/<id>/prev/`, `applyPlan` checks `currentHash(previous) !== plan.expected[op.rel]`, and before moving a newly created file into place, verifies no file appeared at `full` in the meantime. Any discrepancy triggers an immediate `rollbackInterrupted(target)`.
+1. **Staging (`txn/<id>/new/`)**: Planned pack files, changed config, and the next `.manage-agents/{installed,lock,desired}.json` files are written or copied into `<target>/.manage-agents/txn/<id>/new/`. This puts staging under the target, but a nested mount can still put a destination on another filesystem. For source-backed files, `stage` hashes the staged copy and aborts if it differs from the expected source hash.
+2. **Pre-journal TOCTOU verification (`plan.expected`)**: For planned payload paths and a changed config file, `planReconcile` records the expected current hash (`null` if absent, `symlink:<target>` for a symlink). After staging, `applyPlan` re-hashes the recorded paths and aborts before writing the journal if one changed. The staged state files are not entries in `plan.expected`.
+3. **Swap-time checks**: When an existing path is moved into `txn/<id>/prev/`, `applyPlan` compares that moved pre-image with the planned hash when the path has an `expected` entry. Before installing a staged replacement, it checks that the destination has not reappeared. A mismatch throws into the journal rollback path.
 
-### Crash Journal (`journal.json`) and Automatic Rollback
+### Crash Journal (`journal.json`) and Rollback Procedure
 
-Before the first live path in `<target>` is moved or unlinked, `applyPlan` persists [`<target>/.manage-agents/journal.json`](../config/user-and-target-files.md) using `atomicWriteRestrictedFile` (which writes to an exclusive sibling `.journal.json.<pid>.<rand>.tmp` file with restricted permissions per the [Security & Trust Model](./security-and-trust-model.md), flushes, and renames it atomically into place):
+Before the commit loop moves any live path, `applyPlan` writes [`<target>/.manage-agents/journal.json`](../config/user-and-target-files.md) through `atomicWriteRestrictedFile` (see [Security & Trust Model](./security-and-trust-model.md)):
 
 ```json
 {
@@ -146,34 +147,42 @@ Before the first live path in `<target>` is moved or unlinked, `applyPlan` persi
 }
 ```
 
-During the commit loop:
+The journal lists operations in the order they will be attempted. The commit loop processes them sequentially:
 
-1. For each operation where `op.existed` is `true`, the live target file is moved (`movePathWithRetry`) to `<target>/.manage-agents/txn/<id>/prev/<rel>`, preserving its exact pre-image.
-2. For each operation with a staged replacement (`op.staged`), the staged file is moved from `txn/<id>/new/<rel>` to `<target>/<rel>`. Planned deletions have `staged: null`, so moving the original into `prev/` completes the removal while retaining its pre-image until commit finishes.
-3. Once every operation succeeds, `applyPlan` deletes `journal.json`, removes `txn/<id>/`, and prunes empty parent directories of deleted files.
+1. If `op.existed` is true and the live path still exists, it is moved with `movePathWithRetry` to `<target>/.manage-agents/txn/<id>/prev/<rel>`.
+2. If the operation has a staged replacement, that file is moved from `txn/<id>/new/<rel>` to `<target>/<rel>`. For a deletion (`staged: null`), moving the old path into `prev/` effects the removal.
+3. After all operations succeed, `applyPlan` removes `journal.json`, removes `txn/<id>/`, and then prunes empty parent directories for deleted files.
 
-If an exception, `SIGKILL`, or power loss interrupts step 1 or 2, `journal.json` remains on disk. Both `applyPlan`'s `catch` block and the start of the next mutating `changeTarget` or `restoreBackup` call invoke `rollbackInterrupted(target)`:
+If the commit loop throws, its catch block calls `rollbackInterrupted(target)`. If the process stops after the journal is written, the next non-dry-run `changeTarget` or `restoreBackup` call also attempts recovery, provided the journal remains readable. The `status` command reports a pending journal but does not roll it back. A damaged journal is not automatically deleted, and the transaction directory is left for inspection.
 
-- It validates `journal.json` (refusing to auto-delete if damaged so the user can inspect `txn/<id>/`).
-- It iterates `journal.ops` **in reverse order**: if a pre-image exists in `txn/<id>/prev/<rel>`, it unlinks any partial destination and moves the `prev` file back; otherwise, if `!op.existed` and the file on disk still matches `op.hash`, it unlinks the newly staged file.
-- Finally, it removes `journal.json` and `txn/<id>/`, returning the target to its exact pre-transaction state (`result.recovered = true`).
+- It validates the journal's id and operation paths, then iterates `journal.ops` **in reverse order**. If a pre-image exists in `txn/<id>/prev/<rel>`, it removes any current destination and moves the pre-image back. Otherwise, for a path recorded as new, it removes the destination only when its current hash matches the staged hash in the journal.
+- It then removes `journal.json` and `txn/<id>/`; `changeTarget` reports `recovered: true` when this recovery ran.
+
+This rollback describes how recorded operations are reversed when their journal and pre-images are available; it is not a guarantee that every multi-path operation is all-or-nothing. The code does not establish power-loss durability. In particular, if a filesystem move uses the Windows copy/remove fallback below and the process stops mid-fallback, that helper's temporary sidecars are not separate entries in `journal.json`.
+
+### Windows Rename and Removal Handling
+
+[`src/utils/fsWindows.ts`](../modules/target-installer.md) centralizes retries for transient Windows file locks. `movePathWithRetry` first tries `renameSync`, retrying `EPERM`, `EACCES`, and `EBUSY` with short delays; it switches to a copy/remove fallback for `EXDEV` or after those retries are exhausted. The fallback copies through a sibling `.stage-<pid>-<random>` path, copies an existing destination to a `.bak-...` path, removes the destination, then renames or copies the staged entry into place. For a caught replacement failure it attempts to restore the backup; if restoration fails, it throws an error naming the retained backup. Symlinks are recreated from their link text, and directory copies use recursive copy with timestamps and verbatim symlinks.
+
+That fallback is not an atomic rename: destination removal and replacement are separate steps. `removePathWithRetry` also retries transient lock errors while using recursive, forced removal with Node's bounded retry options. These helpers improve behavior around transient Windows locks, but they do not turn the whole target update into an atomic operation.
 
 ## Lifecycle Diagram
 
 ```mermaid
 graph TD
-    Lock["1. Acquire install.lock & Rollback Pending journal.json"] --> Resolve["2. Compute DesiredState & PackLock (resolvePacks / pruneLock)"]
+    Lock["1. Acquire install.lock & Recover Pending Journal (non-dry-run)"] --> Resolve["2. Compute DesiredState & PackLock (resolvePacks / pruneLock)"]
     Resolve --> Plan["3. Plan Reconcile & Snapshot Expected Hashes (planReconcile)"]
     Plan --> Gate{"4. Conflicts or Untrusted Executable Surface?"}
     Gate -->|"Conflict (no --adopt) or Declined"| Abort["Abort Without Touching Target"]
     Gate -->|"Clean & Confirmed"| Stage["5. Stage Files & State in .manage-agents/txn/id/new/"]
     Stage --> Touched{"6. TOCTOU Check Against plan.expected"}
-    Touched -->|"Mismatch or Mid-Swap Error"| Rollback["Clean Staged Txn / Replay journal.json in Reverse"]
-    Touched -->|"Verified"| Commit["7. Save Backup, Write journal.json & Swap prev/ and new/"]
+    Touched -->|"Mismatch"| AbortStage["Remove Staged Txn / Abort Before Journal"]
+    Touched -->|"Verified"| Commit["7. Save Backup, Write journal.json & Apply Path Operations Sequentially"]
+    Commit -->|"Commit Loop Error or Later Recovery"| Rollback["Replay Recorded Operations in Reverse When Artifacts Exist"]
     Commit --> Done["8. Remove journal.json, Clean txn/ & Release install.lock"]
 ```
 
-Every mutating [CLI command](../api/cli-reference.md) passes through [`changeTarget`](../modules/target-installer.md), ensuring no target file is altered until [resolution](../modules/resolver-and-lock.md), conflict checks, [user confirmations](./security-and-trust-model.md), same-filesystem staging, TOCTOU checks, adoption backups, and crash journaling have all succeeded.
+Every mutating [CLI command](../api/cli-reference.md) uses the target lock: `install`, `uninstall`, `update`, and `reconcile` go through [`changeTarget`](../modules/target-installer.md), while restore goes through `restoreBackup`. Pack-managed paths are applied only after [resolution](../modules/resolver-and-lock.md), conflict checks, [user confirmations](./security-and-trust-model.md), staging, expected-hash checks, adoption backups, and journal creation; individual filesystem operations may still use the Windows copy/remove fallback described above.
 
 ---
 

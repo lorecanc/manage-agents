@@ -1,15 +1,15 @@
 ---
 title: "Project Overview"
-description: "Overview of manage-agents, its pack-based OpenCode ecosystem, core capabilities, and repository layout"
+description: "Overview of manage-agents, its pack-based OpenCode ecosystem, interactive workflows, release management, and repository layout"
 category: "root"
 source_files:
-  - "package.json"
   - "README.md"
-  - "AGENTS.md"
+  - "package.json"
+  - "src/App.tsx"
+  - "src/index.tsx"
   - "manage-agents.mjs"
-  - "contract/CONTRACT.md"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-17"
 ---
 
 # Project Overview
@@ -27,16 +27,17 @@ last_updated: "2026-11-13"
 
 ## Key Capabilities
 
-- **Pack Validation, Onboarding, and Doctor**: [`pack validate`](./modules/pack-validation-and-virtual-packs.md) checks directory layout, V2 frontmatter, mandatory `<dir>/<pack>/` namespaces, static imports, symlink safety, and executable surfaces against Contract `1.1` (while retaining backward compatibility with `1.0` packs and [migrating V1 agent fields to V2](./modules/agent-editing-and-v2-compat.md) on write). [`pack init|onboard`](./modules/pack-onboarding-and-doctor.md) converts raw `.md` agent folders, `.opencode/` directories, or cloned Git repositories into compliant packs, `pack doctor` diagnoses and auto-fixes contract drift or bumps semver versions, and `pack add` scaffolds V2 agents, skills, and slash commands.
+- **Pack Validation, Onboarding, and Doctor**: [`pack validate`](./modules/pack-validation-and-virtual-packs.md) checks directory layout, V2 frontmatter, mandatory `<dir>/<pack>/` namespaces, static imports, symlink safety, and executable surfaces against Contract `1.1` (while retaining backward compatibility with `1.0` packs and [migrating V1 agent fields to V2](./modules/agent-editing-and-v2-compat.md) on write). [`pack init|onboard`](./modules/pack-onboarding-and-doctor.md) turns raw agent folders, `.opencode/` directories, or cloned Git sources into compliant packs; its TUI wizard can choose root or subpack layout, organize files, and install the authoring kit. Selecting a virtual pack can prompt onboarding, while `I` starts it directly; for a read-only Git source the wizard clones a local editable copy first. `pack doctor` (TUI `D`) reports contract drift, can apply fixes, install the authoring skill and CI workflow, and bump SemVer. `pack add` (TUI `N`) scaffolds agents, skills, and slash commands.
 - **Source Registry and GitHub Integration**: [`source` commands](./modules/sources-and-github.md) attach local directories, arbitrary Git URLs, or GitHub `owner/repo` shorthands (`sources.json`), caching clean Git checkouts under `$XDG_CACHE_HOME/manage-agents/sources/<name>`. Built-in GitHub CLI (`gh`) integration (`source login`, `source auth`) authenticates HTTPS pulls via `gh auth git-credential` without persisting tokens on disk.
 - **Deterministic Dependency Resolution and Transactional Reconciliation**: [`resolve`](./modules/resolver-and-lock.md) computes a deterministic install order across pack `requires` semver ranges without silently picking newer versions when multiple sources offer the same pack name (`source prefer` or `<source>/<pack>` disambiguates). `install`, `uninstall`, `update`, `reconcile`, `status`, and `restore` [manage `<target>/opencode.json` and installed files transactionally](./modules/target-installer.md).
-- **Interactive 3-Workspace OpenTUI Application**: Launching `manage-agents` opens a full-screen React 19 + OpenTUI interface organized into three switchable workspaces:
-  1. **[Catalog & Inspector](./components/tui-shell-and-catalog.md)**: Collapsible pack/agent tree with live search, bulk selection, [inline parameter/permission/resource modals](./components/authoring-and-bridge-modals.md), and a 6-tab inspector (`Info`, `Prompt`, `Name`, `Sec`, `Graph`, `Res`).
-  2. **[Flows & Call Graph](./components/workspaces-flows-and-sources.md)**: Interactive topology explorer for caller-to-subagent delegations and conditional `IF / OR` routing policies.
-  3. **Sources & OpenCode Target**: Unified source switcher, `gh` repository browser, trust manager, and live OpenCode target sync dashboard.
+- **Interactive 3-Workspace OpenTUI Application**: Launching `manage-agents` without a command opens a full-screen React 19 + OpenTUI interface; `Tab`/`Shift+Tab`, clickable top-bar tabs, or the `Ctrl+K`/`Ctrl+P` Command Palette switch workspaces and actions:
+  1. **[Catalog & Inspector](./components/tui-shell-and-catalog.md)**: Collapsible pack/agent tree with live filtering and batch selection, [inline authoring controls](./components/authoring-and-bridge-modals.md), and a six-tab inspector for pack/agent info, prompts, naming, permissions, delegations, and resources.
+  2. **[Flows & Call Graph](./components/workspaces-flows-and-sources.md)**: Interactive topology explorer for caller-to-subagent delegations and conditional `IF / OR` routing policies, with an inspector for flow details and unresolved references.
+  3. **Sources & OpenCode Target**: Unified local/Git source manager with GitHub login and repository browsing, pull and trust controls, plus a live installed-pack and drift dashboard with one-key target reconciliation and engine self-update.
+  The shared interface also provides contextual shortcuts, a keyboard/mouse guide, resizable list/inspector panes, and a reduced-motion preference.
 - **Dynamic `IF / OR` Conditional and Archetype Routing**: For packs declaring [`archetype` metadata or user-configured flows](./concepts/conditional-routing-and-archetypes.md) (`models` CLI or `m` in the TUI), `reconcile` installs [`plugins/manage-agents-router/`](./modules/runtime-router-plugin.md) into the target and compiles layered `routing.json` rules (`routingDefaults` + `flowDefaults` -> global settings -> target settings). At runtime, matching caller and model triggers (`*`, `provider`, or `provider/model`) dynamically assign subagent models and enforce narrowable `tools`, `permissions`, and `delegations` policies while respecting pinned subagent models.
 - **Claude Code and Codex Bridges**: [`bridge` and `bridge check`](./modules/bridges.md) translate a pack and its transitive `requires` dependencies into a standalone Claude Code plugin (`.claude-plugin/plugin.json`, `marketplace.json`, skills, `.mcp.json`, `.lsp.json`, optional `claude plugin validate --strict` and user-scope registration) or a Codex layer, using persisted tier mappings (`planning`, `execution`, `light`, and Codex `reasoningEffort`) in [`bridges/translation-config.json`](./config/translation-and-release-config.md).
-- **Signed Engine Self-Update**: [`self-update`](./modules/launcher-and-build.md) (or `update --self`) and `release keygen|sign` upgrade `manage-agents` from `v*` GitHub Releases, verifying outer archive SHA-256 digests, inner bundle hashes, and optional Ed25519 signatures (`release-signing.json`), with atomic backup/rollback and automatic target router reconciliation.
+- **Engine Versioning, Self-Update, and Release Signing**: [`version`](./modules/launcher-and-build.md) reports the engine version, channel, dirty state, and bundle hash; `self-update --check` inspects GitHub releases, while `self-update` (also `update --self`) or TUI `Shift+U` applies an update. The updater verifies the release archive SHA-256 and bundle hash, plus an Ed25519 signature when `release-signing.json` is configured, and uses a journaled backup/recovery path; applying an update can also synchronize dependencies and reconcile the OpenCode target/router. Maintainers can create signing keys with `release keygen`, write release metadata with `version --write-manifest`, and sign staged release assets with `release sign` (or explicitly produce unsigned SHA-256 metadata).
 
 ## Tech Stack
 
@@ -65,31 +66,30 @@ last_updated: "2026-11-13"
 
 ```mermaid
 graph TD
-    Sources["Local & Git/GitHub Sources (Packs & Virtual Packs)"] --> Engine["manage-agents CLI & 3-Workspace OpenTUI"]
-    Settings["Scoped User Settings (routing.json, overrides.json)"] --> Engine
-    Engine --> Validator["Contract 1.1 Validator & Semver Resolver"]
-    Validator --> Installer["Transactional Target Reconciler"]
-    Validator --> Translator["Cross-Harness Bridge Translator"]
-    Installer --> Target["OpenCode Target (opencode.json + .manage-agents/)"]
-    Installer --> Router["Runtime Plugin (manage-agents-router)"]
-    Router --> Target
+    Sources["Local & Git/GitHub Pack Sources"] --> Engine["CLI & 3-Workspace OpenTUI"]
+    Settings["Scoped User Settings"] --> Engine
+    Engine --> PackOps["Contract Validator, Resolver & Reconciler"]
+    PackOps --> Target["OpenCode Target & Runtime Router"]
+    Engine --> Translator["Cross-Harness Bridge Translator"]
     Translator --> Bridges["Claude Code Plugins & Codex Layers"]
+    Releases["GitHub Release Assets"] --> Updater["Verified Engine Self-Updater"]
+    Updater --> Engine
 ```
 
-`manage-agents` ingests packs from local workspaces or cached Git sources, combines them with [scoped user settings](./config/user-and-target-files.md), validates and resolves their [dependency graph](./modules/resolver-and-lock.md) under Contract `1.1`, and either reconciles them atomically into an [OpenCode target](./modules/target-installer.md) (alongside [`manage-agents-router`](./modules/runtime-router-plugin.md)) or translates them into [Claude Code and Codex artifacts](./modules/bridges.md).
+`manage-agents` ingests packs from local workspaces or cached Git sources, combines them with [scoped user settings](./config/user-and-target-files.md), validates and resolves their [dependency graph](./modules/resolver-and-lock.md) under Contract `1.1`, and either reconciles them into an [OpenCode target](./modules/target-installer.md) with [`manage-agents-router`](./modules/runtime-router-plugin.md) or translates them into [Claude Code and Codex artifacts](./modules/bridges.md). Separately, the version and release commands check and install verified engine bundles from GitHub Releases, with optional signing and target reconciliation.
 
 ## Repository Directory Map
 
 ```text
 manage-agents/
-├── manage-agents.mjs                    # CLI launcher (bin): enforces Node >=26.4.0 + --experimental-ffi, checks deps, auto-rebuilds dist/ when src/ is newer
+├── manage-agents.mjs                    # CLI launcher: enforces runtime requirements, synchronizes dependencies, rebuilds checkout dist/, and recovers interrupted engine updates
 ├── package.json                         # Package manifest, scripts (start, build, typecheck, test, validate), and published files list
 ├── src/
 │   ├── build.mjs                        # esbuild bundler compiling src/index.tsx -> dist/index.js (ESM)
-│   ├── index.tsx                        # CLI command dispatcher and entry point launching non-interactive commands or OpenTUI
-│   ├── App.tsx                          # Root React 19 OpenTUI state coordinator and Catalog & Inspector workspace
-│   ├── ui/                              # OpenTUI workspaces and modals (FlowsWorkspace, SourcesTargetWorkspace, PackOnboardingModal, PackDoctorModal, BridgeModal, ParameterTuningModal, CommandPaletteModal, HelpModal)
-│   └── utils/                           # Core engine TypeScript modules and colocated *.test.ts suites (packs, resolver, installer, lock, sources, github, archetypes, userSettings, agents, models, v2Compat, virtualPacks, packOnboarding, bridge, codexBridge, selfUpdate, repositoryTransaction)
+│   ├── index.tsx                        # CLI dispatcher for pack/source/target/workspace/version/release commands and OpenTUI startup
+│   ├── App.tsx                          # Root OpenTUI coordinator for workspaces, authoring/doctor modals, target status, and engine updates
+│   ├── ui/                              # Workspaces and modals (Flows, Sources/Target, onboarding, doctor/scaffolding, bridge, palette, help, tuning)
+│   └── utils/                           # Engine modules and colocated tests, including packOnboarding, engineVersion, selfUpdate, resolver, installer, sources, and bridges
 ├── runtime/
 │   └── plugins/manage-agents-router/    # OpenCode V2 runtime router plugin (index.ts, router.js) and unit tests (router.test.mjs) copied into managed targets on reconcile
 ├── contract/
@@ -108,4 +108,6 @@ manage-agents/
 - [Getting Started](./getting-started.md) — Runtime prerequisites, installation, CLI/TUI quickstart, and contributor validation workflow
 - [CLI Command Reference](./api/cli-reference.md) — Complete subcommand and flag reference for `manage-agents`
 - [OpenCode Pack Contract 1.1 Reference](./api/pack-contract-reference.md) — Normative manifest, directory layout, and namespace rules
+- [Pack Onboarding and Doctor](./modules/pack-onboarding-and-doctor.md) — Pack conversion, repair, authoring kit, and resource scaffolding workflows
+- [Launcher, Build, and Self-Update](./modules/launcher-and-build.md) — Runtime bootstrap, build behavior, versioning, and verified engine updates
 - [Glossary](./glossary.md) — Core terminology across packs, virtual packs, sources, targets, archetypes, and bridges

@@ -4,10 +4,12 @@ description: "Complete syntax, flags, exit codes, and JSON output reference for 
 category: "api"
 source_files:
   - "src/index.tsx"
+  - "src/utils/engineVersion.ts"
+  - "src/utils/selfUpdate.ts"
   - "manage-agents.mjs"
   - "README.md"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-17"
 ---
 
 # CLI Command Reference
@@ -61,6 +63,7 @@ Global flags are stripped from `process.argv` before command-specific parsing (`
 | `MANAGE_AGENTS_WORKSPACE` | Unset | Default workspace path when `--workspace` is omitted. |
 | `AGENT_MANAGER_AUTO_COMMIT` | `0` | Must be `0` or `1` if set (any other value throws an error and exits `1`). Overridden by `--auto-commit` / `--no-auto-commit`. |
 | `MANAGE_AGENTS_SKIP_AUTO_INSTALL` | Unset | Set to `1` to skip automatic `npm`/`bun` dependency installation in `manage-agents.mjs`. |
+| `MANAGE_AGENTS_ALLOW_UNSIGNED` | Unset (`0`) | Set to `1` to permit SHA-256-only release operations when no trusted Ed25519 public key is configured; the command-line equivalent is `--allow-unsigned` for `self-update` and `release sign`. |
 | `AGENT_MANAGER_UI_CONFIG` | [`$XDG_CONFIG_HOME/manage-agents/ui.json`](../config/user-and-target-files.md) | Custom UI layout config file path (loads layout in read-only mode). |
 
 ---
@@ -410,13 +413,15 @@ Regenerates committed bridges (`bridges/claude-code/<plugin>` and/or `bridges/co
 
 ## 7. Engine Version, Self-Update & Release Signing
 
-Implemented by `runVersionCLI()`, `runSelfUpdateCLI()`, and `runReleaseCLI()` (`src/index.tsx:1339-1529`; see [Launcher, Build & Self-Update](../modules/launcher-and-build.md)).
+Implemented by `runVersionCLI()`, `runSelfUpdateCLI()`, and `runReleaseCLI()` (`src/index.tsx:1377-1614`; dispatches `version`, `self-update`, `release`, `--version`/`-v`/`-V`, and `update --self`; see [Launcher, Build & Self-Update](../modules/launcher-and-build.md)).
 
 ### `version`
 
 ```bash
 manage-agents version [--json] [--engine-root <dir>]
-manage-agents --version | -v | -V
+manage-agents --version [--json]
+manage-agents -v [--json]
+manage-agents -V [--json]
 manage-agents version --write-manifest --ref-type <tag|branch> --ref-name <name> --sha <sha> [--engine-root <dir>] [--json]
 ```
 
@@ -436,34 +441,35 @@ Inspects the running `manage-agents` engine installation or writes an engine rel
 ### `self-update`
 
 ```bash
-manage-agents self-update [--check] [--yes|-y] [--force] [--reconcile|--no-reconcile] [--repo <owner/repo>] [--target <dir>] [--engine-root <dir>] [--json]
+manage-agents self-update [--check] [--yes|-y] [--force] [--allow-unsigned] [--reconcile|--no-reconcile] [--repo <owner/repo>] [--target <dir>] [--engine-root <dir>] [--json]
 manage-agents update --self [...]
 ```
 
-Checks or installs the latest `v*` GitHub Release of `manage-agents` into its installation directory with atomic backup/rollback, archive SHA-256 verification, inner bundle hash verification, and [Ed25519 signature verification](../concepts/security-and-trust-model.md) when [`release-signing.json`](../config/translation-and-release-config.md) is configured.
+Checks or installs the latest `v*` GitHub Release of `manage-agents` into its installation directory with atomic backup/rollback, archive SHA-256 verification, and inner bundle hash verification. A configured trusted Ed25519 key requires a valid release signature; without a configured key, `--allow-unsigned` opts into SHA-256-only release verification. `update --self` dispatches to this command after removing the alias flag.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--check` | `false` | Check for updates against GitHub Releases and report verification mode, digests, and availability without modifying disk. |
 | `--yes`, `-y` | `false` | Skip interactive `[Y/n]` confirmation prompt. **Required** when running non-interactively (non-TTY) or with `--json` when an update is available. |
-| `--force` | `false` | Allow downgrading when the latest GitHub Release is older than the installed version. |
-| `--reconcile` | Auto (`true` when target needs router update on apply) | Force reconciliation of `--target` even when already on the latest engine version. Mutually exclusive with `--no-reconcile`. |
+| `--force` | `false` | Allow downgrading and overwrite an engine installation with uncommitted changes. |
+| `--allow-unsigned` | `false` | Permit SHA-256 and bundle-hash verification without an Ed25519 signature when no trusted public key is configured. Does not bypass a configured trusted-key requirement. |
+| `--reconcile` | Automatic after an applied update when the target has installed packs | Request reconciliation even when the engine is already current (when the target has installed packs). Mutually exclusive with `--no-reconcile`. |
 | `--no-reconcile` | `false` | Skip automatic reconciliation of `--target` after updating the engine. |
-| `--repo <owner/repo>` | Engine manifest repo or `lorecanc/manage-agents` | GitHub repository to query for releases. |
+| `--repo <owner/repo>` | Configured repo, `$MANAGE_AGENTS_REPO`, or `lorecanc/manage-agents` | GitHub repository to query for releases. |
 | `--target <dir>` | `$XDG_CONFIG_HOME/opencode` | OpenCode target directory to check and reconcile after updating. |
 | `--engine-root <dir>` | Auto-detected engine root | Override `manage-agents` installation directory. |
-| `--json` | `false` | Emit structured JSON (`checkResult` on `--check`; `{ updated: false, applied: false, ... }` when up-to-date or downgrade-blocked; full update result when applied) and suppress progress lines. |
+| `--json` | `false` | Emit structured JSON (`checkResult` on `--check`; `{ updated: false, applied: false, ... }` when up-to-date or downgrade-blocked; full update result when applied) and suppress progress lines. A blocked downgrade exits `1`; a failed post-update reconciliation also sets exit code `1`. |
 
-- **Exit codes**: `0` on success, up-to-date, user-cancelled prompt, or blocked downgrade (without `--force`); `1` on network/signature/checksum failure or missing `--yes` in non-TTY / `--json` mode when an update applies; `2` on positional arguments, combining `--reconcile` with `--no-reconcile`, or unknown flags.
+- **Exit codes**: `0` on success, up-to-date, or user-cancelled prompt; `1` on a blocked downgrade (without `--force`), network/signature/checksum failure, missing `--yes` in non-TTY / `--json` mode when an update applies, or failed reconciliation; `2` on positional arguments, combining `--reconcile` with `--no-reconcile`, or unknown flags.
 
 ### `release` (`keygen` & `sign`)
 
 ```bash
 manage-agents release keygen [--out <private-key-file>] [--key-id <id>] [--repo <owner/repo>] [--replace-keys] [--engine-root <dir>] [--json]
-manage-agents release sign --tag <tag> --sha <sha> --assets-dir <dir> [--repo <owner/repo>] [--private-key-file <file>] [--engine-root <dir>] [--json]
+manage-agents release sign --tag <tag> --sha <sha> --assets-dir <dir> [--repo <owner/repo>] [--private-key-file <file>] [--engine-root <dir>] [--allow-unsigned] [--json]
 ```
 
-Maintainer tooling for Ed25519 release signing and `release-metadata.json` generation.
+Maintainer tooling for Ed25519 release signing and `release-metadata.json` generation. `--allow-unsigned` permits SHA-256-only metadata when no trusted signing key is configured; a configured trusted-key policy still requires a matching Ed25519 private key.
 
 #### `release keygen`
 
@@ -480,19 +486,20 @@ Generates an Ed25519 signing keypair, writes the private key with `0600` permiss
 
 #### `release sign`
 
-Computes SHA-256 archive digests in `--assets-dir`, writes `release-metadata.json`, and writes `release-metadata.json.sig` when `release-signing.json` configures Ed25519 trust (reading the private key from `--private-key-file` or `$RELEASE_SIGNING_PRIVATE_KEY`).
+Computes SHA-256 archive digests in `--assets-dir` and writes `release-metadata.json`. When an Ed25519 private key is provided from `--private-key-file` or `$RELEASE_SIGNING_PRIVATE_KEY`, it also writes `release-metadata.json.sig`; unsigned SHA-256-only metadata requires `--allow-unsigned` and no configured trusted public keys.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--tag <tag>` | Required | Release tag name (for example `v1.2.0`). |
 | `--sha <sha>` | Required | Commit SHA corresponding to the release. |
 | `--assets-dir <dir>` | Required | Directory containing built release archive assets and receiving `release-metadata.json` (+ `.sig`). |
-| `--private-key-file <file>` | `$RELEASE_SIGNING_PRIVATE_KEY` | Path to Ed25519 PEM private key file. |
+| `--private-key-file <file>` | Not set | Read the Ed25519 PEM private key from this file; if omitted, read PEM content from `$RELEASE_SIGNING_PRIVATE_KEY`. |
 | `--repo <owner/repo>` | Engine default | Repository identifier recorded in `release-metadata.json`. |
 | `--engine-root <dir>` | Auto-detected engine root | Engine root used to read `release-signing.json`. |
-| `--json` | `false` | Emit `{ metadataPath, signaturePath?, metadata }`. |
+| `--allow-unsigned` | `false` | Write SHA-256-only metadata when no trusted key is configured; the policy cannot be bypassed when trusted public keys are present. |
+| `--json` | `false` | Emit `{ metadata, metadataPath, signaturePath, signatureBase64 }`; signature fields are `null` in unsigned mode. |
 
-- **Exit codes (`release`)**: `0` on success (`--help` or bare `manage-agents release` prints usage and exits `0`); `1` on missing `RELEASE_SIGNING_PRIVATE_KEY` when Ed25519 trust is active or asset/signing errors; `2` on invalid subcommand, missing required flags, unexpected positional arguments, or unknown options.
+- **Exit codes (`release`)**: `0` on success (`--help` or bare `manage-agents release` prints usage and exits `0`); `1` on missing/invalid signing key or asset/signing errors; `2` on invalid subcommand, missing required flags, unexpected positional arguments, or unknown options.
 
 ---
 
@@ -502,9 +509,9 @@ Computes SHA-256 archive digests in `--assets-dir`, writes `release-metadata.jso
 
 | Exit Code | Meaning | Typical Triggers |
 |-----------|---------|------------------|
-| `0` | **Success** | Command completed cleanly, `--help` / `--version` printed, `status` is in sync, `bridge check` has no drift, or `self-update` found no update needed. |
-| `1` | **Operational, validation, or drift failure** | Pack validation errors (`pack validate`, `pack doctor`), resolution problems (`resolve`), target drift (`status`), declined/failed target changes in text mode (`install`, `uninstall`, `update`, `reconcile`), bridge drift (`bridge check`), unauthenticated `source auth` (text mode), missing workspace, `tune` validation errors, Node.js `< 26.4.0` in `manage-agents.mjs`, or runtime exceptions. |
-| `2` | **CLI usage / argument error** | Unknown top-level command, unknown option or missing flag value in `parseCliArgs()`, missing required subcommand (`pack`, `source`, `models`, `override`), missing required positional arguments (`install`, `uninstall`, `restore`, `resolve`, `pack validate`), unexpected positional arguments (`reconcile`, `status`, `version`, `self-update`, `release`), or empty `--source`. |
+| `0` | **Success** | Command completed cleanly, `--help` / `--version` printed, `status` is in sync, `bridge check` has no drift, or `self-update` found no update needed or the user cancelled its confirmation prompt. |
+| `1` | **Operational, validation, or drift failure** | Pack validation errors (`pack validate`, `pack doctor`), resolution problems (`resolve`), target drift (`status`), declined/failed target changes in text mode (`install`, `uninstall`, `update`, `reconcile`), bridge drift (`bridge check`), unauthenticated `source auth` (text mode), missing workspace, `tune` validation errors, blocked self-update downgrade, failed self-update reconciliation, Node.js `< 26.4.0` in `manage-agents.mjs`, or runtime exceptions. |
+| `2` | **CLI usage / argument error** | Unknown top-level command, unknown option or missing flag value in `parseCliArgs()`, missing required subcommand (`pack`, `source`, `models`, `override`), missing required positional arguments (`install`, `uninstall`, `restore`, `resolve`, `pack validate`), unexpected positional arguments (`reconcile`, `status`, `version`, `self-update`), invalid `release` subcommand or syntax, or empty `--source`. |
 | `128 + N` | **Signal termination** | Launcher (`manage-agents.mjs`) child Node process terminated by OS signal `N`. |
 
 ### `--json` Output & Terminal Safety Escaping

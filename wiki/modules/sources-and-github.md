@@ -1,25 +1,25 @@
 ---
 title: "Sources & GitHub Integration"
-description: "Source registry management, read-only Git cache operations, pack discovery, and GitHub CLI authentication"
+description: "Source registry management, Git cache operations, pack discovery, and GitHub CLI authentication"
 category: "modules"
 source_files:
   - "src/utils/sources.ts"
   - "src/utils/github.ts"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-17"
 ---
 
 # Sources & GitHub Integration
 
 ## Purpose
 
-The Sources & GitHub Integration module manages where `manage-agents` discovers OpenCode *[packs]* (see [Glossary](../glossary.md)). It maintains the user-level source registry ([`sources.json`](../config/user-and-target-files.md)), manages read-only Git checkouts and immutable commit snapshots in the user cache directory, discovers manifest-backed and [virtual packs](./pack-validation-and-virtual-packs.md) across registered sources, hardens all `git` subprocess invocations against [untrusted URLs](../concepts/security-and-trust-model.md) and environment variables, and integrates optionally with the GitHub CLI (`gh`) for shorthand expansion, interactive authentication, repository browsing, and tokenless private HTTPS cloning.
+The Sources & GitHub Integration module manages where `manage-agents` discovers OpenCode *[packs]* (see [Glossary](../glossary.md)). It maintains the user-level source registry ([`sources.json`](../config/user-and-target-files.md)), manages Git source caches and detached, revision-pinned snapshots in the user cache directory, discovers manifest-backed and [virtual packs](./pack-validation-and-virtual-packs.md) across registered sources, hardens `git` subprocess invocations against [untrusted URLs](../concepts/security-and-trust-model.md) and environment variables, and integrates optionally with the GitHub CLI (`gh`) for shorthand expansion, interactive browser login, repository listing, and transient credential-helper access to private HTTPS repositories.
 
 ## Key Files
 
 | File | Role |
 |------|------|
-| `src/utils/sources.ts` | Source registry schema and persistence, URL/ref validation, read-only Git cache management, locked revision snapshots, working-tree clones, and pack discovery. |
+| `src/utils/sources.ts` | Source registry schema and persistence, URL/ref validation, managed Git cache operations, revision-pinned snapshots, working-tree clones, and pack discovery. |
 | `src/utils/github.ts` | GitHub repository shorthand parser, HTTPS hostname validator, and `gh` CLI wrappers for authentication checks, browser login, and repository listing. |
 
 ## Source Registry
@@ -45,7 +45,7 @@ export interface SourceRegistry {
 }
 ```
 
-- **`local` sources** point to an existing local directory resolved through `fs.realpathSync(dir)`. Passing `--ref` for a local directory is rejected.
+- **`local` sources** added through `addSource` must point to an existing directory, which is stored through `fs.realpathSync(dir)`; loading a registry checks that its stored path is absolute but does not re-check that the directory still exists. Passing `--ref` for a local directory is rejected.
 - **`git` sources** record a clean remote `url` and an optional branch, tag, or commit `ref` validated against `GIT_REF_RE`.
 - **`trusted`** controls whether executable pack content from the source requires interactive confirmation (`--yes` in non-interactive CLI flows) during [installation or reconciliation](./target-installer.md).
 - **`prefer`** maps a pack name to a preferred source name when multiple sources advertise the same pack.
@@ -64,9 +64,11 @@ export interface SourceRegistry {
 
 ## Git Checkout Cache, Revision Snapshots & Pack Discovery
 
-### Read-Only Source Checkouts
+### Cached Git Source Checkouts
 
 `engineCacheDir()` resolves `$XDG_CACHE_HOME/manage-agents` (defaulting to `~/.cache/manage-agents`). `sourceRoot(source, env)` maps `local` sources to `source.path` and `git` sources to `$XDG_CACHE_HOME/manage-agents/sources/<name>`.
+
+Git source directories are managed caches rather than filesystem-protected read-only directories: `pullSource` may fetch and update their detached checkout. `cloneSourceToWorkingTree` is the separate operation for creating an editable working copy.
 
 `pullSource(source, env, options)` synchronizes a `git` source checkout (`local` sources return `null`):
 
@@ -81,11 +83,11 @@ Two offline helpers inspect cached state without network calls:
 
 ### Deterministic Revision Snapshots
 
-During lockfile-driven [`reconcile`](./target-installer.md), the installer requires the exact commit recorded in the [target lockfile](./resolver-and-lock.md) even if the mutable source cache in `sources/<name>` has since been pulled to a newer commit. `revisionSnapshot(source, revision, env)` provides an immutable per-commit checkout at `$XDG_CACHE_HOME/manage-agents/revisions/<name>/<revision>`:
+During lockfile-driven [`reconcile`](./target-installer.md), the installer requires the exact commit recorded in the [target lockfile](./resolver-and-lock.md) even if the mutable source cache in `sources/<name>` has since been pulled to a newer commit. `revisionSnapshot(source, revision, env)` provides a detached checkout pinned to that commit at `$XDG_CACHE_HOME/manage-agents/revisions/<name>/<revision>`:
 
 1. Validates that `source.kind === "git"` and `revision` matches `/^[0-9a-f]{40,64}$/`.
 2. Returns `<dir>` immediately if `<dir>/.git` already exists.
-3. Ensures the primary cache repository (`sources/<name>/.git`) has been pulled.
+3. Requires the primary cache repository (`sources/<name>/.git`) to have been pulled already; `revisionSnapshot` does not fetch it.
 4. Clones locally with shared Git object storage into a process-unique temporary sibling directory (`<dir>.tmp-<pid>-<timestamp>`):
    ```ts
    git(["clone", "--quiet", "--shared", "--no-checkout", "--", repo, temporary])
@@ -109,7 +111,7 @@ For [local authoring and onboarding workflows](./pack-onboarding-and-doctor.md),
 Because pack sources may point to untrusted third-party repositories (see [Security & Trust Model](../concepts/security-and-trust-model.md)), `src/utils/sources.ts` enforces strict validation before invoking `git`:
 
 - **Allowed transport schemes (`GIT_URL_RE`)**: Accepts only `https://...`, `ssh://...`, and SCP-style `user@host:path` URLs where the remote path does not start with `-` (blocking SSH argument injection such as `git@host:-oProxyCommand=...`). Unencrypted `http://`, `git://`, `ftp://`, and unknown URI schemes are rejected.
-- **`file:` protocol lockdown**: `file:` URLs are rejected by `isGitLocation` unless `options.allowFileUrls === true` (used exclusively by test suites). Both `pullSource` and `cloneSourceToWorkingTree` pass `-c protocol.file.allow=never` to `git` whenever `allowFileUrls` is not enabled.
+- **`file:` protocol lockdown**: `addSource`, `pullSource`, and `cloneSourceToWorkingTree` reject `file:` URLs unless `options.allowFileUrls === true`; `loadSources` allows the syntax during registry validation, but default pull/clone operations still reject it. Both Git operations pass `-c protocol.file.allow=never` whenever `allowFileUrls` is not enabled.
 - **Credential-in-URL rejection (`hasUrlCredentials`)**: Rejects URLs containing embedded usernames/tokens (`https://user:secret@...`, `https://ghp_token@...`, `ssh://user:pass@...`) or query strings (`https://github.com/org/repo.git?access_token=...`) so secrets are never written to `sources.json` or echoed by `manage-agents source list`.
 - **Safe ref syntax (`GIT_REF_RE`)**: `/^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]+$/` forbids leading hyphens (preventing flag injection like `--upload-pack=...`) and `..` sequences. Inline `#<ref>` suffixes on `https://` and `ssh://` URLs are extracted and checked for conflicts with explicit `--ref` arguments.
 - **Sanitized subprocess environment**: Every `git` call runs with `stdio: ["ignore", "pipe", "pipe"]`, `windowsHide: true`, and `cleanGitEnvironment({ GIT_TERMINAL_PROMPT: "0" })` (defined in [`src/utils/repositoryTransaction.ts`](./agent-editing-and-v2-compat.md)). Setting `GIT_TERMINAL_PROMPT=0` prevents Git from hanging on interactive password prompts, while `cleanGitEnvironment` strips repository-redirecting and configuration-injecting variables from `process.env`:
@@ -130,19 +132,19 @@ Because pack sources may point to untrusted third-party repositories (see [Secur
 
 Owner, repository, and optional `#ref` segments are validated against `GITHUB_OWNER_RE`, `GITHUB_REPO_RE` (rejecting `.`, `..`, and leading `-`), and `SHORTHAND_REF_RE`, expanding to `https://github.com/<owner>/<repo>.git`. Full GitHub HTTPS/SSH URLs bypass `parseGitHubShorthand` and are handled directly by `addSource` (including inline `#ref` extraction on `https://` and `ssh://` URLs).
 
-`extractHttpsHost(url)` parses `https://` URLs via `new URL(url)`, returning `null` if the URL has embedded credentials, a custom port, or a non-HTTPS scheme, and validates the lowercase hostname against `GITHUB_HOST_RE` (`/^(?!-)[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/`).
+`extractHttpsHost(url)` parses `https://` URLs via `new URL(url)`, returning `null` if the URL has embedded credentials, a non-default port, or a non-HTTPS scheme, and validates the lowercase hostname against `GITHUB_HOST_RE` (`/^(?!-)[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/`).
 
 ### Authentication, Web Login & Repository Listing
 
 All `gh` subprocesses run under `cleanGitEnvironment`:
 
-- **`inspectGhAuth` / `inspectGhAuthAsync`**: Validates `hostname` against `GITHUB_HOST_RE` and executes `gh auth status --hostname <host> --json hosts` (never passing `--show-token`). Parses `hosts[host]` to detect missing `gh` (`ENOENT` -> `available: false`), active authenticated accounts (`state === "success"`), expired sessions needing re-authentication, or unauthenticated hosts.
+- **`inspectGhAuth` / `inspectGhAuthAsync`**: Validates `hostname` against `GITHUB_HOST_RE` and executes `gh auth status --hostname <host> --json hosts` (never passing `--show-token`). It reads the requested `hosts[host]` entry, falling back to the first host entry if that key is absent. An active account with `state === "success"` is preferred, then any successful account; accounts with no successful entry are reported as needing re-authentication. Missing `gh` (`ENOENT`) produces `available: false`; no account is reported as unauthenticated. If the output is not valid JSON but `gh` exits successfully, the parser treats the host as authenticated.
 - **`runGhWebLogin`**: Runs `gh auth login --hostname <host> --git-protocol https --web` with `stdio: "inherit"` so the user can complete browser OAuth interactively, then re-verifies status with `inspectGhAuth`.
-- **`listGhRepos` / `listGhReposAsync`**: Validates `owner` (`GITHUB_OWNER_RE`), `hostname` (`GITHUB_HOST_RE`), and clamps `limit` to `1..200` (default `100`), then runs:
+- **`listGhRepos` / `listGhReposAsync`**: Validates `owner` (`GITHUB_OWNER_RE`) and `hostname` (`GITHUB_HOST_RE`), clamps the numeric `limit` to `1..200` (default `100`), and sets `GH_HOST` for non-`github.com` hosts, then runs:
   ```text
   gh repo list [<owner>] --limit <limit> --no-archived --json nameWithOwner,description,isPrivate,updatedAt,url
   ```
-  For GitHub Enterprise hosts (`host !== "github.com"`), `GH_HOST` is set in the child environment. Each returned `nameWithOwner` is re-validated via `parseGitHubShorthand` before constructing `GhRepoSummary` items.
+  Each returned `nameWithOwner` is re-validated via `parseGitHubShorthand` before constructing `GhRepoSummary` items. An HTTPS `url` from `gh` is normalized to end in `.git`; otherwise a URL is synthesized using the selected host.
 
 ### Transparent Credential Helper Injection
 
@@ -167,17 +169,19 @@ The first `-c` resets any preconfigured credential helpers for `<host>` during t
 |--------|------|-------------|
 | `Source`, `SourceRegistry`, `PackCandidate`, `GitOptions` | Types | Core data structures for sources, `sources.json`, discovered packs, and Git auth/protocol options. |
 | `GIT_REF_RE`, `DISCOVERY_DEPTH`, `SKIPPED_DIRS` | Constants | Safe Git ref pattern and pack discovery bounds (`DISCOVERY_DEPTH = 4`). |
+| `assertSafeCachePath(cacheRoot, targetPath)` | Function | Reject a cache path outside the cache root or through existing symlinked/non-directory components. |
 | `engineConfigDir(env?)`, `engineCacheDir(env?)` | Functions | Resolve `$XDG_CONFIG_HOME/manage-agents` and `$XDG_CACHE_HOME/manage-agents`. |
 | `loadSources(env?)`, `saveSources(registry, env?)` | Functions | Read/validate and atomically persist `sources.json` (`0o600`). |
 | `deriveSourceName(location, registry)` | Function | Generate a unique valid `PACK_NAME_RE` slug from a path, URL, or shorthand. |
 | `addSource(registry, name, location, settings?, options?)` | Function | Validate and register a `local` or `git` source in `registry`. |
 | `removeSource(registry, name)`, `findSource(registry, name)` | Functions | Remove (with `prefer`/`active` cleanup) or look up a source by name. |
+| `hasUrlCredentials(location)`, `redactUrlCredentials(location)` | Functions | Detect embedded URL credentials/query tokens and redact them for diagnostics. |
 | `sourceRoot(source, env?)`, `expandUserPath(rawPath, env?)` | Functions | Resolve a source's filesystem path or expand `~` user paths. |
 | `ghCredentialArgs(url, env?, options?)` | Function | Build transient `-c credential.https://<host>.helper=...` flags when `gh` is authenticated. |
 | `pullSource(source, env?, options?)` | Function | Clone or fetch a `git` source into the cache and check out its resolved commit detached. |
 | `cloneSourceToWorkingTree(source, destDir, env?, options?)` | Function | Clone a `git` source into a symlink-checked writable directory for local authoring. |
 | `lastFetchedRevision(source, env?)`, `sourceRevision(source, env?)` | Functions | Inspect the cached ref commit or checked-out `HEAD` commit without network access. |
-| `revisionSnapshot(source, revision, env?)` | Function | Create or reuse a read-only `--shared` detached checkout of a specific commit SHA. |
+| `revisionSnapshot(source, revision, env?)` | Function | Create or reuse a `--shared` detached checkout pinned to a specific commit SHA. |
 | `discoverPacks(source, env?)`, `discoverAllPacks(registry, env?)` | Functions | Discover manifest-backed and virtual packs across one or all sources. |
 
 ### `src/utils/github.ts`
@@ -252,9 +256,9 @@ if (commit) {
 ## Related Pages
 
 - [Dependency Resolver & Lockfile](./resolver-and-lock.md) — Consumes discovered `PackCandidate` entries, `prefer` mappings, and Git revision SHAs.
-- [Transactional Target Installer](./target-installer.md) — Pulls Git sources during `update` and checks out immutable `revisionSnapshot` directories during `reconcile`.
+- [Transactional Target Installer](./target-installer.md) — Pulls Git sources during `update` and checks out revision-pinned `revisionSnapshot` directories during `reconcile`.
 - [Pack Validation, Catalog & Virtual Packs](./pack-validation-and-virtual-packs.md) — Manifest reading and virtual `0.0.0-virtual` pack synthesis invoked during `discoverPacks`.
-- [Pack Onboarding, Doctor & Scaffolding](./pack-onboarding-and-doctor.md) — Uses `cloneSourceToWorkingTree` to convert read-only Git sources into editable local pack repositories.
+- [Pack Onboarding, Doctor & Scaffolding](./pack-onboarding-and-doctor.md) — Uses `cloneSourceToWorkingTree` to turn a Git source into an editable local pack repository.
 - [Flows & Data Sources Workspaces](../components/workspaces-flows-and-sources.md) — Interactive TUI workspace for managing sources, GitHub authentication, and repository browsing.
 - [Security & Trust Model](../concepts/security-and-trust-model.md) — Threat model for untrusted Git URLs, credential rejection, subprocess hardening, and source `trusted` flags.
 - [User Settings, Target State & Environment Variables](../config/user-and-target-files.md) — File layout reference for `sources.json` and `$XDG_CACHE_HOME/manage-agents/`.

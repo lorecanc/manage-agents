@@ -12,8 +12,10 @@ source_files:
   - "src/utils/bridgePrompt.ts"
   - "src/utils/claudePluginCli.ts"
   - "src/utils/claudeNextSteps.ts"
+  - "src/App.tsx"
+  - "src/index.tsx"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-18"
 ---
 
 # Claude Code & Codex Bridges
@@ -29,6 +31,7 @@ The *bridge* (see [Glossary](../glossary.md)) subsystem performs [cross-harness 
 | `src/utils/bridgeWorkspace.ts` | Resolves transitive pack closures into an isolated temp workspace (`prepareBridgeWorkspace`), orchestrates generation (`withGeneratedPackBridge`), and mirrors changed files (`bridgePack`). |
 | `src/utils/translationConfig.ts` | Defines the v2 [`TranslationConfig`](../config/translation-and-release-config.md) schema, v1-to-v2 migration, validation, peer-model inference index, and the five-step `resolveModelTarget` pipeline. |
 | `src/utils/bridgePrompt.ts` | [Interactive TUI](../components/authoring-and-bridge-modals.md) state management, pack filtering, tier/role draft editing, preset cycling, and live mapping preview (`buildPackBridgePreview`). |
+| `src/App.tsx`, `src/index.tsx` | TUI and CLI callers that apply/persist bridge drafts, invoke `bridgePack`, and optionally run Claude CLI validation and registration. |
 | `src/utils/bridge.ts` | Converts OpenCode agents, commands, skills, MCP servers, and LSP servers into a Claude Code plugin and local marketplace manifest. |
 | `src/utils/codexBridge.ts` | Converts OpenCode agents, skills, and MCP servers into a Codex plugin manifest (`.codex-plugin/plugin.json`) and project-scoped `.codex/agents/*.toml` files. |
 | `src/utils/bridgeToolReferences.ts` | Rewrites OpenCode tool names to Claude Code or Codex equivalents, prepends idempotent runtime fallback notes for OpenCode-only tools, and extracts bash allowlists for README documentation. |
@@ -66,10 +69,13 @@ Packs can declare dependencies on companion packs via `requires` in [`opencode-p
 2. **Installable file merging**: Copies `installableFiles(validation)` from every pack in the closure (excluding root-level files without `/` and paths containing `node_modules` or `__pycache__`). If two packs provide the same relative path, staging fails closed (`Packs '<owner>' and '<name>' both provide '<file>'`).
 3. **Config merging**: Reads `opencode.json` or `opencode.jsonc` from each pack in dependency order, merging `readMcpServers(config)` and `config.lsp` (with later packs overriding earlier keys), and writes a unified `<tempRoot>/opencode.json`.
 4. **Scoped agent extraction**: Parses `agents/*.md` **only** from the requested `pack` (setting `agent.category = pack`), while required packs contribute companion `skills/`, `commands/`, `plugins/`, `tools/`, MCP servers, and LSP definitions.
+5. **Executable-surface tracking**: Records executable content from every pack in the closure. If an untrusted source contains executable content, confirmation is required; `withGeneratedPackBridge` refuses to proceed when executable content is present and `allowUntrustedExecutable` is not set. A pack with no requested-pack agents also fails generation, and the temporary tree is cleaned up on errors and after use.
 
 `withGeneratedPackBridge(options, use)` places the generated output inside `<tempRoot>` at the same relative path `outputDir` occupies inside `workspaceRoot` (or `path.basename(outputDir)` when external) so relative paths rendered into `README.md` match the final destination.
 
 `bridgePack(options)` enforces [path and symlink safety](../concepts/security-and-trust-model.md) via `assertSafeOutputDir`—rejecting output paths that contain the catalog root, sit inside `packs/` or a pack directory, or traverse symlinks—and synchronizes the generated tree into `outputDir` via `mirrorTree`, rewriting only byte-changed files and pruning stale files or symlinks.
+
+`withGeneratedPackBridge` dispatches to `bridgeToClaudeCode` or `bridgeToCodex` according to `target` and generates beneath the temporary root at the final output's relative path. `bridgePack` then mirrors that result to the requested directory, leaving unchanged files untouched and returning the final plugin directory together with generated file paths, warnings, and model-resolution preview data.
 
 When bridging a local catalog or workspace, configuration is read from [`bridges/translation-config.json`](../config/translation-and-release-config.md) and plugins default to `bridges/<claude-code|codex>/<pluginName>`. When bridging a [registered git source](./sources-and-github.md) from the [TUI](../components/tui-shell-and-catalog.md) (`src/App.tsx`), `workspaceRoot` points to the cached source checkout, and translation settings and generated plugins are stored under [per-user config and cache directories](../config/user-and-target-files.md) (`<configDir>/translations/<source>/translation.json` and `<cacheDir>/bridges/<source>/<claude-code|codex>/<pluginName>`).
 
@@ -136,14 +142,17 @@ For each agent, `resolveModelTarget(agent, index, config, target)` strips `confi
 
 ### Interactive TUI & CLI Draft Construction (`bridgePrompt.ts`)
 
-- **TUI workflow**: `collectBridgeablePacks`, `filterBridgePacks`, `reconcileBridgePackQuery`, and `stepBridgeField` power the interactive [Bridge modal](../components/authoring-and-bridge-modals.md) (`name -> pack -> tiers -> [effort] -> agents -> model`). Users cycle `CLAUDE_TIER_MODEL_PRESETS` (`opus`, `sonnet`, `haiku`, `inherit`), `CODEX_EFFORT_PRESETS` (`low`, `medium`, `high`, `xhigh`, `max`), and per-role tier assignments (`cycleAgentRoleTier`). `applyBridgeDraftToConfig` merges sanitized draft edits into a `TranslationConfig`, and `buildPackBridgePreview` computes live agent-by-agent previews and per-tier counts.
-- **CLI workflow**: [`manage-agents bridge`](../api/cli-reference.md) supports `--pack`, `--target/-t`, `--output/-o`, `--name/-n`, `--prefix/-p`, `--config`, `--model <src=target>` (`parseKeyValueMappings`), `--map-all <target>`, `--no-validate`, `--no-register`, `--marketplace-name`, and `--wizard/-w` (interactive prompt wizard). Model and marketplace CLI flags persist back to `bridges/translation-config.json`.
+- **Bridge modal**: `collectBridgeablePacks` counts agents in valid packs; `filterBridgePacks`, `reconcileBridgePackQuery`, and `stepBridgePackSelection` implement query filtering and selection. `stepBridgeField` orders the draft fields as `name -> pack -> tiers -> agents -> model` for Claude and inserts `effort` before `agents` for Codex. Users cycle Claude tier-model presets (`opus`, `sonnet`, `haiku`, `inherit`), Codex reasoning-effort presets (`low`, `medium`, `high`, `xhigh`, `max`), and per-role tier assignments (`cycleAgentRoleTier`).
+- **Draft, validation, and preview**: `applyBridgeDraftToConfig` trims/sanitizes tier values, derives the pack prefix, and applies the plugin name, role tiers, and optional target-wide `modelMap["*"]` catch-all without mutating the base config. `validateDraftBridgeTiers` rejects empty tiers and missing Claude/Codex models, and validates Claude model names when Claude is the selected target. `buildPackBridgePreview` runs the draft through the same `resolveModelTarget` logic used during generation and returns per-agent role, tier, target model, mapping source, and tier counts. The TUI persists the accepted config before invoking `bridgePack`.
+- **CLI wizard and flags**: [`manage-agents bridge`](../api/cli-reference.md) supports `--pack`, `--target/-t`, `--output/-o`, `--name/-n`, `--prefix/-p`, `--config`, `--model <src=target>` (`parseKeyValueMappings`), `--map-all <target>`, `--no-validate`, `--no-register`, `--yes/-y`, `--marketplace-name`, and `--wizard/-w`. The CLI wizard prompts for target, plugin name, source prefix, and planning/execution models for both targets. Model mappings and Claude automation/marketplace options are saved to the translation config for later runs; `--yes` confirms bridging untrusted executable content.
 
 ## Claude Code Bridge (`bridge.ts`, `claudePluginCli.ts`, `claudeNextSteps.ts`)
 
 ### Generated Plugin Layout
 
 `bridgeToClaudeCode()` normalizes the plugin identifier via `normalizeClaudeAgentName` (lowercase kebab-case, max 64 chars, prefixed with `agent-` if starting with a digit) and writes `bridges/claude-code/<pluginName>/`:
+
+The generator resolves each agent's Claude model target, builds its translated frontmatter and prompt, discovers pack companion content, and passes those artifacts plus configuration options to `writeClaudeCodePlugin`. The result includes the effective normalized plugin and marketplace names, generated files, warnings, orchestrator name, and a per-agent model preview; `bridgeWorkspace.ts` handles temporary staging and final mirroring.
 
 - `.claude-plugin/plugin.json`: Plugin manifest (`name`, `version: "1.0.0"`, `description`, `author.name` resolved from [`AGENT_AUTHOR_NAME`](../config/user-and-target-files.md) or `DEFAULT_AUTHOR_NAME`).
 - `.claude-plugin/icon.png`: Copied from engine `assets/plugin-icon.png` when available.
@@ -172,13 +181,16 @@ Claude Code plugin agents do not support `permissionMode` or `disallowedTools` f
 
 ### Validation, Registration & Next Steps
 
-- `validatePlugin(pluginDir)` (`claudePluginCli.ts`): Runs `claude plugin validate <pluginDir> --strict` (`spawnSync`, 120s timeout, 300-char stream tailing). Returns `PluginCliOutcome` with `kind: "pass"` (exit 0), `"fail"` (exit 1), `"error"` (exit 2 or spawn error), or `"skipped"` (`ENOENT` when `claude` is not on `PATH`).
-- `registerPlugin(pluginDir, pluginName, marketplaceName)` (`claudePluginCli.ts`): Runs `claude plugin marketplace add <pluginDir>` followed by `claude plugin install <pluginName>@<marketplaceName>`, detecting idempotent `"already"` responses per step. Both CLI and TUI skip registration automatically if `autoValidate` fails/errors, if `emitMarketplace` is `false`, or if `--no-register` (`autoRegister: false`) is set.
+- `validatePlugin(pluginDir)` (`claudePluginCli.ts`): Runs `claude plugin validate <pluginDir> --strict` and returns `PluginCliOutcome`: exit 0 is `pass`, exit 1 is `fail`, a missing executable (`ENOENT`) is `skipped`, and other exits or spawn errors are `error`.
+- `registerPlugin(pluginDir, pluginName, marketplaceName)` (`claudePluginCli.ts`): Runs `claude plugin marketplace add <pluginDir>` followed by `claude plugin install <pluginName>@<marketplaceName>`. It handles each command independently, treats an `"already"` response as idempotent success for that step, and returns pass/fail/error/skipped outcomes.
+- **Call flow and gates**: Both `runBridge` (`src/index.tsx`) and the TUI's `generateBridge` (`src/App.tsx`) invoke these wrappers after generation. Validation is controlled by `claude.autoValidate`; exit 1 or an unexpected/spawn error blocks registration, while a skipped validation (for example, because `claude` is missing) does not by itself block the registration attempt. Registration runs only when `claude.autoRegister` is enabled and a marketplace manifest was emitted; `--no-validate`, `--no-register`, and `claude.emitMarketplace: false` disable their respective steps. The wrappers bound `claude` invocations to 120 seconds and include only the final 300 characters of each output stream in diagnostics.
 - `claudeNextSteps(pluginName, orchestratorName, pluginDir)` (`claudeNextSteps.ts`): Prints local verification hints (`claude plugin validate <pluginDir> --strict` and, when an orchestrator exists, `claude --plugin-dir <pluginDir> --agent <pluginName>:<orchestratorName>`).
 
 ## Codex Bridge (`codexBridge.ts`)
 
 `bridgeToCodex()` / `writeCodexPlugin()` generates a [project-scoped Codex layer](../concepts/cross-harness-translation.md) under `bridges/codex/<pluginName>/`:
+
+The Codex path resolves model and reasoning-effort targets, translates the requested pack's agents, and writes the plugin manifest and project-level configuration beneath the supplied output directory. Its result exposes the generated plugin, files, warnings, and per-agent resolution preview; the shared workspace wrapper stages and mirrors the output as described above.
 
 - `.codex-plugin/plugin.json`: Codex manifest (`renderManifest`) declaring `name`, `version: "1.0.0"`, `author`, `interface` metadata (`capabilities: ["Skills", "Subagents"]` when skills are enabled), and relative pointers to `./skills/` and `./.mcp.json`.
 - `.codex/agents/<name>.toml`: Agent definitions rendered by `renderCodexAgentToml`:

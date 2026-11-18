@@ -4,7 +4,7 @@ description: "Append-only operation log of wiki generation and incremental updat
 category: "root"
 source_files: []
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-18"
 ---
 
 # Wiki Log
@@ -16,3 +16,11 @@ last_updated: "2026-11-13"
 - Pages deprecated: 0
 - Depth: medium
 - Commit: 809d666fdda66cd8bc9a5f2e5eefd6e5352b2c5b
+
+## [2026-11-18] incremental-update | Refresh catalog and source map for TUI/workspace and modal extraction, onboarding/doctor and bridge workflows, engine self-update/release-signing, and installer/Windows/security/lock behavior
+
+- Pages created: 0
+- Pages updated: 25
+- Pages deprecated: 0
+- Depth: medium
+- Commit: 079e58f1f3de235e3a90595a09aad3d89f20a2e2

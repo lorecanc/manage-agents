@@ -7,11 +7,17 @@ source_files:
   - "src/build.mjs"
   - "src/index.tsx"
   - "src/App.tsx"
+  - "src/ui/WorkspaceTopbar.tsx"
+  - "src/ui/FlowsWorkspace.tsx"
+  - "src/ui/SourcesTargetWorkspace.tsx"
+  - "src/ui/PackFlowsModal.tsx"
   - "src/utils/installer.ts"
+  - "src/utils/engineVersion.ts"
+  - "src/utils/selfUpdate.ts"
   - "runtime/plugins/manage-agents-router/index.ts"
   - "AGENTS.md"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-17"
 ---
 
 # System Architecture
@@ -24,44 +30,39 @@ The system separates build-time/CLI management from OpenCode session execution: 
 
 ```mermaid
 graph TD
-    subgraph "Bootstrap & Entry"
-        Launcher["Bootstrap & Build (manage-agents.mjs, src/build.mjs)"]
-        Entry["CLI Dispatch (src/index.tsx)"]
-        TUI["OpenTUI React App (src/App.tsx, src/ui/*)"]
+    subgraph "Bootstrap & Interactive UI"
+        Launcher["Launcher + CLI Dispatch (manage-agents.mjs, src/index.tsx)"]
+        App["OpenTUI App (src/App.tsx): state, keyboard, actions"]
+        Topbar["WorkspaceTopbar"]
+        Workspaces["Catalog + FlowsWorkspace + SourcesTargetWorkspace"]
+        FlowModal["PackFlowsModal"]
     end
 
-    subgraph "Core Domain Engine (src/utils/*)"
-        Agents["Validation, Editing & Bridges (packs.ts, agents.ts, bridge*.ts)"]
-        Sources["Sources, Resolver & Lock (sources.ts, resolver.ts, lock.ts)"]
-        Settings["User Overrides & Flows (userSettings.ts, archetypes.ts)"]
-        Installer["Transactional Installer (installer.ts)"]
+    subgraph "Core & Managed Surfaces"
+        Core["Domain utilities + pack contract (src/utils/*, contract/)"]
+        Installer["Transactional target installer (installer.ts)"]
+        Update["Engine version + release updater (engineVersion.ts, selfUpdate.ts)"]
+        EngineRoot["Engine installation root"]
+        Target["OpenCode target + router runtime"]
     end
 
-    subgraph "Contract & Managed Host Runtime"
-        Contract["Pack Contract 1.1 (contract/)"]
-        Target["OpenCode Target (<target>/ & .manage-agents/)"]
-        Router["Host Router Plugin (manage-agents-router)"]
-    end
-
-    Launcher --> Entry
-    Entry --> TUI
-    Entry --> Agents
-    Entry --> Sources
-    Entry --> Settings
-    Entry --> Installer
-    TUI --> Agents
-    TUI --> Sources
-    TUI --> Settings
-    TUI --> Installer
-    Agents --> Contract
-    Sources --> Installer
-    Settings --> Installer
+    Launcher --> App
+    Launcher --> Core
+    Launcher --> Installer
+    Launcher --> Update
+    App <--> Topbar
+    App <--> Workspaces
+    App <--> FlowModal
+    App --> Core
+    App --> Installer
+    App --> Update
+    Core --> Installer
     Installer --> Target
-    Installer --> Router
-    Router --> Target
+    Update --> EngineRoot
+    Update -->|optional target reconcile| Installer
 ```
 
-[`manage-agents.mjs`](./modules/launcher-and-build.md) prepares the runtime and imports the bundled `dist/index.js` entry (`src/index.tsx`), which either executes one of [20 non-interactive CLI subcommands](./api/cli-reference.md) or mounts the [`<App />` OpenTUI interface](./components/tui-shell-and-catalog.md). Both CLI and TUI invoke the same stateless/transactional modules in `src/utils/`, converging on [`installer.ts`](./modules/target-installer.md) to materialize verified pack files, merged configuration, and the `manage-agents-router` plugin into the OpenCode target directory.
+[`manage-agents.mjs`](./modules/launcher-and-build.md) prepares the runtime and imports the bundled `dist/index.js` entry (`src/index.tsx`), which either executes one of [20 non-interactive CLI subcommands](./api/cli-reference.md) or mounts the [`<App />` OpenTUI interface](./components/tui-shell-and-catalog.md). `App` is the TUI state and action coordinator; `WorkspaceTopbar`, the workspace surfaces, and `PackFlowsModal` separate rendering and input handling behind typed props and callbacks. CLI and TUI pack operations reuse `src/utils/` and converge on [`installer.ts`](./modules/target-installer.md) to materialize verified pack files, merged configuration, and the `manage-agents-router` plugin in the OpenCode target. Engine self-update is a separate path: `engineVersion.ts` and `selfUpdate.ts` replace the `manage-agents` installation itself, then may call the target installer to reconcile an already-populated OpenCode target.
 
 ## Five-Layer Architectural Decomposition
 
@@ -72,6 +73,7 @@ graph TD
 - **Platform & Runtime Gate:** On Windows (`win32`), pins console UTF-8 codepage `65001` (`chcp 65001`). Under Node.js, verifies `>= 26.4.0` (Bun `>= 1.3.0` is supported natively via `process.versions.bun`). If `--experimental-ffi` or `--no-warnings=ExperimentalWarning` is missing from `process.execArgv`, `manage-agents.mjs` synchronously re-executes `process.execPath` with those flags and forwards signals/exit codes (`manage-agents.mjs:17-46`).
 - **Dependency Verification & Auto-Install:** When `src/` or `package-lock.json` is present and `MANAGE_AGENTS_SKIP_AUTO_INSTALL !== "1"`, `dependenciesMatch()` checks installed `node_modules/*/package.json` versions against `package.json` specs and runs `npm ci` / `npm install` or `bun install` with `--ignore-scripts` if out of sync (`manage-agents.mjs:97-134`).
 - **Mtime-Driven `esbuild` Bundling:** In source checkouts where `src/` exists, `newestSourceMtime()` compares source and `package.json` modification times against `dist/index.js`. When stale or missing, it runs `src/build.mjs`, which bundles `src/index.tsx` into ESM `dist/index.js` while keeping `@opentui/core` and `yaml` external (`src/build.mjs:6-7`). Published npm packages omit `src/` and import prebuilt `dist/index.js` directly.
+- **Interrupted Self-Update Recovery:** Before dependency checks and bundle loading, the launcher calls `recoverEngineDirIfInterrupted(scriptDir)`. If a prior engine replacement left `.manage-agents/self-update-journal.json`, it validates the journal's allow-listed targets and restores their saved copies from `.manage-agents/self-update-backup/` before continuing (`manage-agents.mjs:51-56`, `108-197`, `306`).
 
 ### 2. Entry & CLI Dispatch Layer (`src/index.tsx`)
 
@@ -95,8 +97,10 @@ graph TD
 
 - **Three Primary Workspaces (`WorkspaceTab`):**
   1. [`Catalog`](./components/tui-shell-and-catalog.md) (`"catalog"`): Split-pane browser showing collapsible pack/category trees and agent rows on the left, paired with a six-tab inspector (`overview`, `prompt`, `naming`, `security`, `delegations`, `resources`) on the right.
-  2. [`Flows`](./components/workspaces-flows-and-sources.md) (`"flows"`, `src/ui/FlowsWorkspace.js`): Interactive IF/OR conditional routing rule viewer and editor across pack callers, triggers, subagent models, tools, permissions, and delegations.
-  3. `Data Sources` (`"sources"`, `src/ui/SourcesTargetWorkspace.js`): Source registry manager, GitHub CLI (`gh`) account/repository browser, and live OpenCode target drift status panel.
+  2. [`Flows`](./components/workspaces-flows-and-sources.md) (`"flows"`, `src/ui/FlowsWorkspace.tsx`): Interactive pack/agent call-graph browser. `buildFlowsNavRows()` and `buildFlowsInspectorItems()` derive inbound/outbound delegation edges, dead references, pack rules, and subagent rows; callbacks open flow editing, delegation management, or jump to an agent in Catalog.
+  3. `Sources` (`"sources"`, `src/ui/SourcesTargetWorkspace.tsx`): Source registry and GitHub CLI (`gh`) repository browser beside the OpenCode target inspector, which displays installed packs, drift notices, engine version, reconciliation, and the engine-update action.
+- **Shared Header and Workspace Boundaries:** `WorkspaceTopbar` (`src/ui/WorkspaceTopbar.tsx`) renders the three tabs plus width-aware source, commit-mode, onboarding, palette, and busy-status indicators. `App` owns active-source/workspace, selection, focus/scroll, and modal state and supplies data and callbacks to the topbar and workspace components; those components report user actions back to the app rather than owning persistence or target mutations.
+- **Conditional-Flow Modal:** `PackFlowsModal` (`src/ui/PackFlowsModal.tsx`) renders the `routing-configs`, `routing-editor`, `routing-callers`, `routing-tools`, `routing-permissions`, and `routing-delegations` views. `App` loads the combined pack/user flow view with `describeConfiguredPackFlows()`, owns caller and rule drafts, saves via `saveUserPackFlow()` / `saveUserPackCallers()`, and reconciles the target when installed. Workspace edits for read-only Git sources are written to user settings; local pack flows can also be exported to `opencode-pack.json`.
 - **Modal Overlay Architecture:** Over 20 typed `ViewMode` states ([`command-palette`, `help`](./components/navigation-help-and-markdown.md), `model-selector`, `repair-selector`, [`parameter-tuning`, `bridge-prompt`, `install-confirm`, `pack-init`, `pack-doctor`](./components/authoring-and-bridge-modals.md), `self-update`, `routing-editor`, etc.) render bounded viewport overlays without losing underlying workspace selection or scroll state (`src/App.tsx:184-211`).
 - **Dual Write Path:** When connected to a local workspace or local source, agent edits execute inside [`repositoryTransaction()`](./modules/agent-editing-and-v2-compat.md) directly on disk (`src/App.tsx:1002-1011`). When inspecting a read-only Git source (`isReadOnlyGitSource`), `applyAgentMutation()` transparently redirects edits through `runWithOverrideWriter()` into `$XDG_CONFIG_HOME/manage-agents/` [`overrides.json`](./modules/routing-and-user-settings.md) and reconciles the active target (`src/App.tsx:1012-1041`).
 
@@ -110,7 +114,7 @@ All business logic lives in `src/utils/` with colocated `*.test.ts` unit suites:
 - **Archetypes, Flows & User Settings ([`archetypes.ts`, `userSettings.ts`, `sourceCustomization.ts`, `catalog.ts`, `models.ts`](./modules/routing-and-user-settings.md)):** Evaluates caller/subagent archetypes, manages global (`default`) and per-target (`targets.<absPath>`) `routing.json` and `overrides.json` scopes, queries verified model catalogs from OpenCode, and exports flow definitions back to `opencode-pack.json`.
 - **Agent Editing & Repository Transactions ([`agents.ts`, `repositoryTransaction.ts`](./modules/agent-editing-and-v2-compat.md)):** Preserves V1 or V2 frontmatter flavor when editing local files, audits permission rule ordering (`"*": "deny"` first), renames agents with cross-reference updates, and wraps local git workspace mutations in staging/commit transactions when auto-commit is enabled.
 - **Claude Code & Codex Bridges ([`bridge.ts`, `codexBridge.ts`](./modules/bridges.md), `bridgeWorkspace.ts`, `bridgeCheck.ts`, `bridgePrompt.ts`, `bridgeToolReferences.ts`, `translationConfig.ts`, `claudePluginCli.ts`, `claudeNextSteps.ts`):** Translates OpenCode packs and their `requires` closure into Claude Code plugins (`bridges/claude-code/<plugin>`) or Codex agent layers (`bridges/codex/<plugin>`), mapping role tiers, tool names, and model presets, and verifying byte-exact committed bridge outputs via `bridge check`.
-- **Self-Update & Release Signing ([`engineVersion.ts`, `selfUpdate.ts`](./modules/launcher-and-build.md)):** Resolves engine version/channel metadata, verifies GitHub Release archives via SHA-256 and Ed25519 signatures (`release-signing.json`), and updates the engine installation in place.
+- **Engine Version, Release Signing & Self-Update ([`engineVersion.ts`, `selfUpdate.ts`](./modules/launcher-and-build.md)):** `engineVersion.ts` resolves the engine install root independently of the pack workspace, hashes the bundled runtime/contract surface, and identifies the version from a validated `.manage-agents/release-manifest.json`, Git state/tags, or package metadata. `selfUpdate.ts` discovers GitHub releases, verifies repository/tag metadata and configured Ed25519 signatures (or explicitly allowed SHA-256-only metadata), checks archive size/digest and bundle manifest, then stages and journal-replaces engine files. The TUI's Sources/Target inspector exposes `[Shift+U]`; CLI exposes `self-update` and `update --self`, while `release keygen` / `release sign` create trust and release metadata.
 - **Terminal & Data Hardening (`terminalText.ts`, `layout.ts`, `uiConfig.ts`, `uiTheme.ts`, `markdownLayout.ts`, `values.ts`):** Grapheme-aware cell width measurement, terminal control-sequence stripping, `O_NOFOLLOW` descriptor-verified UI config persistence, and prototype-safe object helpers.
 
 ### 5. Contract & Host Runtime Plugin (`contract/`, `runtime/plugins/manage-agents-router/`)
@@ -167,38 +171,54 @@ Because packs and Git sources may originate from untrusted third parties, `manag
 ```mermaid
 sequenceDiagram
     actor User
-    participant CLI as manage-agents (CLI / OpenTUI)
-    participant Src as Sources & Resolver
-    participant Inst as Transactional Installer
-    participant FS as OpenCode Target (<target>/)
-    participant Host as OpenCode Host Session
-    participant Rtr as manage-agents-router
+    participant App as "App.tsx (TUI coordinator)"
+    participant Views as "Topbar, workspace views, and modals"
+    participant Core as "Shared domain utilities"
+    participant Installer as "installer.ts"
+    participant Target as "OpenCode target"
+    participant Host as "OpenCode host/router"
+    participant Updater as "selfUpdate.ts"
+    participant GitHub as "GitHub Releases"
+    participant Engine as "Engine install root"
 
-    User->>+CLI: install / reconcile (pack request or flow change)
-    CLI->>+Inst: changeTarget(target, command, registry, compute)
-    Inst->>FS: Acquire .manage-agents/install.lock & rollbackInterrupted()
-    Inst->>+Src: discoverAllPacks(registry) & resolvePacks(roots, pins)
-    Src-->>-Inst: Resolved packs + SHA-256 content & executable hashes
-    Inst->>Inst: buildLock(), diffLocks() & confirmationsNeeded()
-    alt Untrusted source or changed executableHash
-        Inst->>User: Prompt confirmation (or check --yes / preview lock)
-        User-->>Inst: Approved
+    User->>App: Start TUI and choose an operation
+    App->>Views: Render active workspace/modal with props and callbacks
+    User->>Views: Select pack, edit flow, or choose [Shift+U]
+    Views-->>App: Invoke typed action callback
+    alt Pack install, flow edit, or target reconcile
+        App->>Core: Resolve source or save routing/override settings
+        App->>Installer: changeTarget(install or reconcile, ...)
+        Installer->>Target: Lock, plan, and commit target changes
+        Target-->>Installer: Applied state
+        Installer-->>App: ChangeResult
+        App-->>User: Summary / toast
+    else Engine release update (TUI path)
+        App->>Updater: checkForEngineUpdate()
+        Updater->>GitHub: Fetch latest release and metadata/signature assets
+        GitHub-->>Updater: Release and verification assets
+        Updater->>Updater: Verify release metadata and compare installed version
+        Updater-->>App: Check result (archive not downloaded yet)
+        App->>Updater: applyEngineUpdate(checkResult)
+        Updater->>GitHub: Download versioned archive
+        GitHub-->>Updater: Archive bytes
+        Updater->>Engine: Validate, stage, journal, and replace engine files
+        Engine-->>Updater: Stamped release and verified version
+        opt OpenCode target has installed packs
+            Updater->>Installer: Reconcile target
+            Installer->>Target: Apply reconciled router/config plan
+        end
+        Updater-->>App: Version, dependency, and reconcile result
+        App-->>User: Update summary; restart to load the new bundle
     end
-    Inst->>Inst: planReconcile() (merge overrides.json, routing.json & opencode.json)
-    Inst->>FS: Stage files in .manage-agents/txn/<id>/new/ & write journal.json
-    Inst->>FS: Move previous to txn/<id>/prev/, rename staged into <target>/
-    Inst->>FS: Update installed.json, lock.json, desired.json & clear journal/lock
-    Inst-->>-CLI: ChangeResult (applied)
-    CLI-->>-User: Summary & drift-free status
 
-    User->>+Host: Start session with primary caller agent
-    Host->>+Rtr: session.hook("model.request" / "context")
-    Rtr->>FS: Read & cache plugins/manage-agents-router/routing.json
-    Rtr-->>-Host: Record caller model & strip denied session tools
-    Host->>+Rtr: permission.hook("evaluate") / tool.hook("execute.before")
-    Rtr-->>-Host: Enforce allow/ask/deny policy, block delegation, or rewrite subagent input.model
-    Host-->>-User: Routed agent & subagent execution
+    opt OpenCode host session
+        Host->>Target: Read/cache manage-agents-router/routing.json
+        Host->>Host: Apply model, tool, permission, and delegation hooks
+        Host-->>User: Run caller/subagent with routing policy
+    end
 ```
+
+The TUI view components return user actions to `App.tsx`; the app and CLI entry (`src/index.tsx`) then call shared domain modules. Flow changes persist to user routing settings and reconcile an installed target when needed. Engine release updates are independent of pack installation: the archive replaces the engine root, and reconciliation is a follow-up only when the target already contains installed packs.
 
 ### Phase 1: Resolution, Trust Verification & Planning
 1. **Lock Acquisition & Crash Recovery:** [`changeTarget()`](./modules/target-installer.md) (`src/utils/installer.ts:777-807`) acquires `<target>/.manage-agents/install.lock` and runs `rollbackInterrupted(target)` to ensure any prior interrupted transaction is cleanly reverted before reading state.
@@ -212,6 +232,13 @@ sequenceDiagram
 
 ### Phase 3: Host Session Routing
 7. **Session & Policy Interception:** When OpenCode boots against `<target>`, it loads [`./plugins/manage-agents-router`](./modules/runtime-router-plugin.md) from `opencode.json`. On each hook invocation, `manage-agents-router` checks whether `routing.json` changed on disk (allowing `manage-agents models ...` or TUI flow edits followed by `reconcile` to take effect in running sessions without restarting OpenCode), tracks the caller agent's [active `provider/model` per `sessionID`](./concepts/conditional-routing-and-archetypes.md), filters session tools in `context`, enforces permission overrides in `evaluate`, and rewrites `event.input.model` (or blocks disallowed delegations/tools) in `execute.before`.
+
+## Engine Version & Self-Update Lifecycle
+
+1. **Resolve the Installed Engine:** `resolveEngineRoot()` finds the `manage-agents` package root (including linked installs), independently of the active pack workspace. `resolveEngineVersion()` hashes the bundle surface and chooses a validated `.manage-agents/release-manifest.json`, clean Git tag/commit state, or package version for the displayed identity (`src/utils/engineVersion.ts`). `manage-agents version` reports it; `version --write-manifest` stamps release or CI snapshot metadata.
+2. **Discover and Verify a Release:** `checkForEngineUpdate()` gets the latest GitHub release using `gh api` with an HTTP fallback, downloads `release-metadata.json` and (when present/required) `release-metadata.json.sig`, and checks repository, tag, commit, and trust policy. A configured Ed25519 public key requires a valid signature; SHA-256-only metadata is allowed only under the explicit unsigned policy. It compares release tags and checks whether the OpenCode target has installed packs. The versioned `manage-agents-<tag>.tar.gz` is downloaded only when applying the update (`src/utils/selfUpdate.ts`).
+3. **Stage and Replace the Engine:** `applyEngineUpdate()` refuses an engine checkout with uncommitted changes or a downgrade unless forced. It checks archive size and SHA-256, extracts into a private temporary directory, rejects symlinks/non-regular entries, and verifies the staged release manifest and bundle hash. If package/lock files changed, dependencies are installed in staging with lifecycle scripts disabled. The updater saves allowed engine targets under `.manage-agents/self-update-backup/`, writes `.manage-agents/self-update-journal.json`, and replaces the engine files; it stamps and re-resolves the installed version before deleting recovery state.
+4. **Recover, Reconcile, and Restart:** If replacement fails, `recoverInterruptedSelfUpdate()` restores the journaled backup; the launcher runs its own recovery check before importing `dist/index.js` on the next start. After a successful update, `selfUpdate.ts` reconciles the OpenCode target when installed packs are present (unless disabled by CLI options). The TUI reports that `manage-agents` must be restarted to load the newly installed bundle. The CLI entry supports `self-update` and `update --self`; release tooling exposes `release keygen` and `release sign` for trust configuration and signed metadata (`src/index.tsx`).
 
 ## Related Pages
 

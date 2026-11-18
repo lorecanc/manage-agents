@@ -7,7 +7,7 @@ source_files:
   - "contract/skills/opencode-pack-authoring/SKILL.md"
   - "contract/examples/minimal-pack/opencode-pack.json"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-18"
 ---
 
 # Pack Onboarding, Doctor & Scaffolding
@@ -167,7 +167,7 @@ Running `fixPackDoctor(packDir, { repoRoot, authoringKit })` (`manage-agents pac
 
 ### Semver Version Bumping (`bumpPackVersion`)
 
-`bumpPackVersion(packDir, release)` (`manage-agents pack doctor --bump patch|minor|major`) validates that `opencode-pack.json` has a canonical semver string, computes `semver.inc(previousVersion, release)`, atomically writes the updated manifest, and returns `{ previousVersion, nextVersion, manifestPath }`. Per `contract/skills/opencode-pack-authoring/SKILL.md`:
+`bumpPackVersion(packDir, release)` (`manage-agents pack doctor --bump patch|minor|major`) validates that `opencode-pack.json` has a canonical semver string, computes `semver.inc(previousVersion, release)`, atomically writes the updated manifest, and returns `{ previousVersion, nextVersion, manifestPath }`. The bundled authoring skill says to bump the version for every shipped change and gives these release-size guidelines:
 - `patch`: bug or prompt fixes with no structural changes.
 - `minor`: new agents, commands, skills, or additive features.
 - `major`: removing or renaming agents, commands, skills, plugins, or paths referenced by other packs.
@@ -176,7 +176,7 @@ Running `fixPackDoctor(packDir, { repoRoot, authoringKit })` (`manage-agents pac
 
 ### Resource Scaffolding (`scaffoldPackResource`)
 
-`scaffoldPackResource(packDir, spec)` (`manage-agents pack add <agent|skill|command> <id>`) requires an initialized `opencode-pack.json`, strips leading/trailing slashes and `.md` suffixes from `spec.id`, validates `id` against `RESOURCE_ID_RE` (alphanumeric segments with `._-` and optional `/` namespaces, rejecting `..`), and checks `hasCaseFoldCollisionOnDisk()` to prevent overwriting existing files:
+`scaffoldPackResource(packDir, spec)` (CLI: `manage-agents pack add agent|skill|command <id> --dir <pack-dir>`) requires an initialized `opencode-pack.json`, strips leading/trailing slashes and `.md` suffixes from `spec.id`, validates `id` against `RESOURCE_ID_RE` (alphanumeric segments with `._-` and optional `/` namespaces, rejecting `..`), and checks `hasCaseFoldCollisionOnDisk()` to prevent overwriting existing files:
 
 - **`agent`**: Writes `agents/<id>.md` via `renderAgentFile({ description, mode }, body, "v2")`, where `mode` defaults to `"subagent"` (`"primary"` | `"subagent"` | `"all"`).
 - **`skill`**: Writes `skills/<id>/SKILL.md` with YAML frontmatter `{ name: basename(id), description }` and a starter workflow section.
@@ -191,6 +191,16 @@ Triggered via `--authoring-kit` during `pack onboard`, `pack init`, or `pack doc
 1. **`.opencode/skills/opencode-pack-authoring/SKILL.md`**: Copies the bundled `contract/skills/opencode-pack-authoring/SKILL.md` (resolved relative to `packOnboarding.ts` in both source and bundled `dist/` layouts) into the repository's `.opencode/skills/` tree. This gives AI coding agents working inside the pack repository immediate rules on canonical paths, pack-relative references, `CONFIG_KEYS`, `archetype` / `flowDefaults`, semver rules, and executable surface changes.
 2. **`.github/workflows/validate-pack.yml`**: Created if missing; configures a GitHub Actions workflow on `ubuntu-latest` (Node `26`) running `npx --yes github:lorecanc/manage-agents pack validate <relativePackDir> --git` on pushes to `main`/`master` and pull requests.
 3. **`README.md` (inside `packDir`)**: Created only when `packDir` lacks `README.md`, `README`, `README.txt`, or `README.rst`; documents installation (`source add`, `install`) and local validation (`pack doctor --fix`, `pack validate`).
+
+### Authoring Checklist in the Bundled Skill
+
+The copied `opencode-pack-authoring` skill guides changes made in the pack repository:
+
+1. **Establish the pack and its baseline**: Find the nearest ancestor containing `opencode-pack.json` (or onboard a raw folder first), read `name`, `requires`, `archetype`, and `flowDefaults`, then run `pack doctor` or `pack validate` to distinguish existing warnings from newly introduced ones.
+2. **Use canonical locations**: Put agents in `agents/<id>.md`, commands in `commands/<id>.md`, skills in `skills/<id>/SKILL.md`, plugins in `plugins/<name>/index.ts`, plugin helper modules in `tools/<pack-name>/` (or `tools/_<pack-name>_<file>`), other content in `<dir>/<pack-name>/`, and pack-wide guidance in the root `AGENTS.md`. Skills need a `description`; plugins use `Plugin.define` from `@opencode/plugin` and are registered in `opencode.json` as `./plugins/<name>`. The skill forbids creating legacy singular directories, single-file plugins, other root files, `instructions/`, `.manage-agents/`, or `node_modules/`. Repository-local `.opencode/` authoring files and `.github/` workflows are ignored by the installer and are not shipped.
+3. **Keep references portable**: Use pack-root-relative paths in `opencode.json` fields such as `skills`, `instructions`, and `{file:...}`, and importer-relative paths in code. Do not write absolute user config paths. For files in another pack, declare that pack in `requires` with a semver range and refer to its in-pack path. Plugins may import only `@opencode/plugin`, Node built-ins, and pack files; vendor other dependencies.
+4. **Preserve routing and configuration boundaries**: Pack config may define `plugins`, `mcp` (under `mcp.servers.<name>`), `skills`, `instructions`, `agents`, `commands`, `formatter`, `lsp`, and `experimental`, not user settings such as `model`, `default_agent`, `providers`, or `permissions`. To route subagent models and policies from the caller, declare `archetype` with `callers` and a `reference`, then use optional `routingDefaults` or Contract `1.1` `flowDefaults`. Pin a subagent's `model` only when needed (for example, for image input); pinned models bypass routing.
+5. **Validate the shipped change**: Bump semver for every shipped change: patch for fixes, minor for additions, and major for removing or renaming agents, commands, skills, plugins, or paths referenced by other packs. Changes to plugins, tool modules, skill scripts, or MCP servers alter the executable surface, so mention that in the change description; users are asked to confirm executable-surface changes. Finish with `pack validate` exiting successfully, no new warnings (or a justification for each), and no unresolved references unless a pack in `requires` provides them. `pack doctor --fix` can repair common V1, layout, and namespace drift.
 
 ## Dependencies
 

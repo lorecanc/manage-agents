@@ -1,6 +1,6 @@
 ---
 title: "Launcher, Build & Self-Update"
-description: "Node FFI bootstrap, auto-build pipeline, bundle hashing, cryptographic release signing, and atomic engine self-update"
+description: "Node/Bun FFI bootstrap, auto-build pipeline, engine versioning, release verification, and journaled self-update"
 category: "modules"
 source_files:
   - "manage-agents.mjs"
@@ -8,15 +8,17 @@ source_files:
   - "src/utils/engineVersion.ts"
   - "src/utils/selfUpdate.ts"
   - "src/utils/fsWindows.ts"
+  - "package.json"
+  - ".github/workflows/ci.yml"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-17"
 ---
 
 # Launcher, Build & Self-Update
 
 ## Purpose
 
-This module group owns the execution lifecycle of the [`manage-agents` engine](../architecture.md) itself—independent of any external *[pack]* (see [Glossary](../glossary.md)) catalog or managed OpenCode target. It bootstraps the JavaScript runtime with Foreign Function Interface (FFI) support required by [OpenTUI](../dependencies/runtime-and-tooling-stack.md), automatically installs dependencies and rebuilds the TypeScript/JSX bundle when running from a source checkout, computes deterministic cryptographic hashes of the engine surface, signs and verifies GitHub release artifacts with [Ed25519](../concepts/security-and-trust-model.md), and performs atomic in-place engine self-updates with automatic rollback and Windows file-lock resilience.
+This module group owns the execution lifecycle of the [`manage-agents` engine](../architecture.md) itself—independent of any external *[pack]* (see [Glossary](../glossary.md)) catalog or managed OpenCode target. It bootstraps a supported Node.js or Bun runtime with Foreign Function Interface (FFI) support required by [OpenTUI](../dependencies/runtime-and-tooling-stack.md), automatically installs dependencies and rebuilds the TypeScript/JSX bundle when running from a source checkout, computes deterministic cryptographic hashes of the engine surface, signs and verifies GitHub release metadata with [Ed25519](../concepts/security-and-trust-model.md), and applies releases through a staged, journaled update with rollback and Windows file-lock resilience. The update is recoverable, but replacing the engine's multiple files is not one atomic whole-install swap.
 
 ## Key Files
 
@@ -25,12 +27,14 @@ This module group owns the execution lifecycle of the [`manage-agents` engine](.
 | `manage-agents.mjs` | Executable CLI launcher (`bin`); enforces runtime prerequisites, re-execs Node with FFI flags, auto-installs missing dependencies, triggers stale bundle rebuilds, and imports `dist/index.js`. |
 | `src/build.mjs` | Programmatic `esbuild` bundler that compiles `src/index.tsx` into the ESM bundle `dist/index.js`. |
 | `src/utils/engineVersion.ts` | Resolves the engine root, computes deterministic `sha256` bundle and git worktree hashes, reads/writes `.manage-agents/release-manifest.json`, and determines the active version channel. |
-| `src/utils/selfUpdate.ts` | Implements Ed25519 key generation, release asset signing, trust policy resolution, GitHub Release transport, update checks, and staged atomic self-updates with rollback. |
+| `src/utils/selfUpdate.ts` | Implements Ed25519 key generation, release asset signing, trust policy resolution, GitHub Release transport, update checks, and staged, journaled self-updates with rollback. |
 | `src/utils/fsWindows.ts` | Provides retry-backed filesystem removal and cross-device/lock-tolerant path moves for Windows indexer and antivirus locks. |
+| `package.json` | Defines package version `1.0.0`, the CLI `bin`, Node/Bun engine floors, build scripts, runtime dependencies, and the published npm file set. |
+| `.github/workflows/ci.yml` | Runs the Node/Bun CI matrix and, for eligible `v*` tags, builds, manifests, signs, and publishes GitHub release assets. |
 
 ## Bootstrap Sequence (`manage-agents.mjs`)
 
-`manage-agents.mjs` is the package `bin` entrypoint (`#!/usr/bin/env node`). Before loading any compiled application code, it executes a five-stage bootstrap sequence:
+`manage-agents.mjs` is the package `bin` entrypoint (`#!/usr/bin/env node`). Before loading any compiled application code, it executes a six-stage bootstrap sequence:
 
 ### 1. Windows UTF-8 Codepage Pin
 
@@ -38,7 +42,7 @@ On `win32`, the launcher runs `chcp 65001` via `spawnSync("chcp", ["65001"], { s
 
 ### 2. Runtime Verification and FFI Self-Re-Exec
 
-OpenTUI relies on native FFI bindings. When `process.versions.bun` is not set, the launcher parses `process.versions.node` and enforces **[Node.js `>= 26.4.0`](../getting-started.md)** (matching `engines.node` in `package.json`). Older Node versions exit immediately with status `1`.
+OpenTUI relies on native FFI bindings. `checkRuntimeEngineVersion()` enforces **[Node.js `>= 26.4.0`](../getting-started.md)** or **Bun `>= 1.3.0`**, matching `engines` in `package.json`. Unsupported or malformed runtime versions exit immediately with status `1`. Bun is checked directly and is not re-executed with Node flags.
 
 On supported Node.js versions, `manage-agents.mjs` inspects `process.execArgv` for two flags:
 - `--experimental-ffi`
@@ -60,7 +64,11 @@ if (!hasExperimentalFfi || !hasExperimentalWarningSuppression) {
 }
 ```
 
-### 3. Semver Dependency Verification and Auto-Install
+### 3. Interrupted Self-Update Recovery
+
+After the runtime re-exec, the launcher calls `recoverEngineDirIfInterrupted(scriptDir)` before checking dependencies, rebuilding, or importing the bundle. If `.manage-agents/self-update-journal.json` exists, it validates the journal and engine-relative paths, restores backed-up targets and the release manifest, verifies restored contents, then removes the journal and backup. A failed recovery aborts startup and retains the backup for diagnosis or another recovery attempt.
+
+### 4. Semver Dependency Verification and Auto-Install
 
 Before importing external packages, `dependenciesMatch(managerDir, includeDevDependencies)` reads `package.json` using lightweight built-in helpers (`parseCoreSemver()`, `cmpCoreSemver()`, and `satisfiesSimpleSpec()` supporting exact, `^`, `~`, `>=`, and `*` ranges) and checks every required `node_modules/<pkg>/package.json`. `devDependencies` (such as `esbuild`) are checked only when `src/` exists and a rebuild is needed (`hasSources && needsBuild`).
 
@@ -70,7 +78,7 @@ When [`MANAGE_AGENTS_SKIP_AUTO_INSTALL`](../config/user-and-target-files.md) `!=
 - **Node with `package-lock.json`**: `npm ci --ignore-scripts --no-audit --no-fund`
 - **Node without `package-lock.json`**: `npm install --ignore-scripts --no-audit --no-fund`
 
-### 4. Source Mtime Comparison and Auto-Build
+### 5. Source Mtime Comparison and Auto-Build
 
 `newestSourceMtime(directory)` recursively scans `src/` and compares the newest file `mtimeMs` (along with `package.json`'s `mtimeMs`) against `dist/index.js`:
 
@@ -84,7 +92,7 @@ const needsBuild = hasSources ? !existsSync(distPath) || statSync(distPath).mtim
 
 Published npm packages distribute `dist/` without `src/` (per `package.json` `"files"`), so `needsBuild` evaluates to `false` in production installs. In git checkouts where `needsBuild` is `true`, the launcher runs `bun run build` or `npm run build` (executing `node src/build.mjs`).
 
-### 5. Bundle Execution
+### 6. Bundle Execution
 
 Once `dist/index.js` is up to date, `manage-agents.mjs` transfers control via dynamic ESM import:
 
@@ -116,6 +124,12 @@ Two runtime dependencies are intentionally kept in `external`:
 - **[`@opentui/core`](../dependencies/runtime-and-tooling-stack.md)**: Loads platform-specific optional native FFI packages (`@opentui/core-darwin-arm64`, `@opentui/core-linux-x64`, `@opentui/core-win32-x64`, etc.) relative to `node_modules` at runtime and maintains singleton terminal renderer state shared across modules.
 - **`yaml`**: Ships its Node entrypoint (`./dist/index.js`) as CommonJS (`"type": "commonjs"`). Keeping `yaml` external lets Node's native ESM-to-CJS loader resolve it cleanly rather than emitting broken dynamic `require()` shims inside an ESM bundle.
 
+## Package and CI Release Flow
+
+`package.json` currently declares package version `1.0.0`, exposes `manage-agents.mjs` as the `manage-agents` executable, and requires Node `>= 26.4.0` or Bun `>= 1.3.0`. Its npm `files` list includes the launcher and `dist/` but not `src/`, so a published package runs the shipped bundle; checkout builds use `npm run build` (`node src/build.mjs`) or `bun run build`.
+
+The `test` job in `.github/workflows/ci.yml` runs on Ubuntu, macOS, and Windows. It installs with `npm ci --ignore-scripts`, runs `npm run validate` (typecheck/tests, build, and minimal-pack validation), checks CLI help/version, then installs Bun and checks Bun typecheck/build/help. A `release` job runs only after that matrix passes and only for a pushed `v*` tag. It verifies the tag commit is an ancestor of `origin/main`, builds the bundle, stages a `git archive` plus `dist/`, and writes a release manifest with the tag and commit SHA. It touches `dist/index.js` before archiving so the launcher does not rebuild over newer source mtimes. The archive is named `manage-agents-<tag>.tar.gz`; the job runs `release sign` using the `RELEASE_SIGNING_PRIVATE_KEY` GitHub secret, then publishes the archive and `release-metadata.json` with `gh release create --verify-tag --generate-notes`. It adds `release-metadata.json.sig` only when the signing command produced that file.
+
 ## Engine Version & Bundle Hashing (`src/utils/engineVersion.ts`)
 
 ### Path Isolation and Root Discovery
@@ -143,20 +157,24 @@ CI builds stamp `.manage-agents/release-manifest.json` (`ENGINE_MANIFEST_RELATIV
 
 | Channel | Condition | Resulting `version` / `dirty` |
 |---------|-----------|-------------------------------|
-| `release` | Valid release manifest whose `bundleHash` matches disk, either without `.git`, on a clean matching `HEAD === manifest.commit`, or with matching `appliedOverGitHead` + `appliedWorktreeStateHash`. | `<tag>` (e.g. `v1.2.0`), `dirty: false` |
-| `ci-snapshot` | Non-git installation with a matching `ci-snapshot` manifest (or tampered manifest where `manifest.bundleHash !== bundleHash` in a non-git install, preserving `manifest.channel`). | `sha-<shortCommit>-dirty`, `dirty: true` |
-| `git-tag` | Clean `.git` checkout whose `HEAD` has an exact tag (`git describe --tags --exact-match HEAD`). | `<exactGitTag>`, `dirty: false` |
-| `git` | `.git` checkout without a matching release manifest or exact clean tag. | `sha-<shortCommit>` or `sha-<shortCommit>-dirty` |
-| `package` | Fallback when neither `.git` nor a release manifest exists. | `v<packageVersion>`, `dirty: false` |
+| `release` | Matching release manifest and bundle hash in a non-git install, a clean checkout whose `HEAD` equals `manifest.commit`, or a checkout whose current `HEAD` and worktree hash match the manifest's applied-release stamps. | `<tag>` (e.g. `v1.2.0`), `dirty: false` |
+| `ci-snapshot` | Non-git install with a matching valid `ci-snapshot` manifest. | `sha-<shortCommit>-dirty`, `dirty: true` |
+| `git-tag` | No qualifying release manifest; clean `.git` checkout whose `HEAD` has an exact tag (`git describe --tags --exact-match HEAD`). | `<exactGitTag>`, `dirty: false` |
+| `git` | `.git` checkout not recognized as a matching release or exact clean tag. | `sha-<shortCommit>` or `sha-<shortCommit>-dirty` |
+| `package` | Fallback when no usable git version or matching release manifest applies. | `v<packageVersion>` (currently `v1.0.0`), `dirty: false` |
 
-## Release Signing & Atomic Self-Update (`src/utils/selfUpdate.ts`)
+In a non-git installation, a valid manifest whose `bundleHash` no longer matches disk still yields `sha-<shortCommit>-dirty`; the returned channel retains the manifest's channel. A manifest is therefore not treated as proof that the installed bundle is unchanged.
+
+## Release Signing & Self-Update (`src/utils/selfUpdate.ts`)
 
 ### Ed25519 Key Management and Release Signing
 
-Cryptographic authenticity is governed by [`release-signing.json`](../config/translation-and-release-config.md) (`RELEASE_SIGNING_CONFIG_FILENAME`) at the engine root:
+Cryptographic authenticity is governed by [`release-signing.json`](../config/translation-and-release-config.md) (`RELEASE_SIGNING_CONFIG_FILENAME`) at the engine root, plus optional environment overrides:
 - **`generateReleaseSigningKeypair()`** ([`manage-agents release keygen`](../api/cli-reference.md)): Generates an Ed25519 keypair via `crypto.generateKeyPairSync("ed25519")`, derives a deterministic key identifier `ed25519-<12-hex>` from the first 12 hex characters of the SPKI DER SHA-256 (`computePublicKeyId()`), atomically updates `release-signing.json` (`0o644`), and optionally writes the PKCS#8 private key PEM with `0o600` permissions.
-- **`signReleaseAssets()`** (`manage-agents release sign`): Verifies `manage-agents-<tag>.tar.gz` (`releaseArchiveName(tag)`), computes its byte size and `sha256:<hex>` digest, and writes `release-metadata.json` (`RELEASE_METADATA_ASSET_NAME`). When an Ed25519 private key is provided (`options.privateKeyPem` or `RELEASE_SIGNING_PRIVATE_KEY`), it verifies the key matches `release-signing.json` (if configured), signs the exact `release-metadata.json` bytes using `crypto.sign(null, metadataBytes, privateKey)`, and writes base64 `release-metadata.json.sig` (`RELEASE_SIGNATURE_ASSET_NAME`).
-- **`resolveReleaseTrustPolicy()` & `verifyEngineReleaseMetadata()`**: Combines `release-signing.json` and optional [`MANAGE_AGENTS_RELEASE_PUBLIC_KEY`](../config/user-and-target-files.md) (PEM or base64 SPKI DER, checking against key-ID collisions). Whenever at least one public key is configured—or `requireSignature: true` is passed—Ed25519 verification of `release-metadata.json.sig` is mandatory (`verificationMode: "ed25519"`). Only when no public keys are configured does verification operate in unsigned digest mode (`verificationMode: "sha256"`).
+- **`signReleaseAssets()`** (`manage-agents release sign`): Verifies `manage-agents-<tag>.tar.gz` (`releaseArchiveName(tag)`), computes its byte size and `sha256:<hex>` digest, and writes `release-metadata.json` (`RELEASE_METADATA_ASSET_NAME`). When an Ed25519 private key is provided (`options.privateKeyPem` or `RELEASE_SIGNING_PRIVATE_KEY`), it verifies the key matches a configured trusted public key when keys exist, signs the exact `release-metadata.json` bytes using `crypto.sign(null, metadataBytes, privateKey)`, and writes base64 `release-metadata.json.sig` (`RELEASE_SIGNATURE_ASSET_NAME`).
+- **`resolveReleaseTrustPolicy()` & `verifyEngineReleaseMetadata()`**: Combine public keys in `release-signing.json` with optional [`MANAGE_AGENTS_RELEASE_PUBLIC_KEY`](../config/user-and-target-files.md) (PEM or base64 SPKI DER; key-ID collisions are rejected). Any configured public key makes a signature mandatory. With no keys, signatures are still required by default; SHA-256-only mode can be enabled through `allowUnsigned` / `MANAGE_AGENTS_ALLOW_UNSIGNED=1` (the API also honors `requireSignature: false` when no keys are configured). In Ed25519 mode, the verifier checks a base64-encoded 64-byte signature over the exact downloaded metadata bytes against the trusted key(s). In SHA-256 mode, it validates repository/tag metadata and the metadata's digest field but does not establish signer authenticity; application separately checks the actual archive against that digest.
+
+The CI release job passes `secrets.RELEASE_SIGNING_PRIVATE_KEY` to `release sign`; under the default policy, signing without that key fails unless unsigned mode has explicitly been enabled. The workflow does not set unsigned mode, so an ordinary release run needs the secret. If a trusted key is configured, the signing private key must match it. The workflow uploads the signature asset only when it was produced.
 
 ### GitHub Release Transport
 
@@ -166,19 +184,22 @@ Cryptographic authenticity is governed by [`release-signing.json`](../config/tra
 
 ### Update Discovery (`checkForEngineUpdate`)
 
-`checkForEngineUpdate()` downloads `release-metadata.json` and `release-metadata.json.sig` (when present or required), verifies repository/tag binding and Ed25519 signature via `verifyEngineReleaseMetadata()`, ensures the release contains a unique archive asset matching `metadata.archive.name`, and compares versions with `compareReleaseTags()` (via `semver`). It returns `EngineUpdateCheckResult` containing `updateAvailable`, `downgrade`, `localGitDirty` (`hasUncommittedEngineChanges()`), and `targetReconcileNeeded` (true when the [target lockfile](./resolver-and-lock.md) tracks at least one installed pack).
+`checkForEngineUpdate()` downloads `release-metadata.json` and the signature asset when present or required, applies the resolved trust policy, binds metadata to the selected repository and GitHub release tag, ensures the release contains one archive asset matching `metadata.archive.name`, and compares versions with `compareReleaseTags()` (via `semver`). It returns `EngineUpdateCheckResult` containing `updateAvailable`, `downgrade`, `localGitDirty` (`hasUncommittedEngineChanges()`), and `targetReconcileNeeded` (true when the [target lockfile](./resolver-and-lock.md) tracks at least one installed pack). The archive itself is downloaded and checked during application, not during discovery.
 
-### Atomic Self-Update & Rollback (`applyEngineUpdate`)
+`applyEngineUpdate()` performs this check itself unless the caller supplies `options.checkResult`. That override is reused without re-verifying the release metadata signature, so callers must supply a result already checked under the intended trust policy. The archive's actual size and SHA-256 are still checked during application.
+
+### Journaled Self-Update & Rollback (`applyEngineUpdate`)
 
 `applyEngineUpdate()` (`manage-agents self-update` or `manage-agents update --self`) executes a multi-stage transactional update:
 
-1. **Dirty Checkout & Downgrade Guards**: Calls `hasUncommittedEngineChanges(engineRoot)` and refuses to overwrite uncommitted git modifications unless `options.force` (`--force`) is set. Similarly refuses version downgrades (`checkResult.downgrade`) without `options.force`.
-2. **Archive Integrity Verification**: Downloads `manage-agents-<tag>.tar.gz` and verifies both `archiveBuffer.byteLength === metadata.archive.size` and `sha256` equality before writing to disk.
-3. **Isolated Staging & Symlink Audit**: Creates a `0o700` temporary directory (`manage-agents-self-update-*`), extracts the tarball via `tar -xzf`, and walks the entire extracted tree with [`assertNoSymlinkTree()`](../concepts/security-and-trust-model.md) to reject symlinks, non-regular entries, or path traversal outside the extraction root.
-4. **Manifest & Bundle Hash Verification**: Resolves the extracted package root (`resolveExtractedEngineDir()`), verifies all `ENGINE_REQUIRED_TARGETS` (`manage-agents.mjs`, `package.json`, `dist`, `assets`, `contract`, `runtime`), and runs `validateStagedEngineManifest()`—confirming `.manage-agents/release-manifest.json` matches `metadata.tag` and `metadata.commit`, is on the `"release"` channel, is clean, and matches `computeEngineBundleHash(stagedRoot)`.
-5. **Staged Dependency Installation**: Compares SHA-256 digests of `package.json`, `package-lock.json`, and `bun.lock` between `engineRoot` and `stagedRoot`. If any changed (or `engineRoot/node_modules` is missing), `runDependencyInstallSync()` installs dependencies inside `stagedRoot` (`npm ci --ignore-scripts --no-audit --no-fund`, `npm install --ignore-scripts --no-audit --no-fund`, or `bun install [--frozen-lockfile] --ignore-scripts`) before touching the live installation.
-6. **Backup, Swap, Mtime Touch & Rollback**: Copies existing required targets, `ENGINE_OPTIONAL_TARGETS` (`package-lock.json`, `bun.lock`, `src`, `README.md`, `GUIDA.md`, `LICENSE`, `.gitignore`), and `node_modules` (when updated) to `tempRoot/backup`. Each target in `engineRoot` is validated via `assertSafeEnginePath()`, removed with `removePathWithRetry()`, and replaced from `stagedRoot`. It then touches `dist/index.js` (`fs.utimesSync`) so `manage-agents.mjs` never sees a stale bundle timestamp relative to extracted `src/`, stamps `.manage-agents/release-manifest.json` via `stampAppliedEngineManifest()`, and verifies `resolveEngineVersion(engineRoot)` resolves cleanly to `stagedManifest.tag` on `"release"`. If any step throws, every attempted target is restored in reverse order from `tempRoot/backup` (preserving `tempRoot/backup` on disk if rollback itself encounters an error).
-7. **Target Router Plugin Reconciliation**: When `options.reconcile !== false` and `checkResult.targetReconcileNeeded` is true, runs [`changeTarget(..., "reconcile", ...)`](./target-installer.md) so the managed OpenCode target's [router plugin](./runtime-router-plugin.md) stays synchronized with the updated engine.
+1. **Dirty Checkout & Downgrade Guards**: Calls `hasUncommittedEngineChanges(engineRoot)` and refuses to overwrite uncommitted engine changes unless `options.force` (`--force`) is set. Similarly refuses version downgrades (`checkResult.downgrade`) without `options.force`.
+2. **Archive Digest Verification**: Downloads the archive and compares its byte length and SHA-256 digest with `release-metadata.json` before extraction. Authenticity comes from verifying the signed metadata under an Ed25519 trust policy; the metadata binds the archive name, size, and digest.
+3. **Isolated Staging & Symlink Audit**: Creates a `0o700` temporary directory (`manage-agents-self-update-*`), extracts the tarball via `tar -xzf`, and walks the extracted tree with [`assertNoSymlinkTree()`](../concepts/security-and-trust-model.md), rejecting symlinks, non-regular entries, or paths outside the extraction root.
+4. **Manifest & Bundle Hash Verification**: Resolves the extracted package root (`resolveExtractedEngineDir()`), verifies all required targets (`manage-agents.mjs`, `package.json`, `dist`, `assets`, `contract`, `runtime`), and runs `validateStagedEngineManifest()`. The release manifest must match the metadata tag and commit, use the `"release"` channel, be clean, and match `computeEngineBundleHash(stagedRoot)`.
+5. **Staged Dependency Installation**: Compares SHA-256 digests of `package.json`, `package-lock.json`, and `bun.lock` between the installed and staged engine. If any differ or installed `node_modules` is absent, dependencies are installed inside staging with lifecycle scripts disabled (`npm ci`/`npm install` or `bun install`); the live installation is not touched yet.
+6. **Durable Backup and Journal**: Copies existing required and optional engine targets (plus `node_modules` when the staged install is being applied) under `.manage-agents/self-update-backup/<id>`. It also copies staged replacements to this same-filesystem area, fsyncs the backup tree, and atomically writes a mode-`0o600` `.manage-agents/self-update-journal.json` before replacing live targets. The release manifest is backed up separately.
+7. **Per-Target Replacement and Verification**: Revalidates engine paths and rejects live target symlinks. Staged regular files are moved into place; directory targets are removed before their staged replacement is moved. This is a multi-target transaction, not one atomic whole-install swap. The updater touches `dist/index.js` to keep its mtime newer than extracted source, stamps the applied release manifest, and requires `resolveEngineVersion(engineRoot)` to report the staged tag as a clean `release` before deleting the journal and backups.
+8. **Rollback and Reconciliation**: If replacement or post-swap verification fails while the journal is present, `recoverInterruptedSelfUpdate()` restores and verifies targets from the backup; if recovery fails, the backup remains. An interrupted update is recovered on the next launcher startup. Reconciliation follows the committed engine swap, so a later reconciliation error does not roll the engine back. The updater reconciles the managed OpenCode [router plugin](./runtime-router-plugin.md) when `options.reconcile !== false` and installed packs make reconciliation necessary, using [`changeTarget(..., "reconcile", ...)`](./target-installer.md).
 
 ## Windows File-Lock Resilience (`src/utils/fsWindows.ts`)
 
@@ -195,6 +216,8 @@ Windows file indexers and antivirus scanners transiently lock files during rapid
 
 | Symbol | Source File | Description |
 |--------|-------------|-------------|
+| `checkRuntimeEngineVersion({ bunVersion?, nodeVersion? })` | `manage-agents.mjs` | Validates the active Bun or Node.js runtime against the engine minimums. |
+| `recoverEngineDirIfInterrupted(engineDir)` | `manage-agents.mjs` | Restores an interrupted self-update before dependency checks or bundle loading. |
 | `resolveEngineRoot(overrideRoot?)` | `src/utils/engineVersion.ts` | Locates the real filesystem root of the running `manage-agents` engine. |
 | `assertSafeEnginePath(engineRoot, target)` | `src/utils/engineVersion.ts` | Asserts `target` stays within `engineRoot` and traverses no symlink components. |
 | `computeEngineBundleHash(overrideRoot?)` | `src/utils/engineVersion.ts` | Computes deterministic `sha256:<hex>` over the engine's published runtime and contract files. |
@@ -205,9 +228,10 @@ Windows file indexers and antivirus scanners transiently lock files during rapid
 | `generateReleaseSigningKeypair(overrideEngineRoot?, options?)` | `src/utils/selfUpdate.ts` | Generates an Ed25519 keypair and updates `release-signing.json`. |
 | `signReleaseAssets(overrideEngineRoot, options)` | `src/utils/selfUpdate.ts` | Produces `release-metadata.json` and optional Ed25519 `release-metadata.json.sig`. |
 | `resolveReleaseTrustPolicy(overrideEngineRoot?, options?)` | `src/utils/selfUpdate.ts` | Loads repository and Ed25519 public-key policy from `release-signing.json` and environment variables. |
-| `verifyEngineReleaseMetadata(rawBytes, rawSig, policy, tag?)` | `src/utils/selfUpdate.ts` | Validates metadata schema and verifies its Ed25519 signature against trusted keys. |
-| `checkForEngineUpdate(overrideEngineRoot?, options?)` | `src/utils/selfUpdate.ts` | Queries GitHub Releases, verifies metadata, and reports update/downgrade/dirty status. |
-| `applyEngineUpdate(overrideEngineRoot?, options?)` | `src/utils/selfUpdate.ts` | Downloads, verifies, stages, swaps, rolls back on failure, and reconciles target state. |
+| `verifyEngineReleaseMetadata(rawBytes, rawSig, policy, tag?)` | `src/utils/selfUpdate.ts` | Validates metadata and either verifies a required Ed25519 signature or returns SHA-256-only mode under explicit unsigned policy. |
+| `checkForEngineUpdate(overrideEngineRoot?, options?)` | `src/utils/selfUpdate.ts` | Queries GitHub Releases, applies the metadata trust policy, and reports update/downgrade/dirty status. |
+| `applyEngineUpdate(overrideEngineRoot?, options?)` | `src/utils/selfUpdate.ts` | Obtains or accepts a checked update result, digest-checks and stages the archive, applies the journaled multi-target update, recovers on failure, and reconciles target state. |
+| `recoverInterruptedSelfUpdate(overrideEngineRoot?)` | `src/utils/selfUpdate.ts` | Restores and verifies backed-up engine targets when an update journal remains. |
 | `movePathWithRetry(source, target, ops?)` | `src/utils/fsWindows.ts` | Moves paths with Windows lock retries and staged cross-device (`EXDEV`) fallback. |
 | `removePathWithRetry(target, rmImpl?, sleep?)` | `src/utils/fsWindows.ts` | Removes files or trees with transient Windows lock retries. |
 

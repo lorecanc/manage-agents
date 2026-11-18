@@ -9,7 +9,7 @@ source_files:
   - "src/App.tsx"
   - "contract/CONTRACT.md"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-18"
 ---
 
 # Wiki Index
@@ -19,58 +19,58 @@ last_updated: "2026-11-13"
 ## Overview
 | Page | Description | Last Updated |
 |------|-------------|-------------|
-| [Project Overview](./overview.md) | Overview of manage-agents, its pack-based OpenCode ecosystem, core capabilities, and repository layout | 2026-11-13 |
-| [System Architecture](./architecture.md) | Layered architecture, non-negotiable safety invariants, state locations, and runtime data flows of manage-agents | 2026-11-13 |
-| [Getting Started](./getting-started.md) | Installation, Node/Bun runtime requirements, CLI and TUI quickstart, and contributor test/validation workflow | 2026-11-13 |
+| [Project Overview](./overview.md) | Overview of manage-agents, its pack-based OpenCode ecosystem, interactive workflows, release management, and repository layout | 2026-11-18 |
+| [System Architecture](./architecture.md) | Layered architecture, non-negotiable safety invariants, state locations, and runtime data flows of manage-agents | 2026-11-18 |
+| [Getting Started](./getting-started.md) | Installation, Node/Bun runtime requirements, CLI and TUI quickstart, and contributor test/validation workflow | 2026-11-18 |
 | [Glossary](./glossary.md) | Alphabetically sorted glossary of project-specific terminology across packs, sources, targets, routing, and bridges | 2026-11-13 |
-| [Wiki Log](./log.md) | Append-only log of wiki generation and update operations | 2026-11-13 |
+| [Wiki Log](./log.md) | Append-only log of wiki generation and update operations | 2026-11-18 |
 
 ## Modules
 | Page | Description | Last Updated |
 |------|-------------|-------------|
-| [Launcher, Build & Self-Update](./modules/launcher-and-build.md) | Node FFI bootstrap, auto-build pipeline, bundle hashing, cryptographic release signing, and atomic engine self-update | 2026-11-13 |
-| [Pack Validation, Catalog & Virtual Packs](./modules/pack-validation-and-virtual-packs.md) | Contract 1.1 pack validator, executable surface scanner, catalog closure resolution, and manifest-free virtual pack synthesis | 2026-11-13 |
-| [Pack Onboarding, Doctor & Scaffolding](./modules/pack-onboarding-and-doctor.md) | Automated Contract 1.1 onboarding, V1-to-V2 migration, Pack Doctor auto-repair, resource scaffolding, and authoring kit | 2026-11-13 |
-| [Sources & GitHub Integration](./modules/sources-and-github.md) | Source registry management, read-only Git cache operations, pack discovery, and GitHub CLI authentication | 2026-11-13 |
-| [Dependency Resolver & Lockfile](./modules/resolver-and-lock.md) | Deterministic semver pack resolution, cross-pack reference verification, SHA-256 content/executable hashing, and lockfile diffing | 2026-11-13 |
-| [Transactional Target Installer](./modules/target-installer.md) | Target planning, conflict detection, opencode.json merging, crash-safe journaled writes, backups, and drift status | 2026-11-13 |
-| [Archetypes, Conditional Flows & User Settings](./modules/routing-and-user-settings.md) | Multi-layer subagent model routing, conditional IF/OR policy rules, frontmatter overrides, and read-only source customization | 2026-11-13 |
+| [Launcher, Build & Self-Update](./modules/launcher-and-build.md) | Node/Bun FFI bootstrap, auto-build pipeline, engine versioning, release verification, and journaled self-update | 2026-11-18 |
+| [Pack Validation, Catalog & Virtual Packs](./modules/pack-validation-and-virtual-packs.md) | Contract 1.1 pack validator, executable surface scanner, catalog closure resolution, and manifest-free virtual pack synthesis | 2026-11-18 |
+| [Pack Onboarding, Doctor & Scaffolding](./modules/pack-onboarding-and-doctor.md) | Automated Contract 1.1 onboarding, V1-to-V2 migration, Pack Doctor auto-repair, resource scaffolding, and authoring kit | 2026-11-18 |
+| [Sources & GitHub Integration](./modules/sources-and-github.md) | Source registry management, Git cache operations, pack discovery, and GitHub CLI authentication | 2026-11-18 |
+| [Dependency Resolver & Lockfile](./modules/resolver-and-lock.md) | Deterministic semver pack resolution, cross-pack reference verification, SHA-256 content/executable hashing, and lockfile diffing | 2026-11-18 |
+| [Transactional Target Installer](./modules/target-installer.md) | Target planning, conflict detection, opencode.json merging, journaled writes with interrupted-operation recovery, backups, and drift status | 2026-11-18 |
+| [Archetypes, Conditional Flows & User Settings](./modules/routing-and-user-settings.md) | Multi-layer subagent model routing, conditional IF/OR policy rules, frontmatter overrides, and read-only source customization | 2026-11-18 |
 | [Runtime Router Plugin](./modules/runtime-router-plugin.md) | OpenCode V2 plugin that enforces subagent model routing, tool filtering, permissions, and delegation policies at runtime | 2026-11-13 |
-| [Agent Editing, V2 Compatibility & Git Transactions](./modules/agent-editing-and-v2-compat.md) | Agent frontmatter parsing, V1-to-V2 translation, permission auditing, model catalog lookup, and scoped Git auto-commits | 2026-11-13 |
-| [Claude Code & Codex Bridges](./modules/bridges.md) | Pack closure staging, model tier/inference mapping, prompt tool adaptation, and plugin generation for Claude Code and Codex | 2026-11-13 |
+| [Agent Editing, V2 Compatibility & Git Transactions](./modules/agent-editing-and-v2-compat.md) | Agent frontmatter parsing, V1-to-V2 translation, permission auditing, model catalog lookup, and scoped Git auto-commits | 2026-11-18 |
+| [Claude Code & Codex Bridges](./modules/bridges.md) | Pack closure staging, model tier/inference mapping, prompt tool adaptation, and plugin generation for Claude Code and Codex | 2026-11-18 |
 
 ## Components
 | Page | Description | Last Updated |
 |------|-------------|-------------|
-| [TUI Shell, Catalog Tree & Inspector](./components/tui-shell-and-catalog.md) | Main OpenTUI App component, responsive two-panel layout, collapsible agent tree, 6-tab inspector, animations, and toasts | 2026-11-13 |
-| [Flows & Data Sources Workspaces](./components/workspaces-flows-and-sources.md) | Interactive TUI workspaces for conditional IF/OR routing & delegation graphs and GitHub/local source & target management | 2026-11-13 |
-| [Authoring, Tuning & Bridge Modals](./components/authoring-and-bridge-modals.md) | Modal components for batch parameter tuning, Pack Doctor & scaffolding, Contract 1.1 onboarding, and bridge tier configuration | 2026-11-13 |
-| [Command Palette, Help & Markdown View](./components/navigation-help-and-markdown.md) | Fuzzy command palette, context-aware shortcut bar, tabbed interactive help modal, and cell-accurate Markdown prompt renderer | 2026-11-13 |
+| [TUI Shell, Catalog Tree & Inspector](./components/tui-shell-and-catalog.md) | OpenTUI workspace shell, responsive top bar and two-panel layout, collapsible agent tree, 6-tab inspector, theme utilities, animations, and toast overlay | 2026-11-18 |
+| [Flows & Data Sources Workspaces](./components/workspaces-flows-and-sources.md) | Interactive TUI workspaces for conditional IF/OR routing & delegation graphs and GitHub/local source & target management | 2026-11-18 |
+| [Authoring, Tuning & Bridge Modals](./components/authoring-and-bridge-modals.md) | Modal components for batch parameter tuning, Pack Doctor & scaffolding, Contract 1.1 onboarding, and bridge tier configuration | 2026-11-18 |
+| [Command Palette, Help & Markdown View](./components/navigation-help-and-markdown.md) | Fuzzy command palette, context-aware shortcut bar, tabbed interactive help modal, and cell-accurate Markdown prompt renderer | 2026-11-18 |
 
 ## API
 | Page | Description | Last Updated |
 |------|-------------|-------------|
-| [CLI Command Reference](./api/cli-reference.md) | Complete syntax, flags, exit codes, and JSON output reference for all 20 manage-agents CLI commands | 2026-11-13 |
-| [OpenCode Pack Contract 1.1 Reference](./api/pack-contract-reference.md) | Specification for opencode-pack.json manifest schema, directory layout, namespacing, allowed opencode.json keys, and references | 2026-11-13 |
+| [CLI Command Reference](./api/cli-reference.md) | Complete syntax, flags, exit codes, and JSON output reference for all 20 manage-agents CLI commands | 2026-11-18 |
+| [OpenCode Pack Contract 1.1 Reference](./api/pack-contract-reference.md) | Specification for opencode-pack.json manifest schema, directory layout, namespacing, allowed opencode.json keys, and references | 2026-11-18 |
 
 ## Concepts
 | Page | Description | Last Updated |
 |------|-------------|-------------|
-| [Pack Lifecycle & Target Safety](./concepts/pack-lifecycle-and-target-safety.md) | How desired state, lockfiles, ownership tracking, conflict detection, adoption backups, and crash journals protect OpenCode targets | 2026-11-13 |
-| [Conditional Routing & Archetypes](./concepts/conditional-routing-and-archetypes.md) | How caller models dynamically drive subagent models, tool availability, permissions, and delegations across precedence layers | 2026-11-13 |
-| [Security & Trust Model](./concepts/security-and-trust-model.md) | Defense-in-depth controls for untrusted packs, terminal escape stripping, symlink guards, Git safety, and Ed25519 release signing | 2026-11-13 |
-| [Cross-Harness Pack Translation](./concepts/cross-harness-translation.md) | Conceptual mapping between OpenCode V2 packs, Claude Code plugins, and Codex layers across models, permissions, skills, and tools | 2026-11-13 |
+| [Pack Lifecycle & Target Safety](./concepts/pack-lifecycle-and-target-safety.md) | How desired state, lockfiles, ownership tracking, conflict detection, adoption backups, and crash journals protect OpenCode targets | 2026-11-18 |
+| [Conditional Routing & Archetypes](./concepts/conditional-routing-and-archetypes.md) | How caller models dynamically drive subagent models, tool availability, permissions, and delegations across precedence layers | 2026-11-18 |
+| [Security & Trust Model](./concepts/security-and-trust-model.md) | Defense-in-depth controls for untrusted packs, terminal output, filesystem and Git transactions, bridges, and release verification | 2026-11-18 |
+| [Cross-Harness Pack Translation](./concepts/cross-harness-translation.md) | Conceptual mapping between OpenCode V2 packs, Claude Code plugins, and Codex layers across models, permissions, skills, and tools | 2026-11-18 |
 
 ## Config
 | Page | Description | Last Updated |
 |------|-------------|-------------|
-| [User Settings, Target State & Environment Variables](./config/user-and-target-files.md) | Schema and file location reference for XDG user configs, Git source cache, target .manage-agents state files, and environment variables | 2026-11-13 |
-| [Bridge Translation & Release Config Reference](./config/translation-and-release-config.md) | Configuration reference for bridges/translation-config.json, release-signing.json, and engine release manifests | 2026-11-13 |
+| [User Settings, Target State & Environment Variables](./config/user-and-target-files.md) | Schema and file location reference for XDG user configs, Git source cache, target .manage-agents state files, and environment variables | 2026-11-18 |
+| [Bridge Translation & Release Config Reference](./config/translation-and-release-config.md) | Configuration reference for bridges/translation-config.json, release-signing.json, and engine release manifests | 2026-11-18 |
 
 ## Dependencies
 | Page | Description | Last Updated |
 |------|-------------|-------------|
-| [Runtime & Tooling Dependencies](./dependencies/runtime-and-tooling-stack.md) | External npm packages, esbuild bundling externals, Node FFI/Bun runtime requirements, and optional host CLI integrations | 2026-11-13 |
+| [Runtime & Tooling Dependencies](./dependencies/runtime-and-tooling-stack.md) | Runtime requirements, npm package contents, build and test dependencies, CI, release tooling, and optional host CLI integrations | 2026-11-18 |
 
 ## Source File Map
 
@@ -82,15 +82,16 @@ Quick lookup mapping repository source files to their primary wiki documentation
 | `src/index.tsx` | [CLI Command Reference](./api/cli-reference.md), [System Architecture](./architecture.md) |
 | `src/App.tsx` | [TUI Shell, Catalog Tree & Inspector](./components/tui-shell-and-catalog.md), [Flows & Data Sources Workspaces](./components/workspaces-flows-and-sources.md) |
 | `src/ui/FlowsWorkspace.tsx`, `src/ui/SourcesTargetWorkspace.tsx` | [Flows & Data Sources Workspaces](./components/workspaces-flows-and-sources.md) |
+| `src/ui/PackFlowsModal.tsx` | [Flows & Data Sources Workspaces](./components/workspaces-flows-and-sources.md), [Archetypes, Conditional Flows & User Settings](./modules/routing-and-user-settings.md), [Conditional Routing & Archetypes](./concepts/conditional-routing-and-archetypes.md) |
 | `src/ui/ParameterTuningModal.tsx`, `src/ui/PackDoctorModal.tsx`, `src/ui/PackOnboardingModal.tsx`, `src/ui/BridgeModal.tsx` | [Authoring, Tuning & Bridge Modals](./components/authoring-and-bridge-modals.md) |
 | `src/ui/CommandPaletteModal.tsx`, `src/ui/HelpModal.tsx`, `src/ui/PromptMarkdownView.tsx`, `src/ui/markdownStyle.ts` | [Command Palette, Help & Markdown View](./components/navigation-help-and-markdown.md) |
-| `src/ui/ToastOverlay.tsx`, `src/ui/animations.ts` | [TUI Shell, Catalog Tree & Inspector](./components/tui-shell-and-catalog.md) |
+| `src/ui/WorkspaceTopbar.tsx`, `src/ui/ToastOverlay.tsx`, `src/ui/animations.ts` | [TUI Shell, Catalog Tree & Inspector](./components/tui-shell-and-catalog.md) |
 | `src/utils/agents.ts`, `src/utils/v2Compat.ts`, `src/utils/models.ts`, `src/utils/repositoryTransaction.ts` | [Agent Editing, V2 Compatibility & Git Transactions](./modules/agent-editing-and-v2-compat.md) |
 | `src/utils/archetypes.ts`, `src/utils/userSettings.ts`, `src/utils/sourceCustomization.ts`, `src/utils/values.ts` | [Archetypes, Conditional Flows & User Settings](./modules/routing-and-user-settings.md), [Conditional Routing & Archetypes](./concepts/conditional-routing-and-archetypes.md) |
 | `src/utils/bridge*.ts`, `src/utils/codexBridge.ts`, `src/utils/translationConfig.ts`, `src/utils/claude*.ts` | [Claude Code & Codex Bridges](./modules/bridges.md), [Cross-Harness Pack Translation](./concepts/cross-harness-translation.md), [Bridge Translation & Release Config Reference](./config/translation-and-release-config.md) |
 | `src/utils/commandPalette.ts`, `src/utils/helpGuide.ts`, `src/utils/markdownLayout.ts` | [Command Palette, Help & Markdown View](./components/navigation-help-and-markdown.md) |
 | `src/utils/engineVersion.ts`, `src/utils/selfUpdate.ts` | [Launcher, Build & Self-Update](./modules/launcher-and-build.md), [Bridge Translation & Release Config Reference](./config/translation-and-release-config.md), [Security & Trust Model](./concepts/security-and-trust-model.md) |
-| `src/utils/installer.ts`, `src/utils/changeReport.ts`, `src/utils/fsWindows.ts` | [Transactional Target Installer](./modules/target-installer.md), [Pack Lifecycle & Target Safety](./concepts/pack-lifecycle-and-target-safety.md), [User Settings, Target State & Environment Variables](./config/user-and-target-files.md) |
+| `src/utils/installer.ts`, `src/utils/changeReport.ts`, `src/utils/fsWindows.ts` | [Launcher, Build & Self-Update](./modules/launcher-and-build.md), [Transactional Target Installer](./modules/target-installer.md), [Pack Lifecycle & Target Safety](./concepts/pack-lifecycle-and-target-safety.md), [User Settings, Target State & Environment Variables](./config/user-and-target-files.md) |
 | `src/utils/layout.ts`, `src/utils/uiConfig.ts`, `src/utils/uiTheme.ts`, `src/utils/terminalText.ts` | [TUI Shell, Catalog Tree & Inspector](./components/tui-shell-and-catalog.md), [Security & Trust Model](./concepts/security-and-trust-model.md) |
 | `src/utils/packOnboarding.ts` | [Pack Onboarding, Doctor & Scaffolding](./modules/pack-onboarding-and-doctor.md) |
 | `src/utils/packs.ts`, `src/utils/catalog.ts`, `src/utils/virtualPacks.ts`, `src/utils/pathValidation.ts`, `src/utils/opencodeMcp.ts` | [Pack Validation, Catalog & Virtual Packs](./modules/pack-validation-and-virtual-packs.md), [OpenCode Pack Contract 1.1 Reference](./api/pack-contract-reference.md) |
@@ -98,4 +99,4 @@ Quick lookup mapping repository source files to their primary wiki documentation
 | `src/utils/sources.ts`, `src/utils/github.ts` | [Sources & GitHub Integration](./modules/sources-and-github.md), [User Settings, Target State & Environment Variables](./config/user-and-target-files.md) |
 | `runtime/plugins/manage-agents-router/index.ts`, `runtime/plugins/manage-agents-router/router.js` | [Runtime Router Plugin](./modules/runtime-router-plugin.md), [Conditional Routing & Archetypes](./concepts/conditional-routing-and-archetypes.md) |
 | `contract/CONTRACT.md`, `contract/opencode-pack.schema.json`, `contract/examples/minimal-pack/*`, `contract/skills/opencode-pack-authoring/SKILL.md` | [OpenCode Pack Contract 1.1 Reference](./api/pack-contract-reference.md), [Pack Onboarding, Doctor & Scaffolding](./modules/pack-onboarding-and-doctor.md) |
-| `package.json`, `tsconfig.json`, `.github/workflows/ci.yml`, `test/helpers.ts` | [Project Overview](./overview.md), [Getting Started](./getting-started.md), [Runtime & Tooling Dependencies](./dependencies/runtime-and-tooling-stack.md) |
+| `package.json`, `tsconfig.json`, `.github/workflows/ci.yml`, `test/helpers.ts` | [Project Overview](./overview.md), [Getting Started](./getting-started.md), [Runtime & Tooling Dependencies](./dependencies/runtime-and-tooling-stack.md), [Launcher, Build & Self-Update](./modules/launcher-and-build.md) |

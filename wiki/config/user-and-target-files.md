@@ -8,10 +8,11 @@ source_files:
   - "src/utils/uiConfig.ts"
   - "src/utils/lock.ts"
   - "src/utils/installer.ts"
+  - "src/utils/fsWindows.ts"
   - "manage-agents.mjs"
   - "runtime/plugins/manage-agents-router/index.ts"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-18"
 ---
 
 # User Settings, Target State & Environment Variables
@@ -24,7 +25,7 @@ last_updated: "2026-11-13"
 | **Source & Bridge Cache** | `~/.cache/manage-agents/` | `$XDG_CACHE_HOME` | `src/utils/sources.ts`, `src/utils/sourceCustomization.ts` |
 | **OpenCode Target State** | `~/.config/opencode/.manage-agents/` | `--target <dir>` or `$XDG_CONFIG_HOME` | `src/utils/lock.ts`, `src/utils/installer.ts` |
 
-All JSON state files are written atomically via temporary sibling files (`atomicWriteRestrictedFile` in `src/utils/agents.ts` or staged transactions in `src/utils/installer.ts` — see [Transactional Target Installer](../modules/target-installer.md)) and reject symlinks at target paths.
+Persistent JSON files use atomic replacement (`atomicWriteRestrictedFile`, the UI config's temporary-file/rename protocol, or staged target transactions); ephemeral locks use exclusive creation. Target roots and intermediate managed paths are checked for symlinks; `.manage-agents` state paths also reject symlink leaves, while user file leaves can be backed up as symlinks without following them when replaced under `--adopt` (see [Transactional Target Installer](../modules/target-installer.md)).
 
 ---
 
@@ -82,7 +83,7 @@ Managed by `loadSources` and `saveSources` (`src/utils/sources.ts`; see [Sources
 | `sources` | `Source[]` | Yes | Unique `name` entries matching `PACK_NAME_RE` (`^[a-z0-9]+(?:-[a-z0-9]+)*$`). |
 | `sources[].kind` | `"local" \| "git"` | Yes | Discriminates local filesystem roots vs. remote Git repositories. |
 | `sources[].path` | `string` | When `kind === "local"` | Canonicalized absolute path (`fs.realpathSync` at registration time). |
-| `sources[].url` | `string` | When `kind === "git"` | `https://`, `ssh://`, or `user@host:path` Git URL. URLs containing embedded credentials (`user@` on HTTPS, `user:pass@` on SSH) or query strings (`?...`) are rejected to prevent secret leakage. GitHub shorthand (`[github:]owner/repo[#ref]`) is normalized to `https://github.com/<owner>/<repo>.git`. |
+| `sources[].url` | `string` | When `kind === "git"` | `https://`, `ssh://`, or `user@host:path` Git URL. URLs containing embedded credentials (user-info on HTTPS, non-`git` user-info or a password on `ssh://`, or passwords in scp-style URLs) are rejected; query strings (`?...`) are rejected on `https://` and `ssh://` URLs to prevent secret leakage. GitHub shorthand (`[github:]owner/repo[#ref]`) is normalized to `https://github.com/<owner>/<repo>.git`. |
 | `sources[].ref` | `string` | Optional (`git` only) | Branch, tag, or commit ref matching `^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]+$`. When omitted, `pullSource` resolves `refs/remotes/origin/HEAD`. |
 | `sources[].trusted` | `boolean` | Yes | Defaults to `false` unless `--trust` or `source trust <name>` is used. Packs from untrusted sources carrying executable surfaces (`plugins`, `mcp.servers`, command overrides) require interactive confirmation or `--yes` during install/update (see [Security & Trust Model](../concepts/security-and-trust-model.md)). |
 | `prefer` | `Record<string, string>` | Yes | Maps `<pack-name>` to `<source-name>` when multiple registered sources offer the same pack. Every value must reference an existing entry in `sources`. |
@@ -227,8 +228,8 @@ Managed by `loadUiConfig` and `saveUiConfig` (`src/utils/uiConfig.ts`). Stores i
 
 #### File Integrity & Concurrency Controls
 
-- **Bounded descriptor reads**: `readConfigBytes` rejects files larger than `64 KiB` (`65536` bytes), opens with `O_RDONLY | O_NOFOLLOW` where supported, verifies inode identity between `lstatSync` and `fstatSync`, and returns a SHA-256 `revision` digest (or `"missing"` when absent). Invalid or unreadable files fall back to `DEFAULT_UI_CONFIG` with a non-fatal warning.
-- **Exclusive write lock (`ui.lock`)**: `saveUiConfig` ensures `<engineConfigDir>` exists (mode `0o700`) and is not a symlink, creates `ui.lock` with `O_WRONLY | O_CREAT | O_EXCL` (`0o600`), writes a 32-byte random token, `fsync`s it, verifies `expectedRevision` for optimistic concurrency, writes `.ui.json.tmp-<pid>-<timestamp>-<rand>`, `fsync`s both file and directory descriptors, atomically renames into `ui.json`, and removes `ui.lock` only after verifying inode/token ownership.
+- **Bounded descriptor reads**: `readConfigBytes` rejects files larger than `64 KiB` (`65536` bytes), opens with `O_RDONLY | O_NOFOLLOW` where supported, compares device/inode identity between `lstatSync` and `fstatSync` where available, and returns a SHA-256 `revision` digest (or `"missing"` when absent). Invalid or unreadable files fall back to `DEFAULT_UI_CONFIG` with a non-fatal warning.
+- **Exclusive write lock (`ui.lock`)**: `saveUiConfig` ensures `<engineConfigDir>` exists (mode `0o700`) and is not a symlink, creates `ui.lock` with `O_WRONLY | O_CREAT | O_EXCL` (`0o600`), writes a 32-byte random token, `fsync`s it, verifies `expectedRevision` for optimistic concurrency, writes `.ui.json.tmp-<pid>-<timestamp>-<rand>`, `fsync`s the file and best-effort `fsync`s the directory, atomically renames into `ui.json`, and removes `ui.lock` only after verifying inode/token ownership.
 
 ---
 
@@ -275,7 +276,7 @@ Created and updated by `pullSource` (`src/utils/sources.ts`; see [Sources & GitH
 
 Created on demand by `revisionSnapshot` (`src/utils/sources.ts`) and consumed by `loadLockedPacks` (`src/utils/installer.ts`):
 - Validated against `/^[0-9a-f]{40,64}$/`.
-- Cloned locally from `sources/<name>/` using `git clone --quiet --shared --no-checkout` into `<dir>.tmp-<pid>-<timestamp>`, checked out with `git checkout --quiet --force --detach <commit>`, and renamed atomically into `revisions/<name>/<commit>/`.
+- Cloned locally from `sources/<name>/` using `git clone --quiet --shared --no-checkout` into `<dir>.tmp-<pid>-<timestamp>`, checked out with `git checkout --quiet --force --detach <commit>`, and moved into `revisions/<name>/<commit>/` with `movePathWithRetry` (`src/utils/fsWindows.ts`).
 - Guarantees that `manage-agents reconcile` and `override`/`models` re-renders always materialize the exact commit SHA recorded in `<target>/.manage-agents/lock.json` (see [Dependency Resolver & Lockfile](../modules/resolver-and-lock.md)), even if `sources/<name>/` has already been pulled to newer commits.
 
 ### `bridges/<source>/<claude-code|codex>/<plugin>/` — Cached Bridge Artifacts
@@ -406,7 +407,7 @@ Read by `readInstalled` and written by `applyPlan` (`src/utils/installer.ts`, mo
 }
 ```
 
-- All keys in `files` must pass `isSafeRel` (POSIX separators, relative, no empty/`.`/`..` segments, no NUL bytes).
+- All keys in `files` must pass `isSafeRel` (non-empty, relative POSIX-style paths; no empty/`.`/`..` segments, backslashes, NUL bytes, or POSIX/Windows absolute paths).
 - `:engine` (`ENGINE_OWNER`) marks files and `plugins` entries synthesized by `manage-agents` itself rather than a pack.
 - `createdSections` records dotted object paths in `opencode.json` (e.g., `"mcp"`, `"mcp.servers"`) that did not exist before `manage-agents` created them; when uninstalling leaves those sections empty, `planConfig` deletes them while preserving empty sections originally authored by the user.
 - If a managed file is modified locally by the user and later dropped by pack uninstallation/update, `planReconcile` releases ownership (`released`) and leaves the user's edited file in place with a warning rather than deleting it.
@@ -434,11 +435,13 @@ Managed by `withTargetLock` (`src/utils/installer.ts`). Serializes `install`, `u
 
 Managed by `applyPlan` and `rollbackInterrupted` (`src/utils/installer.ts`), where `<id>` has the format `<ISO-timestamp-with-hyphens>-<8-hex>`:
 
-1. **Stage (`txn/<id>/new/<rel>`)**: Every planned file write, rewritten `opencode.json(c)`, and updated `.manage-agents/{installed,lock,desired}.json` is written inside `<target>/.manage-agents/txn/<id>/new/` (on the same filesystem as `<target>`) and hashed against the plan's expected source digest.
+1. **Stage (`txn/<id>/new/<rel>`)**: Planned file writes, rewritten `opencode.json(c)`, and updated `.manage-agents/{installed,lock,desired}.json` are written inside `<target>/.manage-agents/txn/<id>/new/` (on the same filesystem as `<target>`); writes carrying a planned hash are checked against it.
 2. **Pre-commit drift check**: Every target path in `plan.expected` is re-hashed (`symlink:<target>` for symlinks, SHA-256 for files, `null` for absent paths) to ensure nothing changed on disk while waiting for user confirmation.
 3. **Write journal (`journal.json`)**: Written atomically (`0o644`) with `{ "id": "<id>", "ops": [{ "rel": "...", "existed": true, "hash": "..." }] }`.
-4. **Swap (`txn/<id>/prev/<rel>`)**: Existing files are moved into `txn/<id>/prev/<rel>` (verifying their hash matches `plan.expected`), and staged files from `txn/<id>/new/<rel>` are moved into `<target>/<rel>`.
+4. **Swap (`txn/<id>/prev/<rel>`)**: Existing files are moved into `txn/<id>/prev/<rel>` (verifying their hash matches `plan.expected`), and staged files from `txn/<id>/new/<rel>` are moved into `<target>/<rel>` using `movePathWithRetry`.
 5. **Cleanup or Rollback**: On success, `journal.json` and `txn/<id>/` are deleted and empty parent directories of deleted files are pruned. If an error or process crash interrupts step 4, `rollbackInterrupted` runs automatically at the start of the next mutating command, replaying `journal.ops` in reverse order to restore `txn/<id>/prev/<rel>` and remove newly created files matching `op.hash`.
+
+`movePathWithRetry` (`src/utils/fsWindows.ts`) retries transient Windows `EPERM`, `EACCES`, and `EBUSY` errors. For `EXDEV` or a persistent transient lock, it falls back to a staged copy and removal, preserving an existing destination for restoration if replacement fails. Retry-aware removal is also used to clean up transaction and snapshot paths.
 
 #### `backups/<id>/` — Adopted Content Backups
 

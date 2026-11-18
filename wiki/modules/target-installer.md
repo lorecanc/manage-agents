@@ -1,20 +1,20 @@
 ---
 title: "Transactional Target Installer"
-description: "Target planning, conflict detection, opencode.json merging, crash-safe journaled writes, backups, and drift status"
+description: "Target planning, conflict detection, opencode.json merging, journaled writes with interrupted-operation recovery, backups, and drift status"
 category: "modules"
 source_files:
   - "src/utils/installer.ts"
   - "src/utils/changeReport.ts"
   - "src/utils/fsWindows.ts"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-18"
 ---
 
 # Transactional Target Installer
 
 ## Purpose
 
-The Transactional Target Installer reconciles an OpenCode *[target]* (see [Glossary](../glossary.md)) directory (such as `$XDG_CONFIG_HOME/opencode` or a project `.opencode/` folder) against a [resolved graph of packs](./resolver-and-lock.md). It separates side-effect-free reconciliation planning (`planReconcile`) from crash-safe execution (`applyPlan`), surgically merges pack contributions into `<target>/opencode.json` (or `opencode.jsonc`) without clobbering user configuration, enforces ownership and conflict boundaries with optional `--adopt` backups (see [Pack Lifecycle & Target Safety](../concepts/pack-lifecycle-and-target-safety.md)), prevents concurrent target corruption via process locks, and formats terminal-safe change summaries for both the [CLI](../api/cli-reference.md) and [TUI](../components/tui-shell-and-catalog.md).
+The Transactional Target Installer reconciles an OpenCode *[target]* (see [Glossary](../glossary.md)) directory (such as `$XDG_CONFIG_HOME/opencode` or a project `.opencode/` folder) against a [resolved graph of packs](./resolver-and-lock.md). It separates side-effect-free reconciliation planning (`planReconcile`) from journaled execution with interrupted-transaction recovery (`applyPlan`), surgically merges pack contributions into `<target>/opencode.json` (or `opencode.jsonc`) without clobbering user configuration, enforces ownership and conflict boundaries with optional `--adopt` backups (see [Pack Lifecycle & Target Safety](../concepts/pack-lifecycle-and-target-safety.md)), prevents concurrent target corruption via process locks, and formats terminal-safe change summaries for both the [CLI](../api/cli-reference.md) and [TUI](../components/tui-shell-and-catalog.md).
 
 ## Key Files
 
@@ -35,10 +35,10 @@ The Transactional Target Installer reconciles an OpenCode *[target]* (see [Gloss
 | `loadLockedPacks(lock, registry, env?)` | Function | Resolves every pack in `lock` (checking out git sources at their locked commit snapshot via `revisionSnapshot`), validates contract compliance (standard or virtual packs), and verifies `manifestHash`, `contentHash`, `executableHash`, and config SHA-256 against the lock. |
 | `packContribution(pack, target, overrides?)` | Function | Computes a single pack's `Contribution` to `opencode.json`, normalizing plugin specs, auto-registering shipped plugins, rewriting `skills` and `instructions` paths to `<target>`, adding `instructions/<pack>.md` when `AGENTS.md` is present, and patching overridden `agents`/`commands` entries. |
 | `planReconcile(target, lock, registry, options?)` | Function | Pure read-only planner returning a `ReconcilePlan` (scheduled writes, deletes, released files, conflicts, warnings, adopted items, merged `configText`, TOCTOU `expected` hashes, and next `InstalledState`). |
-| `applyPlan(plan, state)` | Function | Executes a conflict-free `ReconcilePlan` atomically using `<target>/.manage-agents/txn/<id>/`, `.manage-agents/journal.json`, and optional `.manage-agents/backups/<id>/`. |
-| `rollbackInterrupted(target)` | Function | Reverses any half-applied transaction recorded in `.manage-agents/journal.json` and cleans up its staging directory. Returns `true` when recovery occurred. |
+| `applyPlan(plan, state)` | Function | Applies a conflict-free `ReconcilePlan` as a journaled target transaction using `<target>/.manage-agents/txn/<id>/`, `.manage-agents/journal.json`, and optional `.manage-agents/backups/<id>/`; individual paths are replaced sequentially, with recovery data retained until the journal is removed. |
+| `rollbackInterrupted(target)` | Function | Reverses an interrupted operation recorded in `.manage-agents/journal.json` using saved pre-images, removing newly created files only when their hash still matches the journal. Returns `true` when recovery occurred. |
 | `withTargetLock(target, command, fn)` | Function | Serializes target mutations via `<target>/.manage-agents/install.lock`, reclaiming locks left behind by dead local processes. |
-| `changeTarget(target, command, registry, compute, options?)` | Function | Shared lifecycle orchestrator: locks the target, rolls back interrupted transactions, computes target state changes, plans reconciliation, prompts for untrusted/executable confirmations, and applies or dry-runs the plan. |
+| `changeTarget(target, command, registry, compute, options?)` | Function | Shared lifecycle orchestrator: locks the target, rolls back interrupted transactions unless dry-running, computes target state changes, plans reconciliation, prompts for untrusted/executable confirmations, and applies or dry-runs the plan. |
 | `installChange(registry, requests, env?)` | Function | `Compute` factory that adds or updates requested root specs while pinning already-locked non-requested packs to their locked source and version. |
 | `uninstallChange(names)` | Function | `Compute` factory that removes root requests (rejecting direct removal of packs still required as dependencies) and prunes unreachable packs via `pruneLock`. |
 | `updateChange(registry, names, env?, gitOptions?)` | Function | `Compute` factory that pulls git sources for selected packs (or all locked packs when `names` is empty) and re-resolves unpinned packs. |
@@ -65,7 +65,7 @@ The Transactional Target Installer reconciles an OpenCode *[target]* (see [Gloss
 
 ## Target State Trio & Legacy Migration
 
-All engine metadata for a managed target lives under [`<target>/.manage-agents/`](../config/user-and-target-files.md). Three JSON files form the authoritative target state, staged and committed together at the end of every `applyPlan()` run:
+All engine metadata for a managed target lives under [`<target>/.manage-agents/`](../config/user-and-target-files.md). Three JSON files form the authoritative target state. `applyPlan()` stages all three and includes them with content changes in one journaled transaction; it replaces paths sequentially rather than atomically swapping the entire set:
 
 1. **`desired.json` (`DesiredState`)**: Stores `{ desiredVersion: 1, roots: string[] }`, recording only the user's top-level pack requests (such as `"flow"`, `"source/pack@^1.2.0"`), sorted lexicographically on disk. Transitive dependencies are omitted so `uninstall` can cleanly prune orphaned dependencies when a root is removed.
 2. **[`lock.json`](./resolver-and-lock.md) (`PackLock`)**: Stores `{ lockVersion: 1, contract: "1.0", roots: string[], packs: Record<string, LockedPack> }`. Each `LockedPack` pins `source`, `sourceKind` (`"local" | "git"`), `path`, `version`, git `revision`, `manifestHash`, `contentHash`, `executable` summary, `executableHash`, `trusted`, and `requires`. During `loadLockedPacks()`, every pack's manifest, installable files, and `opencode.json(c)` bytes are re-hashed and verified against these digests before planning proceeds.
@@ -165,7 +165,7 @@ Whenever `plan.adopted.files` or `plan.adopted.config` is non-empty, `applyPlan(
 4. If the entire `configFile` was backed up in `backup.files`, restores its raw text verbatim and resets `installed.config = {}` and `installed.createdSections`. Otherwise, splices each `AdoptedConfigEntry` back into `configFile` and removes those keys from every pack's `installed.config` contribution.
 5. Commits the restoration transactionally through `applyPlan()`, leaving the restored files and config entries unmanaged. Calling `manage-agents status` afterward reports the resulting drift against the still-locked packs.
 
-## Crash-Safe Transactions, Symlink Guards & Concurrency Control
+## Journaled Transactions, Symlink Guards & Concurrency Control
 
 ### Target Lock & Stale Lock Recovery (`withTargetLock`)
 
@@ -179,31 +179,30 @@ Only one mutating CLI or TUI operation may run against `<target>` at a time. `wi
 
 The installer enforces strict containment so [untrusted packs](../concepts/security-and-trust-model.md) or crafted target directories cannot trick `manage-agents` into reading or writing outside `<target>`:
 
-- Every state-derived path is checked by `isSafeRel()`.
-- All target inspections in `currentHash()`, `planConfig()`, `applyPlan()`, `rollbackInterrupted()`, and `restoreBackup()` use `fs.lstatSync(..., { throwIfNoEntry: false })` rather than `statSync`, treating symlinks as `"symlink:<linkTarget>"` strings and never following directory or config symlinks.
-- Control files (`backup.json`, `journal.json`, `lock.json`) use [`atomicWriteRestrictedFile()`](./agent-editing-and-v2-compat.md), which verifies via `lstatSync` that any existing target is a regular non-symlink file, allocates a sibling `.tmp` file with `fs.openSync(tempPath, "wx", mode)`, writes all bytes, applies `fchmodSync`, and atomically renames the temp file into place.
+- Every state-derived relative path is checked by `isSafeRel()`; state paths also disallow a symlink at the leaf. Filesystem type checks use `fs.lstatSync()` so managed leaf symlinks are identified and moved or backed up as links rather than dereferenced. A symlink `opencode.json`/`opencode.jsonc` is a planning conflict.
+- `backup.json` and `journal.json` are written with [`atomicWriteRestrictedFile()`](./agent-editing-and-v2-compat.md). The `installed.json`, `lock.json`, and `desired.json` state snapshots are instead staged as operations in the transaction below; `install.lock` is created exclusively with `{ flag: "wx" }`.
 
-### Journaled Five-Phase Commit (`applyPlan` & `rollbackInterrupted`)
+### Journaled Apply and Interrupted-Transaction Recovery (`applyPlan` & `rollbackInterrupted`)
 
-`applyPlan(plan, state)` applies all file writes, deletes, `opencode.json` updates, and `.manage-agents/{installed,lock,desired}.json` state updates on the target filesystem in five phases:
+`applyPlan(plan, state)` applies file writes, deletes, `opencode.json` updates, and `.manage-agents/{installed,lock,desired}.json` state updates in five phases. This is a journaled, recoverable sequence—not one atomic multi-path replacement. Staging normally shares the target filesystem; if a destination is on another volume, `movePathWithRetry()` handles `EXDEV` with a copy fallback.
 
-1. **Same-filesystem staging (`txn/<id>/new/`)**: Stages every `PlannedWrite`, `configText`, and the three `.manage-agents/*.json` files under `<target>/.manage-agents/txn/<id>/new/<rel>`. After staging each file, `currentHash(staged)` is verified against `expectedHash` so concurrent edits in a local pack source abort before touching the target.
+1. **Target-local staging (`txn/<id>/new/`)**: Stages every `PlannedWrite`, `configText`, and the three `.manage-agents/*.json` files under `<target>/.manage-agents/txn/<id>/new/<rel>`. Pack writes with an expected content hash are checked after staging, so source changes detected during the copy abort before target paths are changed.
 2. **Pre-journal TOCTOU check**: Every path recorded in `plan.expected` is re-hashed on `<target>` (`currentHash(targetFile(target, op.rel)) !== plan.expected[op.rel]`). If any target file changed while the user was reading an interactive confirmation prompt, `txn/<id>` is removed and nothing is written.
-3. **Backup & Write-Ahead Journal**: Writes `.manage-agents/backups/<id>/` (when adopting) and atomically writes `<target>/.manage-agents/journal.json` containing `{ id, ops: [{ rel, existed, hash }] }`.
-4. **Pre-image move & atomic swap (`txn/<id>/prev/`)**: Iterates `ops` in order:
-   - If `op.existed`, moves the live target file into `txn/<id>/prev/<rel>` via `movePathWithRetry()` and immediately re-checks `currentHash(previous) === plan.expected[op.rel]` (catching narrow race windows right before replacement).
-   - If `op.staged` is non-null, verifies nothing unexpectedly appeared at `full` and moves `op.staged` to `full` via `movePathWithRetry()`.
-   - Any error thrown inside this loop invokes `rollbackInterrupted(target)` before rethrowing.
-5. **Journal teardown & directory cleanup**: Removes `journal.json`, deletes `txn/<id>` via `removePathWithRetry()`, and prunes empty parent directories left by `plan.deletes`.
+3. **Backup & Write-Ahead Journal**: Copies adopted files into `.manage-agents/backups/<id>/` (when adopting) and atomically writes `<target>/.manage-agents/journal.json` containing `{ id, ops: [{ rel, existed, hash }] }` before replacing target paths. The journal records whether each path existed and, for staged writes, the new content hash.
+4. **Pre-image move & per-path replacement (`txn/<id>/prev/`)**: Iterates `ops` in order:
+   - If `op.existed`, moves the live target path into `txn/<id>/prev/<rel>` via `movePathWithRetry()` and re-checks `currentHash(previous) === plan.expected[op.rel]` when the path is covered by `plan.expected`.
+   - If `op.staged` is non-null, verifies nothing unexpectedly appeared at `full` and moves the staged path into place via `movePathWithRetry()`.
+   - Because operations are sequential, an intermediate state can be visible until recovery completes. Any error inside this loop invokes `rollbackInterrupted(target)` before rethrowing.
+5. **Journal teardown & directory cleanup**: Once all operations are applied, removes `journal.json`, deletes `txn/<id>` via `removePathWithRetry()`, and prunes empty parent directories left by `plan.deletes`. A crash after journal removal leaves the new state applied; it can leave only transaction-directory cleanup unfinished.
 
-If a process crashes (e.g., `SIGKILL` or power loss) during Phase 4, `.manage-agents/journal.json` remains on disk. The next `changeTarget()` (when not `dryRun`) or `restoreBackup()` call runs `rollbackInterrupted(target)` first: it validates `journal.json`, iterates `journal.ops` in **reverse** order, moves every saved pre-image from `txn/<id>/prev/<rel>` back to `<target>/<rel>` (or unlinks newly created files whose hash matches `op.hash`), and deletes both `journal.json` and `txn/<id>`.
+Before the journal is created, live target paths have not yet been replaced; an abrupt stop can leave staged data and possibly an adoption backup without a journal to trigger automatic cleanup. If the process stops after the write-ahead journal is created but before it is removed, `.manage-agents/journal.json` remains on disk. The next non-dry-run `changeTarget()` operation or `restoreBackup()` call runs `rollbackInterrupted(target)` first; `targetStatus()` only reports the pending recovery, and dry runs do not perform it. Recovery validates the journal, iterates `journal.ops` in **reverse** order, restores each available pre-image from `txn/<id>/prev/<rel>`, and unlinks a newly created file only if its current hash still matches `op.hash`. If an operation marked as previously existing has no saved pre-image, its current path is left as-is. After a successful rollback, it removes the journal and transaction directory. This describes process-interruption recovery; the code does not establish a power-loss durability guarantee.
 
 ### Windows File-Lock Resilience (`src/utils/fsWindows.ts`)
 
-On Windows, search indexers and antivirus scanners transiently lock newly written or moved paths with `EPERM`, `EACCES`, or `EBUSY`. `movePathWithRetry()` and `removePathWithRetry()` absorb these locks:
+On Windows, search indexers and antivirus scanners can transiently lock paths with `EPERM`, `EACCES`, or `EBUSY`. `movePathWithRetry()` and `removePathWithRetry()` retry those errors; moves also handle cross-device `EXDEV` failures:
 
-- `removePathWithRetry()` invokes `fs.rmSync` with `WINDOWS_SAFE_RM_OPTIONS` and retries transient lock codes across `[10, 25, 50, 100]` ms synchronous sleeps (`Atomics.wait` on a `SharedArrayBuffer`, with a deadline spin fallback).
-- `movePathWithRetry()` retries `renameSync` across the same backoff schedule. If `renameSync` fails with `EXDEV` (cross-volume move) or exhausts transient lock retries, it copies `source` to `<target>.stage-<suffix>` (`verbatimSymlinks: true`), backs up any existing destination to `<target>.bak-<suffix>`, removes `<target>`, swaps the staged copy in, and restores `<target>.bak-<suffix>` on failure so an existing file is never lost before its replacement succeeds.
+- `removePathWithRetry()` invokes `fs.rmSync` with `WINDOWS_SAFE_RM_OPTIONS` and retries transient lock codes with synchronous `[10, 25, 50, 100]` ms waits (`Atomics.wait` on a `SharedArrayBuffer`, with a deadline-spin fallback).
+- `movePathWithRetry()` makes up to five `renameSync` attempts, waiting `[10, 25, 50, 100]` ms between retries for transient lock errors. On `EXDEV` or exhausted lock retries, it copies the source to `<target>.stage-<suffix>` (preserving symlink text), copies any existing destination to `<target>.bak-<suffix>`, then removes and replaces the destination. If replacement fails, it attempts to restore the backup; if restoration also fails, it retains the backup and reports its path. On success it removes the backup (best-effort) and original source. This copy fallback is recoverable but not an atomic rename across filesystems.
 
 ## Lifecycle Operations & Change Reporting
 
@@ -231,7 +230,7 @@ Inside `changeTarget()`, once `compute` returns a problem-free `TargetChange`:
 
 `targetStatus(target, registry, env)` performs a strictly read-only health check and populates `drift: string[]`:
 
-- Pending crash recovery: checks `fs.existsSync(journalPath(target))` (`interrupted: true`).
+- Pending crash recovery: checks `fs.existsSync(journalPath(target))` (`interrupted: true`); status inspection does not run recovery.
 - Git source drift: compares each locked git source's `sourceRevision()` (working checkout) and `lastFetchedRevision()` against `locked.revision`, advising `manage-agents update <pack>`.
 - Managed file drift: hashes every file in `installed.files`, reporting missing files (`run manage-agents reconcile`) and locally modified files (`manage-agents reconcile --adopt restores the pack version and keeps a backup`).
 - Unapplied settings or conflicts: runs `planReconcile()` against the current lock (deduplicating already-reported paths) and reports conflicts or the count of paths `reconcile` would change, plus unlocked `desired.roots` requests.

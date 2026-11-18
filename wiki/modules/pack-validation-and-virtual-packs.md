@@ -9,7 +9,7 @@ source_files:
   - "src/utils/pathValidation.ts"
   - "src/utils/opencodeMcp.ts"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-18"
 ---
 
 # Pack Validation, Catalog & Virtual Packs
@@ -76,7 +76,7 @@ This module group enforces the [OpenCode pack contract (`1.1`)](../api/pack-cont
 
 ## Executable Surface Scanner (`ExecutableSurface`)
 
-Both `validatePack()` and `validateVirtualPack()` populate an `ExecutableSurface` summary used by [install/update confirmation gates and trust checks](../concepts/security-and-trust-model.md) whenever a pack introduces or modifies runnable code:
+Both `validatePack()` and `validateVirtualPack()` return an `ExecutableSurface` summary used by [install/update confirmation gates and trust checks](../concepts/security-and-trust-model.md) whenever a pack introduces or modifies runnable code. `validatePack()` inventories applicable fields from pack files and config; virtual-pack synthesis currently populates `skillScripts` from discovered skills, leaving the other executable-surface arrays empty.
 
 | Field | How It Is Inventoried |
 |-------|-----------------------|
@@ -123,7 +123,7 @@ Raw agent repositories often start as plain Markdown collections or `.opencode/`
 
 ### Supported Raw Layouts
 
-1. **Explicit Agent Containers (`scanLooseAgentFiles`)**: Inside `agents/`, `agent/`, `mode/`, or `modes/`—either at the repository root or directly inside `.opencode/` (e.g. `.opencode/agents/`)—every non-test `.md` file (excluding documentation names matching `NON_AGENT_MD_RE` such as `README.md`, `AGENTS.md`, `CLAUDE.md`, `GUIDA.md`, `SKILL.md`) is discovered as an agent. Files under `mode/` or `modes/` without an explicit `mode` field receive `mode: "primary"`.
+1. **Explicit Agent Containers (`scanLooseAgentFiles`)**: Inside `agents/`, `agent/`, `mode/`, or `modes/`—either at the repository root or directly inside `.opencode/` (e.g. `.opencode/agents/`)—every non-test `.md` file (excluding documentation names matching `NON_AGENT_MD_RE` such as `README.md`, `AGENTS.md`, `CLAUDE.md`, `GUIDA.md`, `SKILL.md`) is discovered as an agent. Files under `mode/` or `modes/` with a missing or falsy `mode` value are normalized to `mode: "primary"` during synthesis.
 2. **Loose Markdown Agents (`hasAgentFrontmatter`)**: Outside container directories (walking unignored subdirectories up to `DISCOVERY_DEPTH`, skipping files larger than `MAX_SCANNED_BYTES`), a `.md` file is treated as an agent only if its YAML frontmatter contains at least one recognized OpenCode agent key (`AGENT_FRONTMATTER_KEYS`, including `description`, `mode`, `model`, `permissions`, `permission`, `tools`, `steps`, `max_steps`, `temperature`, `top_p`, `variant`, `reasoningEffort`, `options`, `prompt`, `hidden`, `color`, `disabled`, `request`).
 3. **Optional Commands, Skills, Instructions & Config (`scanVirtualExtras`)**: When at least one agent is found, `scanVirtualExtras()` also collects:
    - `commands/` or `command/` (at root or under `.opencode/`) -> mapped to `commands/<id>.md`.
@@ -135,7 +135,7 @@ Raw agent repositories often start as plain Markdown collections or `.opencode/`
 
 `validateVirtualPack(packRoot, options)` builds a `PackValidation` with `manifest.version = "0.0.0-virtual"` and populates `validation.virtualFiles` (`Record<string, VirtualFileEntry>`), mapping each canonical pack path (`agents/<id>.md`, `commands/<id>.md`, `skills/<id>/...`) to `{ sourceRel, content? }`:
 
-- If a discovered agent uses [legacy V1 frontmatter](./agent-editing-and-v2-compat.md) (`detectFrontmatterVersion(frontmatter) === "v1"`, such as `max_steps` or `permission`) or comes from a `mode/` directory lacking `mode`, `renderAgentFile(frontmatter, body, "v2")` rewrites the file in memory into `VirtualFileEntry.content` (`Buffer`) without modifying the user's source files on disk.
+- If a discovered agent uses [legacy V1 frontmatter](./agent-editing-and-v2-compat.md) (`detectFrontmatterVersion(frontmatter) === "v1"`, such as `max_steps` or `permission`) or comes from a `mode/` directory with a missing or falsy `mode`, `renderAgentFile(frontmatter, body, "v2")` rewrites the file in memory into `VirtualFileEntry.content` (`Buffer`) without modifying the user's source files on disk.
 - Canonical target paths are checked for NFC + lowercase collisions (`case-collision`), and `virtualManifestHash(manifest)` computes a SHA-256 digest of the synthesized manifest for [lockfile tracking](./resolver-and-lock.md).
 
 ## Path Validation & MCP Normalization

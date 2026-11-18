@@ -5,10 +5,13 @@ category: "concepts"
 source_files:
   - "contract/CONTRACT.md"
   - "src/utils/archetypes.ts"
+  - "src/utils/sourceCustomization.ts"
   - "src/utils/userSettings.ts"
+  - "src/ui/PackFlowsModal.tsx"
+  - "src/App.tsx"
   - "runtime/plugins/manage-agents-router/router.js"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-18"
 ---
 
 # Conditional Routing & Archetypes
@@ -21,9 +24,11 @@ Without runtime routing, supporting multiple LLM providers (Anthropic, OpenAI, G
 
 `manage-agents` decouples pack structure from vendor-specific model choices:
 
-1. Pack authors optionally declare an `archetype` alongside `routingDefaults` and `flowDefaults` in [`opencode-pack.json`](../api/pack-contract-reference.md).
+1. Pack authors may declare `archetype.callers` and a reference caller in [`opencode-pack.json`](../api/pack-contract-reference.md); manifest `routingDefaults` and contract `1.1+` `flowDefaults` are optional, but require an `archetype`.
 2. Users layer global or per-target customizations in [`$XDG_CONFIG_HOME/manage-agents/routing.json`](../config/user-and-target-files.md) without modifying pack files (keeping [read-only git sources](../modules/sources-and-github.md) clean).
 3. During [`reconcile`](./pack-lifecycle-and-target-safety.md), `buildRuntimeRouting` ([`src/utils/userSettings.ts`](../modules/routing-and-user-settings.md)) compiles effective rules into `<target>/plugins/manage-agents-router/routing.json` and installs the [`manage-agents-router` V2 plugin](../modules/runtime-router-plugin.md) to enforce them per session.
+
+The TUI flow editor is broader than manifest archetypes: it can configure any workspace pack or virtual `.md` folder with discovered agents. Those edits first live in user routing settings; exporting to a local manifest is a separate action.
 
 ## Callers, Subagents, `"inherit"`, and Pinning
 
@@ -57,6 +62,16 @@ When a pack omits `archetype` in `opencode-pack.json` (or is a [virtual `.md` di
 3. By default, inference requires at least one remaining subagent in the pack; if session-level rules (`then.tools` or `then.permissions`) exist, a single primary caller without subagents is also permitted (`allowSingleCallerWithoutSubagents`).
 
 Each caller set designates one `reference` caller (`$reference` or `archetype.reference`, defaulting to the first caller), which `describePackFlows` (`src/utils/archetypes.ts`) orders first and uses to discover available tools and MCP servers. Every agent in the pack that is neither an active caller nor `mode: "primary"` is treated as a subagent.
+
+The TUI's generic flow view (`describePackFlows`) also supports packs without `archetype` and virtual `.md` folders. It selects callers from the per-target or global user setting, then manifest callers, then inferred callers. For this view, inference chooses all `mode: "primary"` agents if any exist; otherwise all agents not marked `mode: "subagent"`; if that set is empty it falls back to the first discovered agent. The caller picker normally excludes `mode: "subagent"` agents, but offers all discovered agents if there are no other candidates. Its source badge identifies `user`, `manifest`, or `inferred` callers. The view selects the reference from the user `$reference`, manifest reference, or first selected caller (in that order), and displays it first. This UI fallback is distinct from runtime `inferPackCallers`, which can leave the caller set empty when it finds no usable primary/subagent combination.
+
+### Editing Callers and Flows
+
+Press `M` on an agent-bearing pack/category folder to open the flow editor; a manifest `archetype` is not required. The editor combines manifest routes with global and per-target user routes into one row per trigger, while conditional rules remain separate rows tagged `PACK`, `GLOBAL`, or `USER`. It can edit caller sets, OR-combined triggers, subagent models, tools/MCP policies, permissions, and delegations.
+
+TUI edits are written to the current target's `routing.json` scope and reconcile the installed target automatically. Caller edits save `$callers` and `$reference`; resetting removes that user override and returns to the next lower-precedence global, manifest, or inferred defaults. Editing a pack- or global-origin rule creates a target-level user override rather than changing the lower layer. The delete action removes target user rules/routes; when a route also exists in the manifest or global settings, it neutralizes those inherited assignments with `inherit`. Pack rules must be changed in the manifest and global rules unset with `manage-agents models rule-unset --global`. Read-only Git sources use the same user-settings path and do not modify the source.
+
+A single non-wildcard trigger with only model assignments and at least one routable subagent is stored as a route map. Wildcard or multi-trigger flows, policy effects, and policy-only cases are stored as conditional rules. On a local pack with a manifest, **Export to pack** writes the current caller selection and flow view—including visible global and user entries—back to `opencode-pack.json`: plain routes become `routingDefaults`, conditional rules become `flowDefaults`, and contract `1.0` is raised to `1.1` when needed. Export validates the manifest and does not clear `routing.json`. For a folder without a manifest, the TUI offers pack initialization instead; read-only Git sources do not offer manifest export.
 
 ### `"inherit"` vs. Explicit Model References
 
@@ -105,6 +120,8 @@ During [`reconcile`](./pack-lifecycle-and-target-safety.md), [`buildRuntimeRouti
 | `2` | `$XDG_CONFIG_HOME/manage-agents/routing.json` | `targets.<realpath>.<pack>` | Trigger maps (`*`, `provider`, `provider/model`), `$callers`, `$reference`, `$rules` |
 
 Plain trigger maps (`routes`) merge subagent assignments field-by-field from Layer `0` through Layer `2`. When any compiled conditional rule defines `then.models`, `buildRuntimeRouting` also mirrors Layer `1` and Layer `2` plain trigger maps into `compiledRules` at `layer: 1` and `layer: 2`. This guarantees that a user's plain [`models set`](../api/cli-reference.md) configuration in Layer `1` or `2` always overrides a lower-layer `flowDefaults` rule from Layer `0`.
+
+The flow editor reflects this distinction: routes are consolidated by trigger, while `flowDefaults`, global `$rules`, and target `$rules` remain individually visible. Editing a route or rule writes a user-layer setting; the source manifest changes only through **Export to pack**.
 
 ### Trigger Specificity & Tie-Breaking
 

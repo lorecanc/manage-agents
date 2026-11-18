@@ -1,6 +1,6 @@
 ---
 title: "TUI Shell, Catalog Tree & Inspector"
-description: "Main OpenTUI App component, responsive two-panel layout, collapsible agent tree, 6-tab inspector, animations, and toasts"
+description: "OpenTUI workspace shell, responsive top bar and two-panel layout, collapsible agent tree, 6-tab inspector, theme utilities, animations, and toast overlay"
 category: "components"
 source_files:
   - "src/App.tsx"
@@ -8,15 +8,16 @@ source_files:
   - "src/utils/uiConfig.ts"
   - "src/utils/uiTheme.ts"
   - "src/utils/terminalText.ts"
+  - "src/ui/WorkspaceTopbar.tsx"
   - "src/ui/animations.ts"
   - "src/ui/ToastOverlay.tsx"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-18"
 ---
 
 # TUI Shell, Catalog Tree & Inspector
 
-`<App />` (`src/App.tsx`) is the root [OpenTUI](../dependencies/runtime-and-tooling-stack.md) React application for `manage-agents` (see [System Architecture](../architecture.md)). It hosts the top workspace switcher, contextual footer bar, modal state machine, collapsible *pack* (see [Glossary](../glossary.md)) and agent catalog tree, 6-tab agent inspector, deterministic viewport layout calculations, hardened UI persistence, timeline-driven micro-animations, and non-blocking toast notifications.
+`<App />` (`src/App.tsx`) is the root [OpenTUI](../dependencies/runtime-and-tooling-stack.md) React application for `manage-agents` (see [System Architecture](../architecture.md)). It coordinates the extracted `WorkspaceTopbar`, the contextual footer bar, modal state machine, collapsible *pack* (see [Glossary](../glossary.md)) and agent catalog tree, 6-tab agent inspector, deterministic viewport calculations, hardened UI persistence, timeline-driven animations, and the floating `ToastOverlay`.
 
 ## Purpose & Component Architecture
 
@@ -24,7 +25,7 @@ The shell coordinates three primary top-level workspaces (`catalog`, plus `flows
 
 ```mermaid
 graph TD
-    App["App (src/App.tsx)"] --> Header["Top Workspace Header"]
+    App["App (src/App.tsx)"] --> Header["WorkspaceTopbar (src/ui/WorkspaceTopbar.tsx)"]
     App --> Toast["ToastOverlay (src/ui/ToastOverlay.tsx)"]
     App --> Catalog["Catalog Tree + 6-Tab Inspector"]
     App --> Flows["FlowsWorkspace"]
@@ -32,6 +33,9 @@ graph TD
     App --> Modals["Overlay Modals (ViewMode != 'main')"]
     Catalog --> Layout["Layout & Viewport Math (src/utils/layout.ts)"]
     Catalog --> Theme["Theme & Safe Text (uiTheme.ts / terminalText.ts)"]
+    Header --> Theme
+    Toast --> Theme
+    Toast --> Anim
     App --> UiConfig["UI Persistence (src/utils/uiConfig.ts)"]
     App --> Anim["Timeline Hooks (src/ui/animations.ts)"]
 ```
@@ -52,6 +56,25 @@ graph TD
 | `uiConfigRevision` | `string` | no | SHA-256 revision token of `ui.json` (`"missing"` when absent) used for optimistic concurrency on save. |
 | `initialModelCatalog` | `ModelCatalog` | no | Pre-loaded verified OpenCode model catalog; if omitted, `<App />` loads it on mount via `loadModelCatalog(true)`. |
 
+### `WorkspaceTopbarProps` (`src/ui/WorkspaceTopbar.tsx`)
+
+| Prop | Type | Required | Description |
+|------|------|----------|-------------|
+| `activeTab` | `WorkspaceTab` | yes | Currently selected `catalog`, `flows`, or `sources` workspace. |
+| `termWidth` | `number` | yes | Terminal width used to choose labels and fit status items. |
+| `dimmed` | `boolean` | yes | Selects dimmed surface colors while an overlay modal is active. |
+| `spinner` | `string` | yes | Optional activity glyph supplied by the shell animation hook. |
+| `workspaceLabel` | `string` | yes | Active workspace/source label, shortened to its available cell budget. |
+| `hasActiveSource` | `boolean` | yes | Chooses the connected-source status color. |
+| `commitLabel` | `string` | yes | Full or compact commit/override label selected by `App`. |
+| `isReadOnlyGitSource` | `boolean` | yes | Controls Git override styling and the onboarding action label. |
+| `autoCommitOn` | `boolean` | yes | Controls local commit status coloring. |
+| `isWorkspaceVirtualPack` | `boolean` | yes | Enables the onboarding action when the available width permits it. |
+| `onSelectTab` | `(tab: WorkspaceTab) => void` | yes | Handles workspace-tab selection. |
+| `onOpenSources` | `() => void` | yes | Opens the Sources workspace from the status label. |
+| `onOpenOnboarding` | `() => void` | yes | Opens pack onboarding from its status pill. |
+| `onOpenPalette` | `() => void` | yes | Opens the command palette from its status pill. |
+
 ### `ToastOverlayProps` (`src/ui/ToastOverlay.tsx`)
 
 | Prop | Type | Required | Description |
@@ -68,15 +91,16 @@ graph TD
 
 ### Top Workspace Switcher & Header Chrome
 
-The 3-row rounded top bar (`src/App.tsx:4345-4470`) adapts its labels to terminal width:
+`App` renders the extracted 3-row, browser-style `WorkspaceTopbar` (`src/ui/WorkspaceTopbar.tsx`) above the active workspace. It receives the selected tab, source/mutation status, spinner, and callbacks from `App`; the component handles cell-width measurement, visual layout, and click targets:
 
-- **Workspace tabs**: Renders three clickable pill tabs—`1 Catalog` (`"catalog"`), and `2 Flows & Graph` (`"flows"`) plus `3 Sources & Target` (`"sources"`) (detailed in [Flows & Data Sources Workspaces](./workspaces-flows-and-sources.md)) when `termWidth >= 136`, or compact `Catalog`, `Flows`, and `Sources` below 136 columns. If neither `workspaceRoot` nor `initialSource` is provided on startup, the shell opens directly on `"sources"`; otherwise it starts on `"catalog"`.
+- **Responsive tabs and brand**: `getTopbarTabs(termWidth)` keeps `Catalog` fixed and uses `Flows & Graph` / `Sources & Target` at `termWidth >= 118`, otherwise `Flows` / `Sources`. The active workspace is drawn as a raised browser-style tab; all tab areas are clickable. The brand includes `manage-agents` at 96 columns or wider and contracts to `◆` below that; the `⇥ Tab` hint appears from 104 columns. The three top-level workspaces are described in [Flows & Data Sources Workspaces](./workspaces-flows-and-sources.md). If neither `workspaceRoot` nor `initialSource` is provided, `App` starts on `sources`; otherwise it starts on `catalog`.
+- **Space-aware status area**: The right side displays the async spinner, a cell-truncated active source label (`Workspace: <path>`, `Source: <name> (<path>)`, or `GitHub: <owner/repo>#<ref>@<sha7>`; with no source, `Source: none ([O] connect)`), commit/override state, and optionally the virtual-pack onboarding and `⌘K` palette pills. Connected-source labels use the active-source color; missing-source labels use the warning color. The component shows the commit segment when at least 36 cells remain, the onboarding pill when at least 42 remain, and the palette pill when at least 10 remain; it shows the source label only when its computed budget is at least 10 cells. `App` chooses the full `Mode: OVERRIDES` / `Commit: ON|OFF` label at `termWidth >= 124`, otherwise the compact `OVR` / `C:ON|OFF` form. Clicking the source label opens Sources; the onboarding and palette pills invoke their supplied callbacks.
 - **Keyboard workspace switching**:
   - `Tab` / `Shift+Tab` cycles across `catalog` ↔ `flows` ↔ `sources` when `viewMode === "main"`.
   - `O` jumps directly to the `sources` workspace from `catalog` or `flows`.
   - `Esc` inside `flows` (or inside `sources` when `sourcesQuery` is empty and an `activeDataSource` is connected) returns to `catalog`.
-  - `Ctrl+K` / `Ctrl+P` (or clicking the `⌘K` header pill) opens the [Command Palette (`CommandPaletteModal`)](./navigation-help-and-markdown.md), exposing `ws-catalog`, `ws-flows`, `ws-sources`, all agent/pack commands, and `jump:<agentPath>` quick-jump entries.
-- **Status indicators**: Displays an async activity spinner (`pulse.spinner`), the active source label (`Workspace: <path>`, `Source: <name> (<path>)`, or `GitHub: <owner/repo>#<ref>@<sha7>`), the mutation mode segment (`termWidth >= 112`: `Mode: OVERRIDES` / `OVR` for Git sources, or `Commit: ON|OFF` / `C:ON|OFF` for local workspaces), a `[I] Onboard Pack` / `[I] Clone & Onboard` pill on virtual packs (`termWidth >= 88`), and `⌘K`.
+  - `Ctrl+K` / `Ctrl+P` (or clicking the `⌘K` pill when it fits) opens the [Command Palette (`CommandPaletteModal`)](./navigation-help-and-markdown.md), exposing `ws-catalog`, `ws-flows`, `ws-sources`, all agent/pack commands, and `jump:<agentPath>` quick-jump entries.
+- **Tab selection behavior**: `App` clears modal/search state when a tab is selected and refreshes source status when entering `sources`. `Tab`/`Shift+Tab` also cycles workspaces when the main screen owns keyboard input.
 
 ### Local Workspace vs. Registered Local/Git Sources
 
@@ -143,11 +167,11 @@ The horizontal split ratio `listShare` is bounded to `[0.60, 0.75]` (`DEFAULT_UI
 
 ### Semantic Color Palette & Visual Helpers (`src/utils/uiTheme.ts`)
 
-`THEME` defines the dark-mode hex palette used across all panels and modals:
-- **Surfaces**: `bgBase` (`#0f1117`), `bgBaseDimmed` (`#080a0e` behind modals), `bgPanel` (`#161922`), `bgPanelDimmed` (`#10131a`), `bgElevated` (`#1c202c`), `bgInput` (`#12151d`), `bgRowFocus` (`#1f324a`), `bgRowSelected` (`#172b24`), `bgRowFlash` (`#1e4631`), `bgPill` (`#232a3b`), `bgPillActive` (`#2b4263`), and soft semantic fills (`bgDangerSoft`, `bgWarnSoft`, `bgSuccessSoft`).
-- **Borders & Foregrounds**: `borderSubtle` (`#252b38`), `borderIdle` (`#2d3546`), `borderFocus` (`#58a6ff`), `borderInspectorFocus` (`#a371f7`), `fgPrimary` (`#e6edf3`), `fgSecondary` (`#9aa4b2`), `fgMuted` (`#636e7b`).
-- **Accents**: `accentBlue` (`#58a6ff`), `accentCyan` (`#39c5cf`), `accentPurple` (`#bc8cff`), `accentGreen` (`#3fb950`), `accentAmber` (`#e3b341`), `accentRed` (`#ff7b72`), `accentPink` (`#f778ba`).
-- **Utilities**: `sanitizeHexColor` validates `#RGB` / `#RRGGBB` strings so untrusted agent frontmatter cannot inject malformed style sequences; `lerpColor` interpolates RGB channels for animated borders and row flashes; `fractionalBar` renders sub-cell progress bars using Unicode eighth-blocks (`▏▎▍▌▋▊▉█`); `gaugeBar` renders `━━━●────` knob gauges; `buildPreviewUnifiedDiff` formats unified diffs for OpenTUI's `<diff>` component.
+`uiTheme.ts` centralizes the dark UI palette and presentation helpers used by `App`, `WorkspaceTopbar`, and `ToastOverlay`:
+- **Surfaces**: `bgBase` (`#0f1117`), `bgBaseDimmed` (`#080a0e`), `bgPanel` (`#161922`), `bgPanelDimmed` (`#10131a`), `bgElevated` (`#1c202c`), `bgInput` (`#12151d`), `bgRowHover` (`#1b2130`), `bgRowFocus` (`#1f324a`), `bgRowSelected` (`#172b24`), `bgRowFlash` (`#1e4631`), `bgPill` (`#232a3b`), `bgPillActive` (`#2b4263`), `bgDangerSoft` (`#3a181c`), `bgWarnSoft` (`#362a14`), and `bgSuccessSoft` (`#163323`).
+- **Borders, foregrounds, and accents**: `borderSubtle` (`#252b38`), `borderIdle` (`#2d3546`), `borderFocus` (`#58a6ff`), `borderInspectorFocus` (`#a371f7`), `borderModal` (`#79c0ff`), `borderSuccess` (`#3fb950`), `borderWarn` (`#d29922`), and `borderDanger` (`#f85149`). Foregrounds are `fgPrimary` (`#e6edf3`), `fgSecondary` (`#9aa4b2`), and `fgMuted` (`#636e7b`); accents are blue `#58a6ff`, cyan `#39c5cf`, purple `#bc8cff`, green `#3fb950`, amber `#e3b341`, red `#ff7b72`, and pink `#f778ba`.
+- **Color and display helpers**: `sanitizeHexColor` accepts only `#RGB` / `#RRGGBB`; `lerpColor` interpolates RGB channels for animated borders and row flashes; `fractionalBar` renders Unicode eighth-block progress; `gaugeBar` renders bounded knob gauges; `buildPreviewUnifiedDiff` formats sanitized text for OpenTUI's `<diff>` component; `terminalSafeMarkdown` sanitizes multiline previews.
+- **Shared status styling**: `SPINNER_FRAMES` supplies the activity glyph sequence. `classifyToastTone` and `toastAppearance` map toast messages to success, warning, error, or info presentation using the same semantic palette as the rest of the shell.
 
 ### Display Sanitization & Grapheme Truncation (`src/utils/terminalText.ts`)
 
@@ -274,7 +298,7 @@ Micro-animations are built on [`@opentui/react`](../dependencies/runtime-and-too
 
 ### Non-Blocking `ToastOverlay` (`src/ui/ToastOverlay.tsx`)
 
-`ToastOverlay` renders transient feedback in an absolute floating box (`position="absolute"`, `right={2}`, `top={4}`, `height={4}`, `zIndex={60}`) so notifications never consume vertical rows or cause layout reflow in the workspace below:
+`App` owns `toastMessage` and the monotonic `toastId`; its `pushToast` sanitizes and trims each message, then increments the id so a repeated message restarts its countdown. The extracted `ToastOverlay` receives that state, terminal width, reduced-motion preference, and a dismissal callback. It renders transient feedback in an absolute floating box (`position="absolute"`, `right={2}`, `top={4}`, `height={4}`, `zIndex={60}`), so notifications never consume vertical rows or cause layout reflow in the workspace below:
 
 - **Tone Classification (`classifyToastTone` & `toastAppearance`)**: Inspects message prefixes and keywords to assign one of four semantic tones and auto-dismiss durations:
   - `"error"` (`✗`, `borderDanger` / `bgDangerSoft`): `5500ms` (matches `✗`, `❌`, `error`, `failed`).

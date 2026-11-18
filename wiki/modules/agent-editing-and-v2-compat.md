@@ -8,7 +8,7 @@ source_files:
   - "src/utils/models.ts"
   - "src/utils/repositoryTransaction.ts"
 created: "2026-11-13"
-last_updated: "2026-11-13"
+last_updated: "2026-11-18"
 ---
 
 # Agent Editing, V2 Compatibility & Git Transactions
@@ -52,8 +52,8 @@ graph LR
 `findAgentFiles(workspaceRoot, sourceDir?, options?)` locates agent `.md` files without ever following symbolic links:
 
 1. **Source root resolution**: When `sourceDir` is omitted, `resolveSourceSubdir(workspaceRoot)` returns `"."` if [`opencode-pack.json`](../api/pack-contract-reference.md) exists at the workspace root, `"packs"` if a `packs/` directory exists, or `"."` otherwise. Both `isWorkspaceRelativePath` and `isPathInsideWorkspace` guard against directory traversal.
-2. **Symlink-safe walk**: Recursively traverses directories while skipping `IGNORED_DIRS` (`node_modules`, `.git`, `.opencode`, `agent-manager`, `backups`, `dist`, `build`). Every entry is inspected with `fs.lstatSync`; [symbolic links are never traversed or read](../concepts/security-and-trust-model.md) and are appended to `(agents as AgentList).warnings`.
-3. **V1 and V2 container directories**: Any non-root directory named `agents`, `agent`, `mode`, or `modes` activates Markdown discovery for its subtree. Agents found under `mode/` or `modes/` default to `frontmatter.mode = "primary"` when `mode` is not explicitly set. If the workspace is a [virtual pack root](./pack-validation-and-virtual-packs.md) (`isVirtualPackRoot`), `scanLooseAgentFiles()` supplements the walk with loose agent definitions.
+2. **Symlink-safe walk**: Recursively traverses directories while skipping `IGNORED_DIRS` (`node_modules`, `.git`, `.opencode`, `agent-manager`, `backups`, `dist`, `build`). Every entry is inspected with `fs.lstatSync`; [symbolic links are never traversed or read](../concepts/security-and-trust-model.md). Links found inside an active agent container, and links reported by the virtual-pack loose-agent scan, are included in `(agents as AgentList).warnings`.
+3. **V1 and V2 container directories**: Any non-root directory named `agents`, `agent`, `mode`, or `modes` activates Markdown discovery for its subtree. Agents found under `mode/` or `modes/` default to `frontmatter.mode = "primary"` when `mode` is absent or otherwise falsy. If the workspace is a [virtual pack root](./pack-validation-and-virtual-packs.md) (`isVirtualPackRoot`), `scanLooseAgentFiles()` supplements the walk with loose agent definitions.
 4. **Category assignment**: Each `AgentInfo.category` resolves to the enclosing pack name via `packNameOf(filePath, workspaceRoot)` (nearest `opencode-pack.json`), falling back to `computeCategories(filenames)`, which picks the longest hyphen-delimited prefix shared by two or more agent filenames (or `"general"`).
 
 ### Frontmatter Parsing & Delegation Graph Extraction
@@ -77,8 +77,8 @@ All writes go through `saveAgentFile()` → `renderAgentFile()` → `atomicWrite
 - **V2 write boundary**: `renderAgentFile()` always translates the in-memory frontmatter through `translateFrontmatterV1ToV2()`, trims the serialized YAML, and strips leading blank lines from the prompt body via `normalizeAgentBody()`.
 - **Atomic replacement**: `atomicWriteAgentFile()` checks `fs.lstatSync(filePath, { throwIfNoEntry: false })` and refuses to replace symlinks or non-regular files, preserves existing permission bits (`target.mode & 0o7777`, defaulting to `0o666`), creates an exclusive sibling temporary file `.${basename}.${process.pid}.${randomBytes(8).toString("hex")}.tmp` with `fs.openSync(tempPath, "wx", mode)` (retrying up to 8 times on `EEXIST`), writes the full buffer, enforces permissions via `fs.fchmodSync`, closes the descriptor, and [atomically swaps the file into place](../concepts/pack-lifecycle-and-target-safety.md) with `fs.renameSync(tempPath, filePath)`.
 - **Compare-and-swap (CAS) & batch rollback**:
-  - `updateAgentResources()` re-reads the file before writing and aborts if `originalAgent.toString("utf8") !== agent.rawContent`, skipping disk I/O entirely when the rendered bytes are identical.
-  - Multi-agent model operations (`updateAgentsModel()` and `repairAgentModels()`) pre-validate every target file's raw bytes (`bytes.equals(Buffer.from(agent.rawContent, "utf8"))`) and parsed on-disk `frontmatter.model` before touching any file. During execution they record original bytes, file modes, in-memory `structuredClone(agent.frontmatter)` snapshots, and the exact expected post-write `{ bytes, mode }`. If a write fails mid-batch, already-written files are rolled back in reverse order—verifying first that on-disk bytes and mode still match the manager's write (`rollback conflict: file changed after manager write` if an external process modified the file concurrently)—and in-memory `AgentInfo` objects are restored.
+  - With its default writer, `updateAgentResources()` re-reads the file before writing and aborts if `originalAgent.toString("utf8") !== agent.rawContent`, skipping disk I/O entirely when the rendered bytes are identical. An injected writer bypasses this on-disk CAS check.
+  - Multi-agent model operations (`updateAgentsModel()` and `repairAgentModels()`) pre-validate every target file's raw bytes against `agent.rawContent` and parsed on-disk `frontmatter.model` before touching any file. During execution they record original bytes, file modes, in-memory `structuredClone(agent.frontmatter)` snapshots, and the exact expected post-write `{ bytes, mode }`. If a write fails mid-batch, already-written files are rolled back in reverse order—verifying first that on-disk bytes and mode still match the manager's write (`rollback conflict: file changed after manager write` if an external process modified the file concurrently)—and in-memory `AgentInfo` objects are restored.
 
 ---
 
@@ -97,7 +97,7 @@ All writes go through `saveAgentFile()` → `renderAgentFile()` → `atomicWrite
 | System prompt override | `prompt: "..."` | `system: "..."` | Mapped in both directions |
 | Model variant | `model: provider/id` + `variant: high` | `model: provider/id#high` | `composeModelVariant()` prevents duplicate `#` suffixes |
 | Sampling parameters | `temperature`, `top_p`, `top_k` | *(removed)* | Stripped from top-level and `request.body` in both directions; empty `request` wrappers are pruned |
-| Tool/resource access | `permission: { ... }` & `tools: { ... }` | `permissions: [{ action, resource, effect }]` | Existing V2 `permissions` takes precedence if both exist |
+| Tool/resource access | `permission: { ... }` & `tools: { ... }` | `permissions: [{ action, resource, effect }]` | Boolean or `allow`/`ask`/`deny` `tools` entries are merged first, then `permission` values override them; existing V2 `permissions` takes precedence if present |
 | Command delegation | `subtask: true` | `subagent: true` | Handled by `translateCommandFrontmatterV1ToV2` / `V2ToV1` |
 | [`opencode.json`](../config/user-and-target-files.md) top-level | `agent`, `mode`, `command`, `subtask`, flat `mcp.<s_id>` (`enabled`) | `agents` (`mode: "primary"`), `commands`, `subagent`, `mcp.servers.<s_id>` (`disabled`) | Handled by `translateConfigV1ToV2` / `V2ToV1`; preserves `mcp.timeout` and explicit `codemode` |
 
@@ -141,7 +141,7 @@ const v1 = {
 // }
 ```
 
-When editing resource permissions via `discoverAgentResources()` and `updateAgentResources()`, tool modules under `tools/<namespace>/<prefix>_<member>.ts` are grouped under `<prefix>_*` family keys, and `updateAgentResources()` reorders `<prefix>_*` ahead of specific `<prefix>_<member>` entries so member overrides win under last-match-wins evaluation.
+When editing resource permissions via `discoverAgentResources()` and `updateAgentResources()`, tool modules under `tools/<namespace>/<prefix>_<member>.ts` are grouped under `<prefix>_*` family keys (the prefix is the part before the first underscore), and `updateAgentResources()` reorders `<prefix>_*` ahead of specific `<prefix>_<member>` entries so member overrides win under last-match-wins evaluation.
 
 ---
 
@@ -164,10 +164,10 @@ Workspace agents follow the pattern:
 
 `renameAgent(workspaceRoot, oldPath, newFilename, agents)` renames an agent file and updates cross-agent references in two phases:
 
-1. **Path sanitization & pre-computation**: Ensures `.md` extension, validates the filename with `sanitizeFilename()` (`/^[a-zA-Z0-9._-]+$/`, no leading `.`, `..`, NUL, or path separators), confirms the destination remains inside `path.dirname(oldPath)` and does not overwrite another file, and scans every discovered agent file in memory:
+1. **Path sanitization & pre-computation**: Ensures `.md` extension, validates the filename with `sanitizeFilename()` (`/^[a-zA-Z0-9._-]+$/`, no leading `.`, `..`, NUL, or path separators), confirms the destination remains inside `path.dirname(oldPath)` and does not overwrite another file, and scans the supplied agent list by reading each existing file before preparing reference updates:
    - Replaces `frontmatter.permission.task[oldNameNoExt]` with `taskPerm[newNameNoExt]`.
    - Rewrites `@<oldName>` subagent invocations in the Markdown body using `new RegExp("@" + escapeRegExp(oldNameNoExt) + "(?![A-Za-z0-9_-])", "g")` so longer agent names sharing a prefix are untouched.
-2. **Filesystem commit**: Performs `fs.renameSync(oldPath, newPath)` first, then flushes every modified agent file via `saveAgentFile()`, preserving V2 formatting and global wildcard ordering.
+2. **Filesystem commit**: Performs `fs.renameSync(oldPath, newPath)` first, then flushes every modified agent file via `saveAgentFile()`, emitting V2 frontmatter and applying the translator's top-level global-rule ordering. If a reference write fails, the rename remains in place and the function reports that reference updates were only partially flushed so the referencing files can be restored from version control.
 
 ### Security Risk Auditing & Safety Presets
 
@@ -195,8 +195,8 @@ Workspace agents follow the pattern:
 
 `inspectTuningTargets()`, `buildTuningUpdateParams()`, [`parseTuneCliArgs()`](../api/cli-reference.md), `updateAgentParams()`, and `updateAgentsColor()` [manage agent execution settings](../components/authoring-and-bridge-modals.md) across single agents, packs, or the entire workspace:
 
-- **`steps`**: Resolved via `resolveAgentSteps()` (`steps ?? max_steps`, defaulting to `50`). Validated against `/^[1-9]\d*$/` and `Number.isSafeInteger`.
-- **`variant`** (`--variant` / `--effort`, cleared with `--clear-variant` / `--clear-effort`): Normalized to lowercase (`[a-z0-9._-]+`) via `normalizeAgentVariant()` and checked against model-specific `allowedVariants` when available or `KNOWN_MODEL_VARIANTS` (`"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`, `"thinking"`). On write, `composeModelVariant()` folds `variant` into `model#variant` (or strips `#variant` when cleared).
+- **`steps`**: Resolved via `resolveAgentSteps()` (`steps ?? max_steps`, defaulting to `50`; numeric strings are accepted for display). Updates change existing `steps` and/or `max_steps` fields, or create `steps` if neither exists. CLI/UI input is validated as a positive safe integer.
+- **`variant`** (`--variant` / `--effort`, cleared with `--clear-variant` / `--clear-effort`): Normalized to lowercase (`[a-z0-9._-]+`) via `normalizeAgentVariant()` and checked against supplied `allowedVariants` or `KNOWN_MODEL_VARIANTS` (`"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`, `"thinking"`). `resolveAllowedTuneVariants()` only derives model-specific choices from a verified catalog: it adds variants shared by all explicitly selected models, or all catalog variants when no explicit model is selected, to the known set. On write, `composeModelVariant()` folds `variant` into `model#variant` (or removes the suffix when cleared).
 - **`mode`**: Validated against `AGENT_TUNING_MODES` (`"subagent"`, `"primary"`, `"all"`, defaulting to `"subagent"`).
 - **`hidden`**: Boolean toggle (`--hidden` / `--no-hidden`).
 - **`color`**: Batch-applied via `updateAgentsColor(agents, color)`.
@@ -208,7 +208,7 @@ Workspace agents follow the pattern:
 
 1. **Fallback command chain**: Executes `opencode models --verbose` first to capture per-model metadata, falling back to `opencode models` if verbose output fails or returns no models. If both fail, returns `{ status: "unavailable", models: [], error }`.
 2. **Verbose JSON block parser (`parseVerboseModelCatalogOutput`)**: Scans lines matching `MODEL_LINE_PATTERN = /^[^/\s]+\/[^\s]+$/` and tracks brace depth (`{` / `}`) outside quoted/escaped strings to parse each model's trailing JSON block. Non-empty keys under `parsed.variants` are recorded in `variants[currentModel]`. Malformed JSON blocks are ignored without aborting catalog loading. `getModelVariants(catalog, model)` strips any `#variant` suffix before looking up supported variants.
-3. **Inherited vs. invalid model detection**: `hasExplicitModel()` checks own-property `"model"` on `frontmatter`. Missing `model` displays as `"Inherited"` via `modelDisplayValue()`, whereas explicit `null`, `false`, `""`, or unverified strings are grouped as repair candidates by `collectInvalidModelGroups(agents, catalog)`.
+3. **Inherited vs. invalid model detection**: `hasExplicitModel()` checks own-property `"model"` on `frontmatter`. Missing `model` displays as `"Inherited"` via `modelDisplayValue()`, whereas explicit `null`, `false`, `""`, other non-string values, or unverified strings are grouped as repair candidates by `collectInvalidModelGroups(agents, catalog)` only when the catalog is verified.
 4. **Fuzzy typo suggestions (`suggestModels`)**: Splits `provider/model` on the first `/`, tokenizes model IDs on `/[^a-z0-9]+/`, and computes token overlap similarity:
 
 ```ts
@@ -220,6 +220,8 @@ function similarity(a: string, b: string): number {
 ```
 
 Candidates are ranked by `sameProvider * 2 + similarity`, filtered to `similarity >= 0.4`, and capped at `limit` (default `3`) verbatim catalog entries.
+
+`updateAgentsModel()` accepts only a replacement present in the verified model list and checks each file's current bytes and parsed model before the batch begins. `repairAgentModels()` similarly validates replacement models and unique target paths, then confirms each target still has its expected old model and raw content. Both batch operations snapshot and roll back their file and in-memory state if a write fails; rollback refuses to overwrite a file whose content or mode changed after the manager's write.
 
 ---
 
@@ -234,13 +236,13 @@ Candidates are ranked by `sameProvider * 2 + similarity`, filtered to `similarit
 
 ### Transaction Lifecycle
 
-1. **Path planning & symlink rejection (`planPaths`)**: Validates `localPaths` and optional `externalPaths` before running `mutation()`, even when auto-commit is `"off"`. Relative `localPaths` containing `..`, paths escaping `workspacePath`, overlapping local/external paths, or any path traversing a symbolic link component (`assertNoSymlinkComponents`) throw `RepositoryTransactionError`. If `!autoCommitEnabled()`, `mutation()` runs immediately and returns `{ value, commit: "off" }`.
+1. **Path planning & symlink rejection (`planPaths`)**: Validates `localPaths` and optional `externalPaths` before running `mutation()`, even when auto-commit is `"off"`. Relative local paths containing `..`, local paths escaping `workspacePath`, a path declared as both local and external, or any path traversing a symbolic-link component (`assertNoSymlinkComponents`) throw `RepositoryTransactionError`. External paths may be outside the workspace but are also checked for symlink components. If `!autoCommitEnabled()`, `mutation()` runs immediately and returns `{ value, commit: "off" }`.
 2. **Lock acquisition & pre-flight checks**:
    - Resolves `git rev-parse --show-toplevel` (`fs.realpathSync`) and `--git-common-dir`, then acquires `<commonDir>/agent-manager.lock` via `fs.openSync(managerLock, "wx", 0o600)` and records its `{ dev, ino }` identity.
    - Verifies no in-progress Git state markers exist (`MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `rebase-merge`, `rebase-apply`).
    - Requires a completely clean worktree and index (`git status --porcelain=v1 -z --untracked-files=all` with `GIT_OPTIONAL_LOCKS=0` returns zero entries; note that Git's own `.git/index.lock` causes `git status` or `commit` to fail safely without blocking the mutation).
    - Verifies an attached, valid branch (`git rev-parse --verify HEAD` and `git symbolic-ref --quiet HEAD`) and a configured author identity (`git var GIT_AUTHOR_IDENT`).
-   - **Non-blocking fallback**: If `agent-manager.lock` is already held (`EEXIST`) or any pre-flight check fails, Git never blocks the workspace edit—`mutation()` still executes, the lock (if owned) is released, and the result returns `commit: "skipped"` with a `TransactionWarning` (`"checkpoint-locked"`, `"preflight-lock"`, `"unsupported-repository-state"`, `"dirty-repository"`, or `"git-unavailable"`).
+    - **Non-blocking fallback**: If `agent-manager.lock` is already held (`EEXIST`) or any pre-flight check fails, Git never blocks the workspace edit—`mutation()` still executes and the result returns `commit: "skipped"` with a `TransactionWarning` (`"checkpoint-locked"`, `"preflight-lock"`, `"unsupported-repository-state"`, `"dirty-repository"`, or `"git-unavailable"`). When this invocation acquired the lock before a later pre-flight failure, it keeps that lock through the fallback mutation and releases it afterward.
 3. **Mutation execution**: Runs `mutation()`. If `mutation()` throws, `agent-manager.lock` is released immediately and the error propagates (leaving file-level rollback to the mutator's own CAS restore logic).
 4. **Scope verification & double blob fingerprinting**:
    - Inspects post-mutation `git status --porcelain=v1 -z --untracked-files=all` (including both sides of `R`/`C` entries). If any dirty path lies outside planned `localPaths`, commit is aborted with `commit: "failed"` (`code: "unexpected-path"`), preserving the user's disk edit. If no files changed, returns `commit: "skipped"`.
