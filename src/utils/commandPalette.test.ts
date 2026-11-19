@@ -74,3 +74,11 @@ test("buildContextualShortcuts adapts actions to workspace tab and focused item 
   assert.ok(sourcesShortcuts.some(chip => chip.actionId === "target-reconcile"))
   assert.ok(sourcesShortcuts.some(chip => chip.actionId === "pane-toggle" && chip.key === "⇧←" && chip.label === "Main"))
 })
+
+test("sources shortcuts include source-remove", () => {
+  const sourcesShortcuts = buildContextualShortcuts({
+    workspaceTab: "sources",
+    selectedCount: 0,
+  })
+  assert.ok(sourcesShortcuts.some(chip => chip.key === "X" && chip.label === "Remove" && chip.actionId === "source-remove"))
+})

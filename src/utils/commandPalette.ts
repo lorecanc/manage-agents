@@ -96,6 +96,7 @@ export function buildContextualShortcuts(ctx: ShortcutContext): ShortcutChip[] {
       { key: "R", label: "Reconcile Target", actionId: "target-reconcile" },
       { key: "Shift+U", label: "Engine Update", actionId: "engine-self-update" },
       { key: "G", label: "GitHub Auth", actionId: "source-gh-auth" },
+      { key: "X", label: "Remove", actionId: "source-remove" },
     ]
     if (paneChip) chips.push(paneChip)
     chips.push({ key: "Ctrl+K", label: "Palette", actionId: "palette", accent: true })

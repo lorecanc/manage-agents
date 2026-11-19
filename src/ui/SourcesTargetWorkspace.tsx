@@ -1,15 +1,12 @@
 import React from "react"
-import type { GhAuthStatus, GhRepoSummary } from "../utils/github.js"
+import type { GhAuthStatus } from "../utils/github.js"
 import type { TargetStatus } from "../utils/installer.js"
 import { parsePackRequest } from "../utils/resolver.js"
-import type { Source } from "../utils/sources.js"
+import type { SourceWorkspaceRow } from "../utils/sourceRows.js"
 import { displayWidth, middleEllipsis, terminalSafeText } from "../utils/terminalText.js"
 import { lerpColor, THEME } from "../utils/uiTheme.js"
 
-export type SourceWorkspaceRow =
-  | { id: string; kind: "connect-input"; spec: string }
-  | { id: string; kind: "registered"; source: Source; revision: string | null; isActive: boolean }
-  | { id: string; kind: "gh-repo"; repo: GhRepoSummary }
+export type { SourceWorkspaceRow }
 
 export function calculateTargetInstalledPackRows(
   termHeight: number,
@@ -55,6 +52,8 @@ export interface SourcesTargetWorkspaceProps {
   onRefreshTarget: () => void
   engineVersionLabel?: string
   onOpenSelfUpdate?: () => void
+  inputMode?: "filter" | "spec"
+  inputValidation?: { ok: boolean; message: string } | null
 }
 
 export function SourcesTargetWorkspace({
@@ -88,6 +87,8 @@ export function SourcesTargetWorkspace({
   onRefreshTarget,
   engineVersionLabel,
   onOpenSelfUpdate,
+  inputMode,
+  inputValidation,
 }: SourcesTargetWorkspaceProps) {
   const leftInner = Math.max(18, leftWidth - 4)
   const rightInner = Math.max(20, rightWidth - 4)
@@ -126,6 +127,22 @@ export function SourcesTargetWorkspace({
   const rightTitle = isInspectorFocused
     ? " ● 🎯 OpenCode Target Status "
     : " 🎯 OpenCode Target Status · ⇧→ "
+
+  const safeQuery = terminalSafeText(query)
+  const inputLine = inputMode === "spec"
+    ? query.trim()
+      ? `➕ Connect & activate "${safeQuery}" · Enter to attach`
+      : "📁 Press Enter to browse local paths and connect a source"
+    : inputMode === "filter"
+      ? `🔍 ${query ? safeQuery : "Type to filter sources"}`
+      : query
+        ? `❯ ${safeQuery}${inputFocused ? "▋" : ""}`
+        : inputFocused
+          ? "❯ owner/repo, https://...git, or local path▋"
+          : "🔍 Click or press [/] to filter or connect owner/repo..."
+
+  const focusedRow = rows[focusedIndex]
+  const sidebarHint = showInspector ? " · [⇧→] Sidebar" : ""
 
   return (
     <box width="100%" minHeight={0} flexGrow={1} flexDirection="row" marginTop={1} overflow="hidden">
@@ -204,16 +221,19 @@ export function SourcesTargetWorkspace({
             }}
           >
             <text wrapMode="none" overflow="hidden" style={{ textColor: query ? THEME.fgPrimary : THEME.fgSecondary }}>
-              {middleEllipsis(
-                query
-                  ? `❯ ${terminalSafeText(query)}${inputFocused ? "▋" : ""}`
-                  : inputFocused
-                    ? "❯ owner/repo, https://...git, or local path▋"
-                    : "🔍 Click or press [/] to filter or connect owner/repo...",
-                leftInner - 2,
-              )}
+              {middleEllipsis(inputLine, leftInner - 2)}
             </text>
           </box>
+
+          {inputValidation && query.trim() && (
+            <text
+              wrapMode="none"
+              overflow="hidden"
+              style={{ textColor: inputValidation.ok ? THEME.accentGreen : THEME.accentAmber }}
+            >
+              {middleEllipsis(`${inputValidation.ok ? "✓" : "⚠"} ${terminalSafeText(inputValidation.message)}`, leftInner)}
+            </text>
+          )}
 
           {sourcesStatus && (
             <text wrapMode="none" overflow="hidden" style={{ textColor: THEME.accentAmber }} marginTop={1}>
@@ -331,7 +351,11 @@ export function SourcesTargetWorkspace({
         >
           <text wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgSecondary }}>
             {middleEllipsis(
-              `[Enter] Activate · [T] Trust · [X] Remove${showInspector ? " · [⇧→] Sidebar" : ""}`,
+              `${focusedRow?.kind === "connect-input"
+                ? "[Enter] Connect · [↑↓] Suggestions · [/] Filter"
+                : focusedRow?.kind === "gh-repo"
+                  ? "[Enter] Attach · [G] GitHub Auth · [/] Filter"
+                  : "[Enter] Activate · [T] Trust · [X] Remove"}${sidebarHint}`,
               Math.max(16, leftInner - 12),
             )}
           </text>
