@@ -38,12 +38,15 @@ import {
   saveOverrideSettings,
   saveRoutingSettings,
   scopeOf,
+  setConfigOverride,
   setOverride,
   setPackCallers,
   setPackRules,
   setRoutes,
   unsetOverride,
   unsetRoutes,
+  type ConfigPatch,
+  type ConfigSection,
   type FieldPatch,
 } from "./userSettings.js"
 import { detectFrontmatterVersion, translateFrontmatterV1ToV2 } from "./v2Compat.js"
@@ -275,14 +278,24 @@ export function overrideAgentsModel(
   model: string,
   verifiedModels: string[] = [],
   options: { target?: string; env?: NodeJS.ProcessEnv } = {},
+  unpin = false,
 ): void {
-  if (!verifiedModels.includes(model)) throw new Error(`Model is not present in refreshed catalog: ${model}`)
+  if (!unpin && !verifiedModels.includes(model)) throw new Error(`Model is not present in refreshed catalog: ${model}`)
   runWithOverrideWriter(workspaceRoot, writer => {
     for (const agent of agents) {
-      const updated = composeModelVariant({ ...agent.frontmatter, model })
-      writer(agent.currentPath, updated, agent.body, agent.frontmatterVersion)
-      agent.model = model
-      agent.frontmatter = { ...agent.frontmatter, model }
+      if (unpin) {
+        const updated: Record<string, any> = { ...agent.frontmatter }
+        delete updated.model
+        delete updated.variant
+        writer(agent.currentPath, updated, agent.body, agent.frontmatterVersion)
+        agent.model = ""
+        agent.frontmatter = updated
+      } else {
+        const updated = composeModelVariant({ ...agent.frontmatter, model })
+        writer(agent.currentPath, updated, agent.body, agent.frontmatterVersion)
+        agent.model = model
+        agent.frontmatter = { ...agent.frontmatter, model }
+      }
     }
   }, options)
 }
@@ -380,6 +393,26 @@ export function saveUserPackCallers(
     const settings = loadRoutingSettings(env)
     setPackCallers(scopeOf(settings, target), id, callers, callers?.[0])
     saveRoutingSettings(settings, env)
+  })
+}
+
+/**
+ * Sets fields of one config entry override of a pack in `overrides.json` (e.g. toggling an MCP server on/off),
+ * under the settings lock so concurrent manage-agents processes cannot lose each other's writes.
+ */
+export function saveConfigOverride(
+  id: string,
+  section: ConfigSection,
+  key: string,
+  fields: ConfigPatch,
+  options: { target?: string; env?: NodeJS.ProcessEnv } = {},
+): void {
+  const env = options.env ?? process.env
+  const target = options.target ?? resolvedDefaultTarget(env)
+  withSettingsLock(env, () => {
+    const settings = loadOverrideSettings(env)
+    setConfigOverride(scopeOf(settings, target), id, section, key, fields)
+    saveOverrideSettings(settings, env)
   })
 }
 

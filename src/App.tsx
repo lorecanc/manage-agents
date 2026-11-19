@@ -51,7 +51,9 @@ import {
 import { packDir, readManifest } from "./utils/catalog.js"
 import { changeTarget, installChange, reconcileChange, targetStatus, type TargetStatus } from "./utils/installer.js"
 import { realpathThroughExistingAncestor } from "./utils/pathValidation.js"
-import { effectiveOverrides, loadOverrideSettings } from "./utils/userSettings.js"
+import { effectiveOverrides, loadOverrideSettings, patchedConfigSections } from "./utils/userSettings.js"
+import { parseJsonc } from "./utils/packs.js"
+import { isServerDisabled } from "./utils/opencodeMcp.js"
 import { addSource, deriveSourceName, engineConfigDir, findSource, loadSources, pullSource, removeSource, saveSources, sourceRevision, sourceRoot, type Source } from "./utils/sources.js"
 import { inspectGhAuthAsync, listGhReposAsync, runGhWebLogin, type GhAuthStatus, type GhRepoSummary } from "./utils/github.js"
 import {
@@ -62,6 +64,7 @@ import {
   overrideRepairAgentModels,
   reconcileTargetIfInstalled,
   runWithOverrideWriter,
+  saveConfigOverride,
   saveUserPackCallers,
   saveUserPackFlow,
   sourceBridgeOutputDir,
@@ -108,7 +111,7 @@ import {
   validateDraftBridgeTiers,
   type BridgeField,
 } from "./utils/bridgePrompt.js"
-import { describeChangeResult } from "./utils/changeReport.js"
+import { changeToast, describeChangeResult } from "./utils/changeReport.js"
 import { defaultTarget, serializeLock } from "./utils/lock.js"
 import {
   buildInferenceIndex,
@@ -382,6 +385,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   // Modal / Action State
   const [viewMode, setViewMode] = useState<ViewMode>("main")
   const installPreviewReqIdRef = useRef(0)
+  const installInFlightRef = useRef(false)
   const pendingJumpIndexRef = useRef<number | null>(null)
   useEffect(() => {
     installPreviewReqIdRef.current += 1
@@ -610,7 +614,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         const result = await changeTarget(target, "reconcile", registry, reconcileChange)
         refreshTargetStatus()
         const summary = describeChangeResult(target, result)
-        pushToast(result.status === "failed" ? `✗ ${summary[0] || "Reconcile failed"}` : `✓ ${summary[0] || "Target reconciled"}`)
+        pushToast(changeToast(target, result))
         if (result.status === "failed") {
           setActionResultTitle("Reconcile Failed")
           setActionResultLines(summary)
@@ -1156,6 +1160,8 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   }
 
   const applyInstall = (preview: InstallPreview) => {
+    if (installInFlightRef.current) return
+    installInFlightRef.current = true
     const fail = (error: any) => {
       setActionResultTitle("Install Failed")
       setActionResultLines([`An error occurred:`, `  ${terminalSafeText(error?.message || error)}`])
@@ -1169,6 +1175,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       } catch (error) {
         fail(error)
         setIsAsyncBusy(false)
+        installInFlightRef.current = false
         setViewMode("action-result")
         return
       }
@@ -1206,6 +1213,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         }
       }
       setIsAsyncBusy(false)
+      installInFlightRef.current = false
       setViewMode("action-result")
     })()
   }
@@ -1617,6 +1625,9 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         })
       }
     })
+    if (viewMode === "model-selector" && routingPick === null) {
+      items.push({ type: "model", id: INHERIT, label: "↺ inherit (remove explicit model)", provider: "routing" })
+    }
     return items
   }, [models, expandedProviders, viewMode, repairGroupKey, invalidModelGroups, modelCatalog, routingPick, pendingTriggers, modelFilter])
   useEffect(() => {
@@ -1950,6 +1961,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   const userOverridesSummary = useMemo(() => {
     const countsByPack = new Map<string, number>()
     const overriddenAgents = new Set<string>()
+    const overriddenConfigKeys = new Set<string>()
     try {
       const target = realpathThroughExistingAncestor(path.resolve(defaultTarget()))
       const settings = loadOverrideSettings()
@@ -1957,13 +1969,17 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       for (const cat of cats) {
         const eff = effectiveOverrides(settings, target, cat)
         const ids = Object.keys(eff.agents).filter(id => Object.keys(ownProp(eff.agents, id) ?? {}).length > 0)
-        if (ids.length > 0) countsByPack.set(cat, ids.length)
         for (const id of ids) overriddenAgents.add(`${cat}/${id}`)
+        const configKeys = Object.entries(eff.config)
+          .flatMap(([section, entries]) => Object.keys(entries ?? {}).map(key => `${section}/${key}`))
+          .map(spec => `${cat}/${spec}`)
+        for (const spec of configKeys) overriddenConfigKeys.add(spec)
+        if (ids.length + configKeys.length > 0) countsByPack.set(cat, ids.length + configKeys.length)
       }
     } catch {
       // Ignore unreadable override settings in status badges
     }
-    return { countsByPack, overriddenAgents }
+    return { countsByPack, overriddenAgents, overriddenConfigKeys }
   }, [agents, flashTick, routingRevision])
 
   const resolveAgentHexColor = (rawCol: unknown): string => {
@@ -2003,6 +2019,49 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     setRoutingConfirmDelete(false)
     setRoutingStatus("")
     setViewMode("routing-configs")
+  }
+
+  /** MCP servers this pack contributes, as the effective (override-patched) contribution sees them. */
+  const packMcpServers = useMemo<Array<{ name: string; enabled: boolean; overridden: boolean }>>(() => {
+    if (!workspaceRoot || !routingArchetype) return []
+    try {
+      const dir = packDir(workspaceRoot, routingArchetype)
+      if (!dir) return []
+      const configFile = ["opencode.json", "opencode.jsonc"].find(name => fs.existsSync(path.join(dir, name)))
+      if (!configFile) return []
+      const config = parseJsonc(fs.readFileSync(path.join(dir, configFile), "utf8")) as Record<string, any>
+      const target = realpathThroughExistingAncestor(path.resolve(defaultTarget()))
+      const eff = effectiveOverrides(loadOverrideSettings(), target, routingArchetype)
+      const servers = patchedConfigSections(config, eff.config, routingArchetype)["mcp.servers"] ?? {}
+      return Object.keys(servers).sort().map(name => {
+        const server = ownProp(servers, name) as Record<string, any> | undefined
+        const sectionOverrides = ownProp(eff.config, "mcp.servers") as Record<string, unknown> | undefined
+        return { name, enabled: server ? !isServerDisabled(server) : true, overridden: Boolean(sectionOverrides && Object.hasOwn(sectionOverrides, name)) }
+      })
+    } catch {
+      return []
+    }
+  }, [workspaceRoot, routingArchetype, routingRevision, flashTick])
+
+  const togglePackMcpServer = (name: string) => {
+    if (!routingArchetype) return
+    try {
+      const server = packMcpServers.find(candidate => candidate.name === name)
+      // Disabling writes `disabled: true`; enabling writes `disabled: null`, which removes the field from the entry
+      // the pack contributes (the same semantics as `models unpin`), so pack-level and global disables are beaten too.
+      const target = realpathThroughExistingAncestor(path.resolve(defaultTarget()))
+      saveConfigOverride(routingArchetype, "mcp.servers", name, server?.enabled ? { disabled: true } : { disabled: null }, { target })
+      setRoutingRevision(r => r + 1)
+      const nextState = server?.enabled ? "disabled" : "enabled"
+      setRoutingStatus(`MCP server '${name}' ${nextState} in overrides.json; reconciling target...`)
+      void reconcileTargetIfInstalled("override").then(outcome => {
+        setRoutingStatus(`MCP server '${name}' ${nextState}. ${formatReconcileLines(outcome)[0]}`)
+      }).catch(error => {
+        setRoutingStatus(`MCP server '${name}' ${nextState} in overrides.json; reconcile failed: ${terminalSafeText(error?.message || error)}`)
+      })
+    } catch (error: any) {
+      setRoutingStatus(`Error: ${terminalSafeText(error?.message || error)}`)
+    }
   }
 
   const openRoutingBranchAtIndex = (index: number) => {
@@ -3486,6 +3545,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
             })
           } else {
             const selectedModel = item.id
+            const unpin = selectedModel === INHERIT
             if (routingPick && routingDraft) {
               const pick = routingPick
               setRoutingPick(null)
@@ -3533,22 +3593,28 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
               const selectedAgents = selectedAgentPaths.size > 0
                 ? agents.filter((a) => selectedAgentPaths.has(a.currentPath))
                 : (activeItems[focusedIndex]?.agent ? [activeItems[focusedIndex].agent!] : [])
-              if (!modelCatalog.models.includes(selectedModel)) throw new Error("Model is not present in refreshed catalog")
+              if (!unpin && !modelCatalog.models.includes(selectedModel)) throw new Error("Model is not present in refreshed catalog")
               if (isReadOnlyGitSource) {
                 void (async () => {
                   try {
-                    overrideAgentsModel(workspaceRoot, selectedAgents, selectedModel, modelCatalog.models)
+                    overrideAgentsModel(workspaceRoot, selectedAgents, unpin ? "" : selectedModel, modelCatalog.models, undefined, unpin)
                     refreshData()
                     setSelectedAgentPaths(new Set())
                     const outcome = await reconcileTargetIfInstalled("override")
                     setActionResultTitle("Model Updated Successfully")
-                    setActionResultLines([
-                      `Successfully set model:`,
-                      `  ${selectedModel}`,
-                      `on ${selectedAgents.length} agents.`,
-                      "",
-                      ...formatReconcileLines(outcome),
-                    ])
+                    setActionResultLines(unpin
+                      ? [
+                          `Successfully unpinned model on ${selectedAgents.length} agents.`,
+                          "",
+                          ...formatReconcileLines(outcome),
+                        ]
+                      : [
+                          `Successfully set model:`,
+                          `  ${selectedModel}`,
+                          `on ${selectedAgents.length} agents.`,
+                          "",
+                          ...formatReconcileLines(outcome),
+                        ])
                   } catch (error: any) {
                     setActionResultTitle("Error Updating Model")
                     setActionResultLines([`An error occurred:`, `  ${error.message || error}`])
@@ -3557,10 +3623,12 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                 })()
                 return
               }
-              const tx = mutate(selectedAgents.map(a => a.currentPath), "tune", () => updateAgentsModel(selectedAgents, selectedModel, modelCatalog.models))
+              const tx = mutate(selectedAgents.map(a => a.currentPath), "tune", () => updateAgentsModel(selectedAgents, unpin ? "" : selectedModel, modelCatalog.models, undefined, unpin))
               try { refreshData() } catch (error) { setMutationRefreshFailure(error, tx.warning); return }
               setSelectedAgentPaths(new Set())
-              setMutationSuccess("Model Updated Successfully", [`Successfully set model:`, `  ${selectedModel}`, `on ${selectedAgents.length} agents.`], tx.warning)
+              setMutationSuccess("Model Updated Successfully", unpin
+                ? [`Successfully unpinned model on ${selectedAgents.length} agents.`]
+                : [`Successfully set model:`, `  ${selectedModel}`, `on ${selectedAgents.length} agents.`], tx.warning)
             } catch (error: any) {
               setActionResultTitle("Error Updating Model")
               setActionResultLines([`An error occurred:`, `  ${error.message || error}`])
@@ -3752,7 +3820,10 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       }
     } else if (viewMode === "routing-configs") {
       const flows = routingView?.flows ?? []
-      const rows = flows.length + 1
+      const mcpRows = packMcpServers
+      const rows = flows.length + 1 + mcpRows.length
+      const focusedMcpIndex = routingFocus - flows.length - 1
+      const focusedMcp = focusedMcpIndex >= 0 && focusedMcpIndex < mcpRows.length ? mcpRows[focusedMcpIndex] : null
       const modalLayout = calculatePackFlowsModalLayout(termWidth, termHeight, {
         hasPinned: Boolean(routingView?.pinned.length),
         hasStatus: Boolean(routingStatus),
@@ -3766,6 +3837,8 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         setRoutingFocus(next)
         setRoutingScroll(offset => clampListScroll(next, rows, offset, modalLayout.configViewportRows))
         setRoutingConfirmDelete(false)
+      } else if ((key === "t" || ((key === "enter" || key === "return" || key === "space") && focusedMcp)) && focusedMcp) {
+        togglePackMcpServer(focusedMcp.name)
       } else if (key === "c" && routingView) {
         openRoutingCallersModal()
       } else if (key === "w" && routingView && !isReadOnlyGitSource && routingView.hasManifest) {
@@ -6490,6 +6563,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
           callerScroll={callerScroll}
           flowSubFocus={flowSubFocus}
           flowSubScroll={flowSubScroll}
+          mcpServers={packMcpServers}
           termWidth={termWidth}
           termHeight={termHeight}
           onClose={() => {
@@ -6510,7 +6584,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
           }}
           onOpenBranch={idx => openRoutingBranchAtIndex(idx)}
           onScrollBranches={delta => {
-            const total = (routingView?.flows.length ?? 0) + 1
+            const total = (routingView?.flows.length ?? 0) + 1 + packMcpServers.length
             if (total <= 0) return
             const vpRows = Math.max(1, calculatePackFlowsModalLayout(termWidth, termHeight, {
               hasPinned: Boolean(routingView?.pinned.length),
@@ -6527,6 +6601,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
           onOpenCallers={openRoutingCallersModal}
           onExportManifest={exportRoutingToManifest}
           onOpenInitPack={openInitPackModal}
+          onToggleMcpServer={togglePackMcpServer}
           onFocusEditorRow={idx => setRoutingEditorFocus(idx)}
           onActivateEditorRow={idx => activateRoutingEditorRow(idx, false)}
           onToggleEditorAgentSelect={role => {
@@ -6868,6 +6943,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         const addedLines = installPreview.lines.filter(l => /^\s*\b(write|add|install|update)\b/i.test(l))
         const removedLines = installPreview.lines.filter(l => /^\s*\b(remove|delete|prune)\b/i.test(l))
         const hasDiffItems = addedLines.length > 0 || removedLines.length > 0
+        const canAccept = !installPreview.blocked
 
         return (
           <box
@@ -6918,12 +6994,12 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                       />
                     </box>
                   )}
-                  {installPreview.confirmations.length > 0 && (
+                  {canAccept && installPreview.confirmations.length > 0 && (
                     <text style={{ textColor: THEME.accentAmber }} b marginTop={1}>
                       Confirming also accepts executable surface:
                     </text>
                   )}
-                  {installPreview.confirmations.map((reason, index) => (
+                  {canAccept && installPreview.confirmations.map((reason, index) => (
                     <text key={`confirm-${index}`} style={{ textColor: THEME.accentAmber }}>
                       {`  • ${terminalSafeText(reason)}`}
                     </text>
