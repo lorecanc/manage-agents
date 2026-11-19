@@ -4,7 +4,7 @@ import fs from "node:fs"
 import path from "node:path"
 import test from "node:test"
 import { tempDir, writePack } from "../../test/helpers.js"
-import { addSource, deriveSourceName, discoverPacks, ghCredentialArgs, hasUrlCredentials, loadSources, pullSource, redactUrlCredentials, removeSource, saveSources, sourceRevision, type SourceRegistry } from "./sources.js"
+import { addSource, deriveSourceName, discoverPacks, ghCredentialArgs, hasUrlCredentials, isSourceSpecLike, loadSources, pullSource, redactUrlCredentials, removeSource, saveSources, sourceRevision, validateSourceSpec, type SourceRegistry } from "./sources.js"
 
 const emptyRegistry = (): SourceRegistry => ({ schemaVersion: 1, sources: [], prefer: {} })
 const envFor = (t: test.TestContext) => {
@@ -89,6 +89,46 @@ test("source URLs: redact credentials and query strings without changing public 
   assert.equal(hasUrlCredentials("user:secret@github.com:org/repo.git"), true)
   assert.equal(hasUrlCredentials("ssh://git@github.com/org/repo.git"), false)
   assert.equal(hasUrlCredentials("git@github.com:org/repo.git"), false)
+})
+
+test("source specs: validateSourceSpec resolves a local directory and rejects bad specs", (t) => {
+  const dir = tempDir(t)
+  const env = envFor(t)
+
+  const local = validateSourceSpec(dir, env)
+  assert.deepEqual(local, { ok: true, kind: "local", path: fs.realpathSync(dir), spec: dir })
+
+  const missing = validateSourceSpec(path.join(dir, "nope"), env)
+  assert.equal(missing.ok, false)
+  if (!missing.ok) assert.match(missing.error, /not a directory/)
+
+  const withCredentials = validateSourceSpec("https://user:secret@example.com/x.git", env)
+  assert.equal(withCredentials.ok, false)
+  if (!withCredentials.ok) {
+    assert.match(withCredentials.error, /credentials in source URLs/)
+    assert.doesNotMatch(withCredentials.error, /secret/)
+  }
+})
+
+test("source specs: isSourceSpecLike distinguishes path-like queries from plain filters", () => {
+  for (const query of ["/tmp/repo", "~/repo", "./repo", "../repo", "owner/repo", "repo\\sub"]) {
+    assert.equal(isSourceSpecLike(query), true, query)
+  }
+  for (const query of ["alpha", "flow", "my filter query"]) {
+    assert.equal(isSourceSpecLike(query), false, query)
+  }
+})
+
+test("source specs: addSource still registers a local directory through the shared resolver", (t) => {
+  const dir = tempDir(t)
+  const env = envFor(t)
+  const registry = emptyRegistry()
+  const source = addSource(registry, "local", dir, { trusted: true })
+  assert.deepEqual(source, { name: "local", kind: "local", path: fs.realpathSync(dir), trusted: true })
+
+  saveSources(registry, env)
+  const loaded = loadSources(env)
+  assert.equal(loaded.sources[0].kind === "local" && loaded.sources[0].path, fs.realpathSync(dir))
 })
 
 test("discovery: finds packs, does not descend into a pack, reports broken manifests and unpulled git sources", (t) => {

@@ -144,42 +144,68 @@ export function deriveSourceName(location: string, registry: SourceRegistry): st
   return candidate
 }
 
+/** Outcome of resolving a raw source spec, without touching a registry. */
+export type SourceSpecResult =
+  | { ok: true; kind: "local"; path: string; spec: string }
+  | { ok: true; kind: "git"; spec: string; ref?: string }
+  | { ok: false; error: string }
+
+/** Single source of truth for spec parsing; `externalRef` is the ref supplied through addSource settings. */
+function resolveSpec(raw: string, options: GitOptions, externalRef?: string): SourceSpecResult {
+  let spec = raw.trim()
+  let ref = externalRef
+  const shorthand = parseGitHubShorthand(spec)
+  if (shorthand) {
+    if (ref !== undefined && shorthand.ref !== undefined && ref !== shorthand.ref) return { ok: false, error: `conflicting git refs "${ref}" and "${shorthand.ref}"` }
+    ref = ref ?? shorthand.ref
+    spec = shorthand.url
+  } else if (/^(?:github|gh):/i.test(spec)) {
+    return { ok: false, error: `invalid GitHub repository "${raw}": use github:<owner>/<repo>[#<ref>]` }
+  } else if (/^(?:https|ssh):\/\//i.test(spec) && spec.includes("#")) {
+    const hashIndex = spec.indexOf("#")
+    const inlineRef = spec.slice(hashIndex + 1)
+    if (!inlineRef || !GIT_REF_RE.test(inlineRef)) return { ok: false, error: `invalid git ref "${inlineRef}"` }
+    if (ref !== undefined && ref !== inlineRef) return { ok: false, error: `conflicting git refs "${ref}" and "${inlineRef}"` }
+    spec = spec.slice(0, hashIndex)
+    ref = ref ?? inlineRef
+  }
+  if (ref !== undefined && !GIT_REF_RE.test(ref)) return { ok: false, error: `invalid git ref "${ref}"` }
+  if (hasUrlCredentials(spec)) return { ok: false, error: "credentials in source URLs are not stored: configure a git credential helper or an SSH key instead" }
+  if (isGitLocation(spec, options)) return { ok: true, kind: "git", spec, ...(ref ? { ref } : {}) }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(spec) && !path.win32.isAbsolute(spec)) {
+    return { ok: false, error: `unsupported source URL "${redactUrlCredentials(raw)}": use https:, ssh:, git@host:path or owner/repo` }
+  }
+  const dir = path.resolve(spec)
+  if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return { ok: false, error: `${dir} is not a directory` }
+  if (ref !== undefined) return { ok: false, error: "--ref applies only to git sources" }
+  return { ok: true, kind: "local", path: fs.realpathSync(dir), spec }
+}
+
+/** Resolves a directory, git URL or GitHub `[github:]owner/repo[#ref]` spec; read-only and registry-independent. */
+export function resolveSourceSpec(raw: string, env: NodeJS.ProcessEnv = process.env, options: GitOptions = {}): SourceSpecResult {
+  return resolveSpec(raw, options)
+}
+
+/** Safe on every keystroke: same outcome as resolveSourceSpec, with no writes and no registry mutation. */
+export function validateSourceSpec(raw: string, env: NodeJS.ProcessEnv = process.env, options: GitOptions = {}): SourceSpecResult {
+  return resolveSourceSpec(raw, env, options)
+}
+
+/** Pure heuristic for path-like specs, used to pick the connect row icon and position; no I/O. */
+export function isSourceSpecLike(query: string): boolean {
+  const value = query.trim()
+  return value.startsWith("/") || value.startsWith("~/") || value.startsWith("./") || value.startsWith("../") || value.includes("/") || value.includes("\\")
+}
+
 /** Adds a source; `location` is a directory, a git URL (https:, ssh:, git@host:path), or GitHub shorthand (`[github:]owner/repo[#ref]`). */
 export function addSource(registry: SourceRegistry, name: string, location: string, settings: { ref?: string; trusted?: boolean } = {}, options: GitOptions = {}): Source {
   if (!PACK_NAME_RE.test(name)) throw new Error(`invalid source name "${name}": use lowercase letters, digits and hyphens`)
   if (registry.sources.some(source => source.name === name)) throw new Error(`source "${name}" already exists`)
-  let resolvedLocation = location.trim()
-  let resolvedRef = settings.ref
-  const shorthand = parseGitHubShorthand(resolvedLocation)
-  if (shorthand) {
-    if (resolvedRef !== undefined && shorthand.ref !== undefined && resolvedRef !== shorthand.ref) {
-      throw new Error(`conflicting git refs "${resolvedRef}" and "${shorthand.ref}"`)
-    }
-    resolvedLocation = shorthand.url
-    resolvedRef = resolvedRef ?? shorthand.ref
-  } else if (/^(?:github|gh):/i.test(resolvedLocation)) {
-    throw new Error(`invalid GitHub repository "${location}": use github:<owner>/<repo>[#<ref>]`)
-  } else if (/^(?:https|ssh):\/\//i.test(resolvedLocation) && resolvedLocation.includes("#")) {
-    const hashIndex = resolvedLocation.indexOf("#")
-    const inlineRef = resolvedLocation.slice(hashIndex + 1)
-    if (!inlineRef || !GIT_REF_RE.test(inlineRef)) throw new Error(`invalid git ref "${inlineRef}"`)
-    if (resolvedRef !== undefined && resolvedRef !== inlineRef) throw new Error(`conflicting git refs "${resolvedRef}" and "${inlineRef}"`)
-    resolvedLocation = resolvedLocation.slice(0, hashIndex)
-    resolvedRef = resolvedRef ?? inlineRef
-  }
-  if (resolvedRef !== undefined && !GIT_REF_RE.test(resolvedRef)) throw new Error(`invalid git ref "${resolvedRef}"`)
-  if (hasUrlCredentials(resolvedLocation)) throw new Error("credentials in source URLs are not stored: configure a git credential helper or an SSH key instead")
-  let source: Source
-  if (isGitLocation(resolvedLocation, options)) {
-    source = { name, kind: "git", url: resolvedLocation, ...(resolvedRef ? { ref: resolvedRef } : {}), trusted: settings.trusted === true }
-  } else if (/^[a-z][a-z0-9+.-]*:/i.test(resolvedLocation) && !path.win32.isAbsolute(resolvedLocation)) {
-    throw new Error(`unsupported source URL "${redactUrlCredentials(location)}": use https:, ssh:, git@host:path or owner/repo`)
-  } else {
-    const dir = path.resolve(resolvedLocation)
-    if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) throw new Error(`${dir} is not a directory`)
-    if (resolvedRef !== undefined) throw new Error("--ref applies only to git sources")
-    source = { name, kind: "local", path: fs.realpathSync(dir), trusted: settings.trusted === true }
-  }
+  const resolved = resolveSpec(location, options, settings.ref)
+  if ("error" in resolved) throw new Error(resolved.error)
+  const source: Source = resolved.kind === "git"
+    ? { name, kind: "git", url: resolved.spec, ...(resolved.ref ? { ref: resolved.ref } : {}), trusted: settings.trusted === true }
+    : { name, kind: "local", path: resolved.path, trusted: settings.trusted === true }
   registry.sources.push(source)
   return source
 }
