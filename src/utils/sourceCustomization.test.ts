@@ -116,3 +116,59 @@ test("git source customizations write overrides.json and routing.json, reconcile
   assert.equal(runtimeRouting.archetypes.flow.routes.openai["flow-explore"], "openai/gpt-5-mini")
   assert.ok(loadRoutingSettings(env).targets[target]?.flow?.openai)
 })
+
+test("git source model unpin writes a null model override and keeps the git cache clean", { skip: !hasGit }, async (t) => {
+  const base = tempDir(t, "source-unpin-")
+  const env = { ...process.env, XDG_CONFIG_HOME: path.join(base, "config"), XDG_CACHE_HOME: path.join(base, "cache") }
+  const upstream = path.join(base, "upstream")
+  fs.mkdirSync(upstream, { recursive: true })
+  gitIn(upstream, "init", "--quiet", "--initial-branch=main")
+  writePack(
+    path.join(upstream, "packs", "flow"),
+    {
+      "agents/flow-build.md": "---\nmode: primary\nmodel: old/model\n---\nbuild\n",
+    },
+    {
+      name: "flow",
+      archetype: { callers: ["flow-build"], reference: "flow-build" },
+    },
+  )
+  gitIn(upstream, "add", "-A")
+  gitIn(upstream, "commit", "--quiet", "-m", "initial")
+
+  const registry: SourceRegistry = { schemaVersion: 1, sources: [], prefer: {} }
+  const source = addSource(registry, "github-flow", `file://${upstream}`, { trusted: true }, { allowFileUrls: true })
+  saveSources(registry, env)
+  pullSource(source, env, { allowFileUrls: true, useGhAuth: false })
+  const cacheRoot = sourceRoot(source, env)
+  const target = fs.realpathSync(fs.mkdirSync(path.join(base, "target"), { recursive: true }) || path.join(base, "target"))
+
+  const installRes = await changeTarget(target, "install", registry, installChange(registry, ["github-flow/flow"], env), {
+    env,
+    confirm: async () => true,
+  })
+  assert.equal(installRes.status, "applied")
+
+  const build = loadSourceAgents(cacheRoot, { target, env }).find(a => a.filename === "flow-build.md")!
+  assert.equal(build.model, "old/model")
+
+  overrideAgentsModel(cacheRoot, [build], "", [], { target, env }, true)
+
+  // Git cache must remain 100% untouched
+  assert.equal(gitIn(cacheRoot, "status", "--porcelain"), "")
+
+  // Unpin stores a null model patch in the target-scoped overrides
+  const patch = loadOverrideSettings(env).targets[target]?.flow?.agents?.["flow-build"]
+  assert.equal(patch?.model, null)
+
+  // Reloading the source agent no longer exposes a model key
+  const unpinned = loadSourceAgents(cacheRoot, { target, env }).find(a => a.filename === "flow-build.md")!
+  assert.equal(Object.prototype.hasOwnProperty.call(unpinned.frontmatter, "model"), false)
+
+  // Reconcile propagates the unpin into the installed OpenCode target
+  const rec = await reconcileTargetIfInstalled("override", { target, env })
+  assert.equal(rec.installed, true)
+  assert.equal(rec.result?.status, "applied")
+  const installedBuild = fs.readFileSync(path.join(target, "agents", "flow-build.md"), "utf8")
+  assert.doesNotMatch(installedBuild, /model:/)
+})

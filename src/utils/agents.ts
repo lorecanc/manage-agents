@@ -1452,8 +1452,8 @@ function atomicWriteAgentFile(filePath: string, bytes: Buffer): void {
 /**
  * Batch update the model of multiple agents.
  */
-export function updateAgentsModel(agents: AgentInfo[], model: string, verifiedModels: string[] = [], writer = saveAgentFile) {
-  if (!verifiedModels.includes(model)) throw new Error(`Model is not present in refreshed catalog: ${model}`)
+export function updateAgentsModel(agents: AgentInfo[], model: string, verifiedModels: string[] = [], writer = saveAgentFile, unpin = false) {
+  if (!unpin && !verifiedModels.includes(model)) throw new Error(`Model is not present in refreshed catalog: ${model}`)
   const originals = new Map<string, { bytes: Buffer; stat: fs.Stats }>()
   const expected = new Map<string, { bytes: Buffer; mode: number }>()
   const snapshots = new Map<AgentInfo, { model: string; frontmatter: Record<string, any>; frontmatterContent: Record<string, any>; rawContent: string; frontmatterVersion?: "v1" | "v2" | "unknown" }>()
@@ -1470,14 +1470,26 @@ export function updateAgentsModel(agents: AgentInfo[], model: string, verifiedMo
   try {
     for (const agent of agents) {
       attempted.push(agent.currentPath)
-      const updatedFrontmatter = { ...agent.frontmatter, model }
-      const writeFrontmatter = composeModelVariant({ ...updatedFrontmatter })
+      const updatedFrontmatter = { ...agent.frontmatter }
+      if (unpin) {
+        delete updatedFrontmatter.model
+        delete updatedFrontmatter.variant
+      } else {
+        updatedFrontmatter.model = model
+      }
+      const writeFrontmatter = unpin ? updatedFrontmatter : composeModelVariant({ ...updatedFrontmatter })
       expected.set(agent.currentPath, { bytes: Buffer.from(renderAgentFile(writeFrontmatter, agent.body, agent.frontmatterVersion)), mode: originals.get(agent.currentPath)!.stat.mode & 0o7777 })
       writer(agent.currentPath, writeFrontmatter, agent.body, agent.frontmatterVersion)
     }
     for (const agent of agents) {
-      agent.model = model
-      agent.frontmatter = { ...agent.frontmatter, model }
+      agent.model = unpin ? "" : model
+      agent.frontmatter = { ...agent.frontmatter }
+      if (unpin) {
+        delete agent.frontmatter.model
+        delete agent.frontmatter.variant
+      } else {
+        agent.frontmatter.model = model
+      }
       agent.rawContent = fs.readFileSync(agent.currentPath, "utf8")
     }
   } catch (error: any) {

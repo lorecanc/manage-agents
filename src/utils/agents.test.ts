@@ -8,6 +8,7 @@ import YAML from "yaml"
 import { tempDir, writePack } from "../../test/helpers.js"
 import { extractFrontmatter, findAgentFiles, getExportDestination, parseAgentFile, renameAgent, saveAgentFile, repairAgentModels, updateAgentsModel, discoverAgentResources, updateAgentResources, updateAgentParams, applySafetyPreset, AGENT_EFFORT_VARIANTS, KNOWN_MODEL_VARIANTS, inspectTuningTargets, buildTuningUpdateParams, resolveAgentSteps, resolveAgentTuningMode, parseTuneCliArgs, resolveAllowedTuneVariants, validateAgentVariantSyntax } from "./agents.js"
 import { AUTO_COMMIT_MESSAGES, repositoryTransaction } from "./repositoryTransaction.js"
+import { modelDisplayValue } from "./models.js"
 
 type PackFixture = { manifest?: Record<string, unknown>; files?: Record<string, string> }
 
@@ -126,6 +127,38 @@ test("model update applies atomically to two agents and synchronizes memory", (t
     assert.equal(agent.rawContent, fs.readFileSync(agent.currentPath, "utf8"))
     assert.equal(parseAgentFile(agent.currentPath, workspace)!.model, "new/model")
   }
+})
+
+test("model unpin removes the model field and keeps unrelated frontmatter", (t) => {
+  const workspace = catalog(t, "agent-unpin-")
+  const a = fixtureAgent(agentPath(workspace, "a"), workspace, "old/model")
+
+  updateAgentsModel([a], "", [], undefined, true)
+
+  assert.equal(Object.hasOwn(parseAgentFile(a.currentPath, workspace)!.frontmatter, "model"), false)
+  assert.equal(modelDisplayValue(a), "Inherited")
+  assert.equal(a.model, "")
+  assert.equal(a.frontmatter.description, "x")
+  assert.doesNotMatch(fs.readFileSync(a.currentPath, "utf8"), /\nmodel:/)
+})
+
+test("model unpin does not reintroduce model from a legacy variant field", (t) => {
+  const workspace = catalog(t, "agent-unpin-variant-")
+  const filePath = agentPath(workspace, "a")
+  fs.mkdirSync(path.dirname(filePath), { recursive: true })
+  saveAgentFile(filePath, { description: "x", model: "old/model", variant: "fast" }, "body")
+  const a = parseAgentFile(filePath, workspace)!
+
+  updateAgentsModel([a], "", [], undefined, true)
+
+  const onDisk = parseAgentFile(filePath, workspace)!
+  assert.equal(Object.hasOwn(onDisk.frontmatter, "model"), false)
+  assert.equal(Object.hasOwn(onDisk.frontmatter, "variant"), false)
+  assert.equal(Object.hasOwn(a.frontmatter, "model"), false)
+  assert.equal(Object.hasOwn(a.frontmatter, "variant"), false)
+  const content = fs.readFileSync(filePath, "utf8")
+  assert.doesNotMatch(content, /\nmodel:/)
+  assert.doesNotMatch(content, /\nvariant:/)
 })
 
 test("model update uses one repository transaction for real agent files", (t) => {
