@@ -54,7 +54,7 @@ import { realpathThroughExistingAncestor } from "./utils/pathValidation.js"
 import { effectiveOverrides, loadOverrideSettings, patchedConfigSections } from "./utils/userSettings.js"
 import { parseJsonc } from "./utils/packs.js"
 import { isServerDisabled } from "./utils/opencodeMcp.js"
-import { addSource, deriveSourceName, engineConfigDir, findSource, loadSources, pullSource, removeSource, saveSources, sourceRevision, sourceRoot, type Source } from "./utils/sources.js"
+import { addSource, deriveSourceName, engineConfigDir, findSource, isSourceSpecLike, loadSources, pullSource, removeSource, saveSources, sourceRevision, sourceRoot, validateSourceSpec, type Source } from "./utils/sources.js"
 import { inspectGhAuthAsync, listGhReposAsync, runGhWebLogin, type GhAuthStatus, type GhRepoSummary } from "./utils/github.js"
 import {
   describeConfiguredPackFlows,
@@ -144,6 +144,9 @@ import { applyEngineUpdate, checkForEngineUpdate, type EngineUpdateCheckResult }
 import { loadUiConfig, saveUiConfig } from "./utils/uiConfig.js"
 import { displayWidth, middleEllipsis, terminalSafeText } from "./utils/terminalText.js"
 import { buildContextualShortcuts, filterPaletteCommands, type PaletteCommand, type WorkspaceTab } from "./utils/commandPalette.js"
+import { buildSourceWorkspaceRows } from "./utils/sourceRows.js"
+import { consumePasteSequence, emptyPasteBuffer, sanitizePasteText, type PasteBuffer } from "./utils/keyboardInput.js"
+import { loadRecentSourcePaths, recordRecentSourcePath, saveRecentSourcePaths, suggestLocalPaths, type RecentSourcePaths } from "./utils/recentSourcePaths.js"
 import { buildPreviewUnifiedDiff, fractionalBar, gaugeBar, lerpColor, sanitizeHexColor, terminalSafeMarkdown, THEME } from "./utils/uiTheme.js"
 import { isReducedMotionPreferred, useAnimatedNumber, useFlashDecay, usePulseLoop } from "./ui/animations.js"
 import { CommandPaletteModal } from "./ui/CommandPaletteModal.js"
@@ -400,6 +403,14 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   const [ghRepos, setGhRepos] = useState<GhRepoSummary[]>([])
   const [sourcesQuery, setSourcesQuery] = useState("")
   const [sourcesInputFocused, setSourcesInputFocused] = useState(false)
+  const [recentPaths, setRecentPaths] = useState<RecentSourcePaths>(() => {
+    try {
+      return loadRecentSourcePaths()
+    } catch {
+      return { schemaVersion: 1, items: [] }
+    }
+  })
+  const pasteRef = useRef<PasteBuffer>(emptyPasteBuffer())
   const [sourcesFocusIndex, setSourcesFocusIndex] = useState(0)
   const [sourcesScrollOffset, setSourcesScrollOffset] = useState(0)
   const [sourcesStatus, setSourcesStatus] = useState(startupNotice ?? "")
@@ -948,7 +959,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     setViewMode("pack-init")
   }
 
-  const switchToDataSource = (next: ActiveDataSource) => {
+  const switchToDataSource = (next: ActiveDataSource, options: { keepTab?: boolean } = {}) => {
     const loadedAgents = next.kind === "source" && next.source.kind === "git"
       ? loadSourceAgents(next.root)
       : findAgentFiles(next.root)
@@ -967,7 +978,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     setSearchQuery("")
     setIsSearching(false)
     setLayoutStatus("")
-    setWorkspaceTab("catalog")
+    if (!options.keepTab) setWorkspaceTab("catalog")
     refreshTargetStatus()
     const isNextVirtual = Boolean(next.root && isVirtualPackRoot(next.root))
     if (isNextVirtual && !promptedVirtualRootsRef.current.has(next.root)) {
@@ -988,9 +999,20 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       const registry = loadSources()
       registry.active = source.name
       saveSources(registry)
-      switchToDataSource({ kind: "source", source, root: sourceRoot(source) })
+      switchToDataSource({ kind: "source", source, root: sourceRoot(source) }, { keepTab: true })
     } catch (error: any) {
       setSourcesStatus(`Could not open ${source.name}: ${terminalSafeText(error?.message || error)}`)
+    }
+  }
+
+  const rememberSourcePath = (source: Source, rawSpec: string) => {
+    try {
+      recordRecentSourcePath(source, rawSpec)
+      const next = loadRecentSourcePaths()
+      saveRecentSourcePaths(next)
+      setRecentPaths(next)
+    } catch {
+      // Il registro dei percorsi recenti è best-effort: non blocca l'attivazione.
     }
   }
 
@@ -1007,12 +1029,13 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       const source = existing ?? addSource(registry, deriveSourceName(trimmed, registry), trimmed)
       registry.active = source.name
       saveSources(registry)
+      if (source.kind === "local") rememberSourcePath(source, trimmed)
       if (source.kind === "git" && !fs.existsSync(path.join(sourceRoot(source), ".git"))) {
         pullSource(source)
       }
       setSourcesQuery("")
       setSourcesInputFocused(false)
-      switchToDataSource({ kind: "source", source, root: sourceRoot(source) })
+      switchToDataSource({ kind: "source", source, root: sourceRoot(source) }, { keepTab: true })
     } catch (error: any) {
       setSourcesStatus(`Attach failed: ${terminalSafeText(error?.message || error)}`)
     }
@@ -1636,33 +1659,86 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
 
   const sourceModalRows = useMemo<SourceWorkspaceRow[]>(() => {
     const query = sourcesQuery.trim().toLowerCase()
-    const rows: SourceWorkspaceRow[] = []
     const registeredGitUrls = new Set(
       registeredSources
         .filter((s): s is Source & { kind: "git" } => s.kind === "git")
         .map(s => s.url.toLowerCase().replace(/\.git$/i, ""))
     )
-    for (const source of registeredSources) {
-      const targetText = source.kind === "local" ? source.path : source.url
-      if (query && !source.name.toLowerCase().includes(query) && !targetText.toLowerCase().includes(query)) continue
-      rows.push({
-        id: `reg:${source.name}`,
-        kind: "registered",
+    const registered = registeredSources
+      .filter(source => {
+        if (!query) return true
+        const targetText = source.kind === "local" ? source.path : source.url
+        return source.name.toLowerCase().includes(query) || targetText.toLowerCase().includes(query)
+      })
+      .map(source => ({
         source,
         revision: sourceRevisions[source.name] ?? null,
         isActive: (activeDataSource?.kind === "source" ? activeDataSource.source.name : activeSourceName) === source.name,
-      })
+      }))
+    const ghReposFiltered = ghRepos.filter(repo => {
+      if (registeredGitUrls.has(repo.url.toLowerCase().replace(/\.git$/i, ""))) return false
+      return !query || repo.nameWithOwner.toLowerCase().includes(query) || repo.description.toLowerCase().includes(query)
+    })
+
+    let recentSuggestions: string[] = []
+    if (isSourceSpecLike(sourcesQuery)) {
+      const trimmed = sourcesQuery.trim()
+      let dir = process.cwd()
+      let needle = trimmed
+      try {
+        const expanded = trimmed.startsWith("~") ? path.join(os.homedir(), trimmed.slice(1)) : trimmed
+        const resolved = path.resolve(expanded)
+        const resolvedStat = fs.lstatSync(resolved, { throwIfNoEntry: false })
+        if (resolvedStat?.isDirectory() && !resolvedStat.isSymbolicLink()) {
+          dir = resolved
+          needle = ""
+        } else {
+          const parent = path.dirname(resolved)
+          const parentStat = fs.lstatSync(parent, { throwIfNoEntry: false })
+          if (parentStat?.isDirectory() && !parentStat.isSymbolicLink()) {
+            dir = parent
+            needle = path.basename(resolved)
+          }
+        }
+      } catch {
+        // La directory di partenza resta quella corrente.
+      }
+      let entries: Array<{ name: string; isDirectory: boolean; isSymbolicLink: boolean }> = []
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true }).map(entry => ({
+          name: entry.name,
+          isDirectory: entry.isDirectory(),
+          isSymbolicLink: entry.isSymbolicLink(),
+        }))
+      } catch {
+        // Directory non leggibile: restano solo i percorsi recenti.
+      }
+      const home = os.homedir()
+      const toSpec = (name: string) => {
+        const full = path.join(dir, name)
+        if (trimmed === "~" || trimmed.startsWith("~/")) {
+          const rel = path.relative(home, full)
+          if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) return `~/${rel.split(path.sep).join("/")}`
+        }
+        return full
+      }
+      const localSuggestions = suggestLocalPaths(needle, entries, 4).map(toSpec)
+      const remembered = recentPaths.items.map(item => item.kind === "local" ? item.path : item.spec)
+      recentSuggestions = [...remembered, ...localSuggestions]
     }
-    for (const repo of ghRepos) {
-      if (registeredGitUrls.has(repo.url.toLowerCase().replace(/\.git$/i, ""))) continue
-      if (query && !repo.nameWithOwner.toLowerCase().includes(query) && !repo.description.toLowerCase().includes(query)) continue
-      rows.push({ id: `gh:${repo.nameWithOwner}`, kind: "gh-repo", repo })
+
+    return buildSourceWorkspaceRows({ query: sourcesQuery, registered, ghRepos: ghReposFiltered, recentSuggestions })
+  }, [registeredSources, sourceRevisions, ghRepos, sourcesQuery, activeDataSource, activeSourceName, recentPaths])
+
+  const sourceValidation = useMemo(() => {
+    if (!sourcesInputFocused || !sourcesQuery.trim()) return null
+    const result = validateSourceSpec(sourcesQuery)
+    if (result.ok) {
+      const value = result.kind === "local" ? result.path : `${result.spec}${result.ref ? `#${result.ref}` : ""}`
+      return { ok: true, message: terminalSafeText(value) }
     }
-    if (sourcesQuery.trim()) {
-      rows.push({ id: "connect-input", kind: "connect-input", spec: sourcesQuery.trim() })
-    }
-    return rows
-  }, [registeredSources, sourceRevisions, ghRepos, sourcesQuery, activeDataSource, activeSourceName])
+    return { ok: false, message: terminalSafeText("error" in result ? result.error : String(result)) }
+  }, [sourcesInputFocused, sourcesQuery])
 
   const maxVisibleSourceRows = wsViewports.sourcesRows
   useEffect(() => {
@@ -2882,6 +2958,78 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     setHelpScrollOffset(off => clampHelpScroll(clampedFocus, helpContent.rows, off, vpRows))
   }, [viewMode, termWidth, termHeight, helpContent.rows, helpContent.items.length])
 
+  useEffect(() => {
+    pasteRef.current = emptyPasteBuffer()
+  }, [viewMode, workspaceTab, isSearching, sourcesInputFocused, doctorTab, initPackField, scaffoldField, tuningFocusedField, renameFocusedField])
+
+  const resolvePasteTarget = (): { set: (text: string) => void; append: (ch: string) => void; after: () => void } | null => {
+    const printable = (ch: string) => /^[\x20-\x7E]$/.test(ch)
+    const simple = (
+      setter: (updater: (value: string) => string) => void,
+      after: () => void,
+      accept: (ch: string) => boolean = printable,
+    ) => {
+      const append = (ch: string) => { if (accept(ch)) setter(value => value + ch) }
+      return { set: (text: string) => { for (const ch of text) append(ch) }, append, after }
+    }
+
+    if (viewMode === "command-palette") {
+      return simple(setPaletteQuery, () => { setPaletteFocusIndex(0); setPaletteScrollOffset(0) })
+    }
+    if (viewMode === "main" && workspaceTab === "catalog" && isSearching) {
+      return simple(setSearchQuery, () => {})
+    }
+    if (viewMode === "main" && workspaceTab === "sources" && sourcesInputFocused) {
+      return simple(setSourcesQuery, () => { setSourcesFocusIndex(0); setSourcesScrollOffset(0) })
+    }
+    if (viewMode === "pack-init") {
+      const append = (ch: string) => {
+        if (!printable(ch)) return
+        if (initPackField === "cloneDest") setInitCloneDest(s => s + ch)
+        else if (initPackField === "name" && /[a-zA-Z0-9-]/.test(ch)) setInitPackName(s => (s + ch.toLowerCase()).slice(0, 64))
+        else if (initPackField === "version" && ch !== " ") setInitPackVersion(s => s + ch)
+        else if (initPackField === "desc") setInitPackDesc(s => s + ch)
+      }
+      return { set: text => { for (const ch of text) append(ch) }, append, after: () => {} }
+    }
+    if (viewMode === "pack-doctor" && doctorTab !== "doctor") {
+      const append = (ch: string) => {
+        if (!printable(ch)) return
+        if (scaffoldField === "id" && /[a-zA-Z0-9._/-]/.test(ch)) setScaffoldId(s => s + ch)
+        else if (scaffoldField === "desc") setScaffoldDesc(s => s + ch)
+      }
+      return { set: text => { for (const ch of text) append(ch) }, append, after: () => {} }
+    }
+    if (viewMode === "parameter-tuning" && (tuningFocusedField === "steps" || tuningFocusedField === "variant")) {
+      const append = (ch: string) => {
+        if (!printable(ch) || ch === " ") return
+        if (tuningFocusedField === "steps") {
+          if (/[0-9]/.test(ch)) {
+            setTuningSteps(prev => (!tuningDirtyFields.has("steps") && tuningSummary.steps.mixed ? ch : prev + ch))
+            markTuningDirty("steps")
+          } else if (ch === "-" || ch === "_") adjustTuningSteps(-1)
+          else if (ch === "+" || ch === "=") adjustTuningSteps(1)
+        } else if (/^[a-zA-Z0-9._-]$/.test(ch)) {
+          const lower = ch.toLowerCase()
+          setTuningVariant(prev => (!tuningVariantTyping || (!tuningDirtyFields.has("variant") && tuningSummary.variant.mixed) ? lower : prev + lower))
+          setTuningVariantTyping(true)
+          markTuningDirty("variant")
+        }
+      }
+      return { set: text => { for (const ch of text) append(ch) }, append, after: () => {} }
+    }
+    if (viewMode === "rename-prompt") {
+      const append = (ch: string) => {
+        if (!printable(ch)) return
+        if (renameFocusedField === "family") setRenameFamily(prev => prev + ch)
+        else if (renameFocusedField === "category") setRenameCategory(prev => prev + ch)
+        else setRenameRole(prev => prev + ch)
+      }
+      return { set: text => { for (const ch of text) append(ch) }, append, after: () => {} }
+    }
+    return null
+  }
+
   // Keyboard navigation and actions
   useKeyboard((e) => {
     const key = e.name.toLowerCase()
@@ -2890,6 +3038,24 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       : e.shift
         ? e.name.toUpperCase()
         : e.name
+    const pasteStep = consumePasteSequence(e.sequence ?? "", pasteRef.current)
+    pasteRef.current = pasteStep.buffer
+    if (pasteStep.outcome.kind !== "pass") {
+      if (pasteStep.outcome.kind === "commit") {
+        const target = resolvePasteTarget()
+        if (target) {
+          target.set(sanitizePasteText(pasteStep.outcome.text))
+          target.after()
+        }
+      } else if (pasteStep.outcome.kind === "hold" && pasteStep.outcome.prefix) {
+        const target = resolvePasteTarget()
+        if (target) {
+          target.set(sanitizePasteText(pasteStep.outcome.prefix))
+          target.after()
+        }
+      }
+      return
+    }
     const isUppercaseF = key === "f" && (e.sequence === "F" || !!e.shift)
     const isUppercaseL = key === "l" && (e.sequence === "L" || !!e.shift)
     const isUppercaseU = key === "u" && (e.sequence === "U" || !!e.shift)
@@ -3080,6 +3246,13 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
           const next = (sourcesFocusIndex + delta + sourceModalRows.length) % sourceModalRows.length
           setSourcesFocusIndex(next)
           clampScroll(next, sourceModalRows.length)
+        } else if (key === "tab") {
+          const suggestion = sourceModalRows.find(row => row.kind === "connect-input" && row.spec !== sourcesQuery.trim())
+          if (suggestion?.kind === "connect-input") {
+            setSourcesQuery(suggestion.spec)
+            setSourcesFocusIndex(0)
+            setSourcesScrollOffset(0)
+          }
         } else if (key === "backspace") {
           setSourcesQuery(q => q.slice(0, -1))
           setSourcesFocusIndex(0)
@@ -4810,6 +4983,8 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
           termHeight={termHeight}
           query={sourcesQuery}
           inputFocused={sourcesInputFocused}
+          inputMode={isSourceSpecLike(sourcesQuery) ? "spec" : "filter"}
+          inputValidation={sourceValidation}
           ghAuth={ghAuth}
           busySpinner={pulse.spinner}
           sourcesStatus={sourcesStatus || null}
