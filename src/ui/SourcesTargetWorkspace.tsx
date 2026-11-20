@@ -129,17 +129,9 @@ export function SourcesTargetWorkspace({
     : " 🎯 OpenCode Target Status · ⇧→ "
 
   const safeQuery = terminalSafeText(query)
-  const inputLine = inputMode === "spec"
-    ? query.trim()
-      ? `➕ Connect & activate "${safeQuery}" · Enter to attach`
-      : "📁 Press Enter to browse local paths and connect a source"
-    : inputMode === "filter"
-      ? `🔍 ${query ? safeQuery : "Type to filter sources"}`
-      : query
-        ? `❯ ${safeQuery}${inputFocused ? "▋" : ""}`
-        : inputFocused
-          ? "❯ owner/repo, https://...git, or local path▋"
-          : "🔍 Click or press [/] to filter or connect owner/repo..."
+  const inputLine = query
+    ? `${inputMode === "spec" ? "Connect" : "Filter"}  ${safeQuery}${inputFocused ? "▋" : ""}`
+    : inputFocused ? "Local path, Git URL or owner/repo▋" : "[/] Filter sources or connect a repository"
 
   const focusedRow = rows[focusedIndex]
   const sidebarHint = showInspector ? " · [⇧→] Sidebar" : ""
@@ -244,7 +236,7 @@ export function SourcesTargetWorkspace({
           <box flexDirection="column" width="100%" marginTop={1} overflow="hidden">
             {visibleRows.length === 0 ? (
               <text style={{ textColor: THEME.fgSecondary }}>
-                No sources yet. Type owner/repo above and press Enter, or press [G] for GitHub login.
+                Press / and enter a local path, Git URL or owner/repo. Enter opens the catalog.
               </text>
             ) : (
               visibleRows.map((row, idx) => {
@@ -351,11 +343,11 @@ export function SourcesTargetWorkspace({
         >
           <text wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgSecondary }}>
             {middleEllipsis(
-              `${focusedRow?.kind === "connect-input"
+              `${!focusedRow ? "[/] Connect source" : focusedRow.kind === "connect-input"
                 ? "[Enter] Connect · [↑↓] Suggestions · [/] Filter"
                 : focusedRow?.kind === "gh-repo"
                   ? "[Enter] Attach · [G] GitHub Auth · [/] Filter"
-                  : "[Enter] Activate · [T] Trust · [X] Remove"}${sidebarHint}`,
+                  : "[Enter] Open catalog · [T] Trust · [X] Remove"}${sidebarHint}`,
               Math.max(16, leftInner - 12),
             )}
           </text>

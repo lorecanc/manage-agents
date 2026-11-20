@@ -6,6 +6,8 @@ import path from "node:path"
 import React from "react"
 import { createTestRenderer } from "@opentui/core/testing"
 import { createRoot } from "@opentui/react"
+import { tempDir, writePack } from "../../test/helpers.js"
+import { loadSources } from "./sources.js"
 import { App } from "../App.js"
 import { chunkPillsByWidth } from "../ui/ParameterTuningModal.js"
 import {
@@ -770,4 +772,143 @@ test("untrusted executable bridge content requires confirmation and cancellation
     else process.env.XDG_CACHE_HOME = prevXdgCache
     fs.rmSync(tmp, { recursive: true, force: true })
   }
+})
+
+test("PackFlowsModal MCP toggle writes the target-scope config override and reflects [ON]/[OFF] without mouse", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ma-tui-mcp-toggle-"))
+  const prevXdgConfig = process.env.XDG_CONFIG_HOME
+  const prevXdgCache = process.env.XDG_CACHE_HOME
+  process.env.XDG_CONFIG_HOME = path.join(tmp, "xdg-config")
+  process.env.XDG_CACHE_HOME = path.join(tmp, "xdg-cache")
+  const packDir = path.join(tmp, "packs", "mcppack")
+  fs.mkdirSync(path.join(packDir, "agents"), { recursive: true })
+  fs.writeFileSync(path.join(packDir, "opencode-pack.json"), JSON.stringify({ contract: "1.0", name: "mcppack", version: "1.0.0", description: "pack with an MCP server" }))
+  fs.writeFileSync(path.join(packDir, "opencode.json"), JSON.stringify({ mcp: { servers: { cupertino: { type: "local", command: ["cupertino-mcp"], disabled: true } } } }))
+  fs.writeFileSync(path.join(packDir, "agents", "mcppack-helper.md"), "---\ndescription: Helper agent\nmode: primary\n---\nHelp.\n")
+
+  const press = async (renderer: any, renderOnce: () => Promise<void>, name: string, sequence = name.length === 1 ? name : "") => {
+    renderer.keyInput.emit("keypress", { name, sequence, ctrl: false, meta: false, shift: false })
+    await new Promise(resolve => setImmediate(resolve))
+    await new Promise(resolve => setTimeout(resolve, 14))
+    await renderOnce()
+  }
+  const waitUntil = async (renderOnce: () => Promise<void>, frame: () => string, predicate: (text: string) => boolean) => {
+    for (let attempt = 0; attempt < 40; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 20))
+      await renderOnce()
+      if (predicate(frame())) return
+    }
+  }
+
+  const overridesPath = path.join(process.env.XDG_CONFIG_HOME!, "manage-agents", "overrides.json")
+  const readTargetOverride = (): Record<string, unknown> | undefined => {
+    if (!fs.existsSync(overridesPath)) return undefined
+    const saved = JSON.parse(fs.readFileSync(overridesPath, "utf8"))
+    const [scopeKey] = Object.keys(saved.targets ?? {})
+    assert.match(scopeKey, /opencode$/, "the toggle writes to the default OpenCode target scope, like the CLI without --global")
+    return saved.targets[scopeKey].mcppack.config
+  }
+
+  let rendererInstance: any
+  try {
+    const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 136, height: 34 })
+    rendererInstance = renderer
+    createRoot(renderer).render(React.createElement(App, {
+      workspaceRoot: tmp,
+      listShare: 2 / 3,
+      reducedMotion: true,
+      initialModelCatalog: { status: "unverified" as const, models: [] },
+    }))
+    await waitUntil(renderOnce, captureCharFrame, frame => frame.includes("mcppack (1)"))
+
+    // Open the pack detail: Tab switches to Flows & Graph; Enter opens PackFlowsModal on the pack row.
+    await press(renderer, renderOnce, "tab", "\t")
+    await waitUntil(renderOnce, captureCharFrame, frame => frame.includes("Flows & Graph"))
+    await press(renderer, renderOnce, "return", "\r")
+    await waitUntil(renderOnce, captureCharFrame, frame => frame.includes("MCP cupertino"))
+    assert.equal(captureCharFrame().includes("[OFF]"), true, "the pack ships the server disabled and no override exists yet")
+    assert.equal(readTargetOverride(), undefined, "nothing written yet")
+
+    // Focus the MCP row with the keyboard and toggle.
+    await press(renderer, renderOnce, "down")
+    assert.equal(captureCharFrame().includes("▎ ⚡ MCP cupertino"), true, "keyboard focus lands on the MCP toggle row")
+    await press(renderer, renderOnce, "t", "t")
+    await waitUntil(renderOnce, captureCharFrame, frame => frame.includes("[ON]"))
+    assert.deepEqual(readTargetOverride(), { "mcp.servers": { cupertino: { disabled: null } } }, "enabling removes the field from the contributed entry")
+
+    // Toggle back off from the same row.
+    await press(renderer, renderOnce, "t", "t")
+    await waitUntil(renderOnce, captureCharFrame, frame => frame.includes("[OFF]"))
+    assert.deepEqual(readTargetOverride(), { "mcp.servers": { cupertino: { disabled: true } } }, "disabling writes disabled: true into the target-scope override")
+
+    // Escape closes the modal; the override stays saved for the next reconcile/bridge export.
+    await press(renderer, renderOnce, "escape")
+    await waitUntil(renderOnce, captureCharFrame, frame => !frame.includes("MCP cupertino"))
+    assert.equal(fs.existsSync(overridesPath), true)
+  } finally {
+    try { rendererInstance?.destroy() } catch {}
+    if (prevXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME
+    else process.env.XDG_CONFIG_HOME = prevXdgConfig
+    if (prevXdgCache === undefined) delete process.env.XDG_CACHE_HOME
+    else process.env.XDG_CACHE_HOME = prevXdgCache
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+
+test("Sources opens a mixed-layout catalog and installs a command-only pack by manifest name", async t => {
+  const tmp = tempDir(t, "ma-catalog-ui-")
+  const previousConfig = process.env.XDG_CONFIG_HOME
+  const previousCache = process.env.XDG_CACHE_HOME
+  process.env.XDG_CONFIG_HOME = path.join(tmp, "config")
+  process.env.XDG_CACHE_HOME = path.join(tmp, "cache")
+  t.after(() => {
+    if (previousConfig === undefined) delete process.env.XDG_CONFIG_HOME
+    else process.env.XDG_CONFIG_HOME = previousConfig
+    if (previousCache === undefined) delete process.env.XDG_CACHE_HOME
+    else process.env.XDG_CACHE_HOME = previousCache
+  })
+  const catalog = path.join(tmp, "notebook")
+  const command = "---\ndescription: Index a volume\n---\nIndex $ARGUMENTS.\n"
+  writePack(path.join(catalog, "library", "volumes"), { "commands/index.md": command }, { name: "archive" })
+  writePack(path.join(catalog, "packs", "team"), { "agents/editor.md": "---\ndescription: Editor\nmode: primary\n---\nEdit.\n" }, { name: "editors" })
+  const ui = await createTestRenderer({ width: 130, height: 36 })
+  t.after(() => ui.renderer.destroy())
+  createRoot(ui.renderer).render(React.createElement(App, { reducedMotion: true, initialModelCatalog: { status: "verified", models: [] } }))
+  const waitFor = async (label: string) => {
+    for (let attempt = 0; attempt < 60; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 15))
+      await ui.renderOnce()
+      if (ui.captureCharFrame().includes(label)) return
+    }
+    assert.fail(`Missing ${label} in frame:\n${ui.captureCharFrame()}`)
+  }
+  const press = async (name: string) => {
+    ui.renderer.keyInput.emit("keypress", { name, sequence: name === "return" ? "\r" : name.length === 1 ? name : "", ctrl: false, meta: false, shift: false } as any)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    await ui.renderOnce()
+  }
+  await waitFor("GitHub Discovery")
+  await new Promise(resolve => setTimeout(resolve, 30))
+  await press("/")
+  await ui.mockInput.pasteBracketedText(catalog)
+  await waitFor("notebook")
+  await press("return")
+  await waitFor("archive (0)")
+  assert.equal(loadSources().active, "notebook")
+  assert.ok(ui.captureCharFrame().includes("editors (1)"))
+  await press("d")
+  await waitFor("Pack Doctor & Authoring · archive@1.0.0")
+  assert.ok(ui.captureCharFrame().includes("archive"))
+  await press("escape")
+  await press("e")
+  await waitFor("Install 'archive'")
+  const installed = path.join(process.env.XDG_CONFIG_HOME, "opencode", "commands", "index.md")
+  await press("escape")
+  assert.equal(fs.existsSync(installed), false)
+  await press("e")
+  await waitFor("Install 'archive'")
+  await press("y")
+  await waitFor("Install Complete")
+  assert.equal(fs.readFileSync(installed, "utf8"), command)
 })

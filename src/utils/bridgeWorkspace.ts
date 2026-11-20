@@ -5,11 +5,13 @@ import { parseAgentFile, type AgentInfo } from "./agents.js"
 import { bridgeToClaudeCode, type BridgeResult } from "./bridge.js"
 import { packDir, packsDir, resolvePackClosure } from "./catalog.js"
 import { bridgeToCodex, type CodexBridgeResult } from "./codexBridge.js"
-import { readMcpServers } from "./opencodeMcp.js"
-import { hasErrors, installableFiles, MAX_SCANNED_BYTES, parseJsonc, validatePack } from "./packs.js"
-import { isPathInsideWorkspace } from "./pathValidation.js"
+import { discoverPackDirs, hasErrors, installableFiles, MANIFEST_FILE, MAX_SCANNED_BYTES, parseJsonc, validatePack } from "./packs.js"
+import { validateVirtualPack } from "./virtualPacks.js"
+import { defaultTarget } from "./lock.js"
+import { isPathInsideWorkspace, realpathThroughExistingAncestor } from "./pathValidation.js"
 import { describeExecutable } from "./resolver.js"
 import { loadSources, sourceRoot } from "./sources.js"
+import { effectiveOverrides, loadOverrideSettings, patchedConfigSections } from "./userSettings.js"
 import type { TranslationConfig } from "./translationConfig.js"
 
 export type BridgeTarget = "claude" | "codex"
@@ -36,6 +38,8 @@ export interface BridgePackOptions {
   prefix: string
   trusted?: boolean
   allowUntrustedExecutable?: boolean
+  /** Environment overrides.json is read from (config overrides apply to the merged workspace). */
+  env?: NodeJS.ProcessEnv
 }
 
 const SKIPPED_SEGMENTS = new Set(["node_modules", "__pycache__"])
@@ -43,7 +47,6 @@ const CONFIG_FILES = ["opencode.json", "opencode.jsonc"]
 
 const isPlainObject = (value: unknown): value is Record<string, any> =>
   typeof value === "object" && value !== null && !Array.isArray(value)
-
 
 function requirePackDir(workspaceRoot: string, pack: string): string {
   const dir = packDir(workspaceRoot, pack)
@@ -60,12 +63,22 @@ function readPackConfig(root: string): Record<string, any> {
   return isPlainObject(parsed) ? parsed : {}
 }
 
-/** Copy the closure of `pack` into one temp tree, as the installer lays it out, with a merged `opencode.json`. */
-export function prepareBridgeWorkspace(workspaceRoot: string, pack: string): BridgeWorkspace {
+/** The OpenCode target scope whose settings the CLI and TUI edit by default (`override config-set`, the TUI toggles). */
+const bridgeSettingsTarget = (env: NodeJS.ProcessEnv) => realpathThroughExistingAncestor(path.resolve(defaultTarget(env)))
+
+/** Copy the closure of `pack` into one temp tree, as the installer lays it out, with a merged `opencode.json`.
+ *
+ * Config overrides (overrides.json) apply too, so a pack bridged to Claude Code or Codex sees the same patched MCP/LSP
+ * entries it contributes after a reconcile: the layers are the "default" scope plus the default OpenCode target's scope,
+ * which is where `override config-set` and the TUI write by default.
+ */
+export function prepareBridgeWorkspace(workspaceRoot: string, pack: string, env: NodeJS.ProcessEnv = process.env): BridgeWorkspace {
   const closure = resolvePackClosure(workspaceRoot, pack)
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "manage-agents-bridge-"))
   const cleanup = () => fs.rmSync(root, { recursive: true, force: true })
   try {
+    const overrideSettings = loadOverrideSettings(env)
+    const settingsTarget = bridgeSettingsTarget(env)
     const servers: Record<string, unknown> = {}
     const lsp: Record<string, unknown> = {}
     const owners = new Map<string, string>()
@@ -73,7 +86,7 @@ export function prepareBridgeWorkspace(workspaceRoot: string, pack: string): Bri
     let agentFiles: string[] = []
     for (const name of closure) {
       const source = requirePackDir(workspaceRoot, name)
-      const validation = validatePack(source)
+      const validation = fs.existsSync(path.join(source, MANIFEST_FILE)) ? validatePack(source) : validateVirtualPack(source, { name })
       if (hasErrors(validation)) {
         const errors = validation.issues.filter(issue => issue.level === "error")
         throw new Error(`Pack '${name}' is invalid: ${errors.map(issue => `${issue.path ? `${issue.path}: ` : ""}${issue.message}`).join("; ")}`)
@@ -88,18 +101,29 @@ export function prepareBridgeWorkspace(workspaceRoot: string, pack: string): Bri
         owners.set(file, name)
         const target = path.join(root, file)
         fs.mkdirSync(path.dirname(target), { recursive: true })
-        fs.copyFileSync(path.join(source, file), target)
+        const virtual = validation.virtualFiles?.[file]
+        if (virtual?.content) fs.writeFileSync(target, virtual.content)
+        else fs.copyFileSync(path.join(source, virtual?.sourceRel ?? file), target)
       }
-      const config = readPackConfig(source)
-      Object.assign(servers, readMcpServers(config))
-      if (isPlainObject(config.lsp)) Object.assign(lsp, config.lsp)
+      const config = validation.virtualFiles ? {} : readPackConfig(source)
+      const sections = patchedConfigSections(config, effectiveOverrides(overrideSettings, settingsTarget, name).config, name)
+      const patchedServers = sections["mcp.servers"] ?? {}
+      Object.assign(servers, patchedServers)
+      Object.assign(lsp, sections.lsp ?? {})
       if (name === pack) agentFiles = files.filter(file => file.startsWith("agents/") && file.endsWith(".md"))
     }
     fs.writeFileSync(path.join(root, "opencode.json"), `${JSON.stringify({ mcp: { servers }, lsp }, null, 2)}\n`, "utf-8")
     const agents = agentFiles
-      .map(file => parseAgentFile(path.join(root, file), root))
+      .map(file => {
+        const agent = parseAgentFile(path.join(root, file), root)
+        if (agent) {
+          agent.filename = file.slice("agents/".length)
+          agent.id = agent.filename.slice(0, -3)
+          agent.category = pack
+        }
+        return agent
+      })
       .filter((agent): agent is AgentInfo => agent !== null)
-    for (const agent of agents) agent.category = pack
     return { root, agents, executable, cleanup }
   } catch (error) {
     cleanup()
@@ -107,8 +131,8 @@ export function prepareBridgeWorkspace(workspaceRoot: string, pack: string): Bri
   }
 }
 
-export function inspectBridgeExecutableSurface(workspaceRoot: string, pack: string): Array<{ pack: string; items: string[] }> {
-  const workspace = prepareBridgeWorkspace(workspaceRoot, pack)
+export function inspectBridgeExecutableSurface(workspaceRoot: string, pack: string, env: NodeJS.ProcessEnv = process.env): Array<{ pack: string; items: string[] }> {
+  const workspace = prepareBridgeWorkspace(workspaceRoot, pack, env)
   try {
     return workspace.executable
   } finally {
@@ -116,9 +140,9 @@ export function inspectBridgeExecutableSurface(workspaceRoot: string, pack: stri
   }
 }
 
-export function bridgeConfirmationsNeeded(workspaceRoot: string, pack: string, trusted: boolean, sourceLabel?: string): string[] {
+export function bridgeConfirmationsNeeded(workspaceRoot: string, pack: string, trusted: boolean, sourceLabel?: string, env: NodeJS.ProcessEnv = process.env): string[] {
   if (trusted) return []
-  return inspectBridgeExecutableSurface(workspaceRoot, pack).map(entry =>
+  return inspectBridgeExecutableSurface(workspaceRoot, pack, env).map(entry =>
     `untrusted${sourceLabel ? ` source '${sourceLabel}'` : ""} pack '${entry.pack}' contains executable content (${entry.items.join(", ")})`
   )
 }
@@ -156,9 +180,9 @@ export function withGeneratedPackBridge<T>(
   options: BridgePackOptions,
   use: (generatedDir: string, result: BridgeResult | CodexBridgeResult) => T
 ): T {
-  const { pack, target, outputDir, config, pluginName, prefix } = options
+  const { pack, target, outputDir, config, pluginName, prefix, env } = options
   const workspaceRoot = path.resolve(options.workspaceRoot)
-  const workspace = prepareBridgeWorkspace(workspaceRoot, pack)
+  const workspace = prepareBridgeWorkspace(workspaceRoot, pack, env)
   try {
     if (options.trusted === false && !options.allowUntrustedExecutable && workspace.executable.length > 0) {
       throw new Error(`Refusing to bridge untrusted pack '${pack}' with executable content without confirmation (--yes): ${workspace.executable.map(entry => `${entry.pack} (${entry.items.join(", ")})`).join("; ")}`)
@@ -179,7 +203,9 @@ export function withGeneratedPackBridge<T>(
 
 function assertSafeOutputDir(workspaceRoot: string, pack: string, outputDir: string): void {
   if (isPathInsideWorkspace(outputDir, workspaceRoot)) throw new Error(`Bridge output '${outputDir}' must not contain the catalog`)
-  if (isPathInsideWorkspace(packsDir(workspaceRoot), outputDir) || isPathInsideWorkspace(requirePackDir(workspaceRoot, pack), outputDir)) {
+  if (isPathInsideWorkspace(packsDir(workspaceRoot), outputDir) ||
+      isPathInsideWorkspace(requirePackDir(workspaceRoot, pack), outputDir) ||
+      [...discoverPackDirs(workspaceRoot)].some(dir => isPathInsideWorkspace(dir, outputDir) || isPathInsideWorkspace(outputDir, dir))) {
     throw new Error(`Bridge output '${outputDir}' must not live inside a pack`)
   }
   // Inside the catalog, no component below the catalog root may be a link: mirroring writes and prunes through it.

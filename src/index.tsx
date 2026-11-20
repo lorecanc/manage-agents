@@ -20,16 +20,16 @@ import {
 } from "./utils/translationConfig.js"
 import { AUTO_COMMIT_MESSAGES, isRepositoryLocalPath, repositoryTransaction, parseAutoCommitArgs } from "./utils/repositoryTransaction.js"
 import { loadUiConfig } from "./utils/uiConfig.js"
-import { hasErrors, MANIFEST_FILE, PACK_NAME_RE, validatePack, type PackValidation } from "./utils/packs.js"
-import { packDir, packsDir, readManifest } from "./utils/catalog.js"
+import { discoverPackDirs, hasErrors, MANIFEST_FILE, PACK_NAME_RE, validatePack, type PackValidation } from "./utils/packs.js"
+import { manifestName, packDir, readManifest } from "./utils/catalog.js"
 import { addSource, deriveSourceName, discoverAllPacks, findSource, loadSources, pullSource, redactUrlCredentials, removeSource, saveSources, sourceRevision, sourceRoot, type Source } from "./utils/sources.js"
 import { inspectGhAuth, runGhWebLogin } from "./utils/github.js"
 import { describeExecutable, parsePackRequest, resolvePacks } from "./utils/resolver.js"
 import { buildLock, confirmationsNeeded, defaultTarget, diffLocks, readLock } from "./utils/lock.js"
 import { changeTarget, installChange, reconcileChange, restoreBackup, targetStatus, uninstallChange, updateChange, type ChangeResult } from "./utils/installer.js"
 import { exportFlowsToPackManifest } from "./utils/archetypes.js"
-import { describeConfiguredPackFlows } from "./utils/sourceCustomization.js"
-import { loadOverrideSettings, loadRoutingSettings, saveOverrideSettings, saveRoutingSettings, scopeOf, setOverride, setPackCallers, setPackRules, setRoutes, unsetOverride, unsetRoutes } from "./utils/userSettings.js"
+import { describeConfiguredPackFlows, sourceBridgeOutputDir, sourceTranslationConfigLocation, standaloneBridgeKey } from "./utils/sourceCustomization.js"
+import { CONFIG_SECTIONS, loadOverrideSettings, loadRoutingSettings, removeConfigEntry, saveOverrideSettings, saveRoutingSettings, scopeOf, setConfigOverride, setOverride, setPackCallers, setPackRules, setRoutes, unsetConfigOverride, unsetOverride, unsetRoutes, type ConfigSection } from "./utils/userSettings.js"
 import { parseTriggerList, validateConditionalRule, type ConditionalPolicy, type DelegationEffect, type PolicyEffect } from "./utils/values.js"
 import { isVirtualPackRoot } from "./utils/virtualPacks.js"
 import {
@@ -51,7 +51,7 @@ import { terminalSafeText } from "./utils/terminalText.js"
 import { describeChangeResult, formatLockChange } from "./utils/changeReport.js"
 import { claudeNextSteps } from "./utils/claudeNextSteps.js"
 import { registerPlugin, validatePlugin } from "./utils/claudePluginCli.js"
-import { resolveEngineVersion, writeEngineReleaseManifest } from "./utils/engineVersion.js"
+import { resolveEngineRoot, resolveEngineVersion, writeEngineReleaseManifest } from "./utils/engineVersion.js"
 import {
   applyEngineUpdate,
   checkForEngineUpdate,
@@ -59,7 +59,7 @@ import {
   signReleaseAssets,
 } from "./utils/selfUpdate.js"
 import type { BridgeResult } from "./utils/bridge.js"
-import type { CodexBridgeResult } from "./utils/codexBridge.js"
+import { codexNextSteps, type CodexBridgeResult } from "./utils/codexBridge.js"
 
 function repositoryMutation<T>(workspaceRoot: string, plan: string[] | { localPaths: string[]; externalPaths?: string[] }, message: string, mutation: () => T): T {
   const result = repositoryTransaction(workspaceRoot, plan, message, mutation)
@@ -130,7 +130,8 @@ async function runCreate(workspaceRoot: string) {
   console.log("------------------------------------------")
 
   const singlePack = fs.existsSync(path.join(workspaceRoot, MANIFEST_FILE))
-  const packs = singlePack ? [] : fs.readdirSync(packsDir(workspaceRoot)).filter(name => packDir(workspaceRoot, name)).sort()
+  const packs = singlePack ? [] : [...discoverPackDirs(workspaceRoot)].map(manifestName).filter(name => name !== null).sort()
+  if (!singlePack && !packs.length) throw new Error("Onboard a pack before creating an agent")
   const familyInput = await askQuestion("1. 🏷  Family (Optional, e.g. go, mistral, hybrid - press enter to skip): ")
   let categoryInput = singlePack ? String(readManifest(workspaceRoot).name) : ""
   while (!singlePack && !packs.includes(categoryInput)) {
@@ -295,15 +296,17 @@ async function runBridgeCheck(workspaceRoot: string) {
   }
 
   // Check-only runs must never migrate or persist the translation config.
-  const config = loadTranslationConfig(workspaceRoot, undefined, { persistMigration: false })
-  pack = pack || (config.prefix || "").replace(/-$/, "")
+  const storageKey = standaloneBridgeKey(workspaceRoot)
+  const loc = storageKey ? sourceTranslationConfigLocation(storageKey, workspaceRoot) : undefined
+  const config = loadTranslationConfig(workspaceRoot, loc?.readPath, { persistMigration: false })
+  pack = pack || (config.prefix || "").replace(/-$/, "") || manifestName(workspaceRoot) || ""
   if (!pack) throw new Error(`Cannot tell which pack the bridges translate: set 'prefix' in ${path.relative(workspaceRoot, translationConfigPath(workspaceRoot))} or pass --pack`)
   const pluginName = sanitizeFilename(config.pluginName || DEFAULT_TRANSLATION_CONFIG.pluginName)
   const checks = [
     { target: "claude" as const, folder: "claude-code" },
     { target: "codex" as const, folder: "codex" }
   ].filter(entry => !targetFilter || entry.target === targetFilter)
-    .map(entry => ({ ...entry, committedDir: path.join(workspaceRoot, "bridges", entry.folder, pluginName) }))
+    .map(entry => ({ ...entry, committedDir: storageKey ? sourceBridgeOutputDir(storageKey, entry.target, pluginName) : path.join(workspaceRoot, "bridges", entry.folder, pluginName) }))
     .filter(entry => targetFilter || fs.existsSync(entry.committedDir))
   if (checks.length === 0) throw new Error(`No committed bridge named ${pluginName} under ${path.join(workspaceRoot, "bridges")}`)
 
@@ -311,7 +314,7 @@ async function runBridgeCheck(workspaceRoot: string) {
   let drifted = false
   for (const check of checks) {
     const label = `${check.folder}/${pluginName}`
-    const result = checkPackBridge({ workspaceRoot, pack, target: check.target, config, committedDir: check.committedDir })
+    const result = checkPackBridge({ workspaceRoot, pack, target: check.target, config: { ...config, prefix: config.prefix || `${pack}-` }, committedDir: check.committedDir })
     if (result.clean) {
       console.log(`Bridge ${label} (pack ${pack}): current.`)
       continue
@@ -400,8 +403,8 @@ Subcommands:
 Options:
   --pack <name>           Pack to bridge (default: the configured prefix without its trailing "-")
   --target, -t <name>     Translation target: claude (default) or codex
-  --output, -o <path>     Output directory (default: bridges/<claude-code|codex>/<name> in the workspace)
-  --name, -n <name>       Plugin name (default: decent-pipeline)
+  --output, -o <path>     Output directory (default: workspace bridges/ for catalogs, manager cache for standalone packs)
+  --name, -n <name>       Plugin name (default: translated-agents)
   --prefix, -p <prefix>   Prefix to strip from agent names (default: <pack>-)
   --config <path>         Reusable translation config (default: bridges/translation-config.json)
   --model <src=target>    Map a source model to a target model; repeatable and accepts comma lists
@@ -425,7 +428,9 @@ automation flags are persisted the same way.
     }
   }
 
-  const loaded = loadTranslationConfig(workspaceRoot, configFile || undefined, { persistMigration: false })
+  const storageKey = standaloneBridgeKey(workspaceRoot)
+  const loc = storageKey ? sourceTranslationConfigLocation(storageKey, workspaceRoot) : undefined
+  const loaded = loadTranslationConfig(workspaceRoot, configFile || loc?.readPath, { persistMigration: false })
   const config = wizard
     ? await runTranslationWizard(workspaceRoot, loaded, configFile || undefined, false)
     : loaded
@@ -442,7 +447,7 @@ automation flags are persisted the same way.
   }
   pluginName = pluginName || config.pluginName || DEFAULT_TRANSLATION_CONFIG.pluginName
   prefix = prefix || (pack ? `${pack}-` : config.prefix)
-  if (!pack) pack = prefix.replace(/-$/, "")
+  if (!pack) pack = prefix.replace(/-$/, "") || manifestName(workspaceRoot) || ""
   if (!prefix) prefix = `${pack}-`
   if (!pack) {
     console.error("Error: --pack is required (or set prefix in the bridge wizard).")
@@ -450,7 +455,8 @@ automation flags are persisted the same way.
   }
 
   const safePluginName = sanitizeFilename(pluginName)
-  const outputDir = path.resolve(output || path.join(workspaceRoot, "bridges", target === "codex" ? "codex" : "claude-code", safePluginName))
+  const outputDir = path.resolve(output || (storageKey ? sourceBridgeOutputDir(storageKey, target, safePluginName) :
+    path.join(workspaceRoot, "bridges", target === "codex" ? "codex" : "claude-code", safePluginName)))
 
   const safe = terminalSafeText
   console.log(`\n🔄 Bridging pack '${safe(pack)}' to ${safe(target)} layer '${safe(pluginName)}'...`)
@@ -468,10 +474,10 @@ automation flags are persisted the same way.
     process.exitCode = 1
     return
   }
-  const bridgeConfigPath = configFile || translationConfigPath(workspaceRoot)
+  const bridgeConfigPath = configFile || loc?.configPath || translationConfigPath(workspaceRoot)
   const bridgePlan = { localPaths: [bridgeConfigPath].filter(file => isRepositoryLocalPath(workspaceRoot, file)).concat(isRepositoryLocalPath(workspaceRoot, outputDir) ? [outputDir] : []), externalPaths: [bridgeConfigPath, outputDir].filter(file => !isRepositoryLocalPath(workspaceRoot, file)) }
   const result: BridgeResult | CodexBridgeResult = repositoryMutation(workspaceRoot, bridgePlan, AUTO_COMMIT_MESSAGES.bridge, () => {
-    if (wizard || modelFlagsGiven || marketFlagsGiven) saveTranslationConfig(workspaceRoot, config, configFile || undefined)
+    if (wizard || modelFlagsGiven || marketFlagsGiven) saveTranslationConfig(configFile ? workspaceRoot : loc?.configRoot ?? workspaceRoot, { ...config, pluginName, prefix }, bridgeConfigPath)
     return bridgePack({ workspaceRoot, pack, target, outputDir, config, pluginName: safePluginName, prefix, trusted: trust.trusted, allowUntrustedExecutable: true })
   })
 
@@ -519,11 +525,10 @@ automation flags are persisted the same way.
       }
     }
     console.log()
-  } else {
-    console.log(`\n   Codex project-scoped agents:`)
-    console.log(`     cd ${safe(outputDir)} && codex`)
-    console.log(`   Plugin manifest:`)
-    console.log(`     ${safe(path.join(outputDir, ".codex-plugin", "plugin.json"))}\n`)
+  } else if ("plugin" in result) {
+    console.log("\n   Open the generated project in Codex:")
+    codexNextSteps(result).forEach(line => console.log(safe(line)))
+    console.log()
   }
 }
 
@@ -1191,6 +1196,14 @@ const SETTINGS_USAGE = `Usage (user settings applied at reconcile; never written
   override set <pack>/<id> <field>=<value>... [--command]
                      patch frontmatter of an installed agent (or command with --command); value is YAML, null removes the field
   override unset <pack>/<id> [<field>...] [--command]
+  override config-set <pack>/<section>/<key> <field>=<value>...
+                      patch one config entry a pack contributes (sections: mcp.servers, lsp, formatter, experimental)
+                      value is YAML; dotted field names nest (environment.FOO=x); null removes the field from the entry
+                      an entry the pack does not have is created; the patched contribution must stay schema-valid
+  override config-unset <pack>/<section>/<key> [<field>...]
+                      drop overridden fields (dotted names address nested fields), or the whole entry override when none
+  override config-remove <pack>/<section>/<key>
+                      make the pack contribute no such entry at all
 Common options: --target <opencode-config-dir> (default $XDG_CONFIG_HOME/opencode), --global (applies to every target;
 default: only this target), --no-reconcile, --yes. Settings live in $XDG_CONFIG_HOME/manage-agents/{routing,overrides}.json.`
 
@@ -1208,6 +1221,34 @@ function parseAssignments(items: string[], parseValue: (raw: string) => unknown)
     Object.defineProperty(out, item.slice(0, equals), { value: parseValue(item.slice(equals + 1)), enumerable: true, writable: true, configurable: true })
   }
   return out
+}
+
+/** Turns "a.b=v" assignments into a nested patch: config override field names may be dotted paths. */
+function expandDottedAssignments(assignments: Record<string, unknown>): Record<string, unknown> {
+  const defineOwn = (object: Record<string, unknown>, key: string, value: unknown) =>
+    Object.defineProperty(object, key, { value, enumerable: true, writable: true, configurable: true })
+  const out: Record<string, unknown> = {}
+  for (const [name, value] of Object.entries(assignments)) {
+    const parts = name.split(".")
+    let cursor = out
+    for (const part of parts.slice(0, -1)) {
+      const next = Object.hasOwn(cursor, part) ? cursor[part] : undefined
+      if (typeof next !== "object" || next === null || Array.isArray(next)) defineOwn(cursor, part, {})
+      cursor = cursor[part] as Record<string, unknown>
+    }
+    defineOwn(cursor, parts[parts.length - 1], value)
+  }
+  return out
+}
+
+/** Splits "<pack>/<section>/<key>": the section has no slash, the key may contain one. */
+function splitConfigSpec(spec: string): [string, ConfigSection, string] {
+  const [pack, rest] = splitPackId(spec)
+  const slash = rest.indexOf("/")
+  if (slash <= 0 || slash === rest.length - 1) throw new Error(`"${spec}" must be <pack>/<section>/<key> with section in {${CONFIG_SECTIONS.join(", ")}}`)
+  const section = rest.slice(0, slash)
+  if (!(CONFIG_SECTIONS as readonly string[]).includes(section)) throw new Error(`unknown config section "${section}" (allowed: ${CONFIG_SECTIONS.join(", ")})`)
+  return [pack, section as ConfigSection, rest.slice(slash + 1)]
 }
 
 async function runSettingsCLI(command: "models" | "override") {
@@ -1329,6 +1370,25 @@ async function runSettingsCLI(command: "models" | "override") {
         saveOverrideSettings(settings)
         message = action === "pin" ? `${terminalSafeText(first)} is pinned to ${terminalSafeText(others[0])} for ${scopeLabel}.` : `${terminalSafeText(first)} has no fixed model for ${scopeLabel}: it follows routing.`
       } else return cliError(`unknown models command ${terminalSafeText(action)}\n${SETTINGS_USAGE}`)
+    } else if (action === "config-set" || action === "config-unset" || action === "config-remove") {
+      if (!first || (action === "config-set" && !others.length)) {
+        return cliError(`usage: override ${action} <pack>/<section>/<key>${action === "config-set" ? " <field>=<value>..." : " [<field>...]"}\n${SETTINGS_USAGE}`)
+      }
+      const [pack, section, key] = splitConfigSpec(first)
+      const settings = loadOverrideSettings()
+      const scope = scopeOf(settings, scopeTarget)
+      if (action === "config-set") {
+        setConfigOverride(scope, pack, section, key, expandDottedAssignments(parseAssignments(others, raw => YAML.parse(raw))))
+        message = `Config override of ${terminalSafeText(first)} updated for ${scopeLabel}.`
+      } else if (action === "config-remove") {
+        removeConfigEntry(scope, pack, section, key)
+        message = `Config entry ${terminalSafeText(first)} is no longer contributed by the pack for ${scopeLabel}.`
+      } else if (!unsetConfigOverride(scope, pack, section, key, others)) {
+        return cliError(`no config override for ${first} in ${scopeLabel}`, 1)
+      } else {
+        message = `Config override of ${terminalSafeText(first)} updated for ${scopeLabel}.`
+      }
+      saveOverrideSettings(settings)
     } else {
       if (action !== "set" && action !== "unset") return cliError(`unknown override command ${terminalSafeText(action)}\n${SETTINGS_USAGE}`)
       if (!first || (action === "set" && !others.length)) return cliError(`usage: override ${action} <pack>/<id> ...\n${SETTINGS_USAGE}`)
@@ -1363,12 +1423,21 @@ async function runSettingsCLI(command: "models" | "override") {
 }
 
 /** The pack catalog (a directory with packs/<name>/opencode-pack.json) or single pack the agent commands and the TUI edit. */
+function isWorkspaceRoot(dir: string): boolean {
+  return !discoverPackDirs(dir).next().done || isVirtualPackRoot(dir)
+}
+
 export function findWorkspace(start: string): string | null {
   const resolvedStart = path.resolve(start)
   for (let dir = resolvedStart; ; dir = path.dirname(dir)) {
     const packs = path.join(dir, "packs")
-    if (fs.existsSync(packs) && fs.readdirSync(packs).some(name => fs.existsSync(path.join(packs, name, "opencode-pack.json")))) return dir
+    if (fs.lstatSync(packs, { throwIfNoEntry: false })?.isDirectory() && !discoverPackDirs(packs, 1).next().done) return dir
     if (fs.existsSync(path.join(dir, "opencode-pack.json"))) return dir
+    if (fs.existsSync(path.join(dir, ".git"))) {
+      // Only search this repository. The engine's bundled contract example is not a user catalog.
+      if (dir !== resolveEngineRoot() && !discoverPackDirs(dir).next().done) return dir
+      break
+    }
     if (path.dirname(dir) === dir) break
   }
   return isVirtualPackRoot(resolvedStart) ? resolvedStart : null
@@ -1615,8 +1684,8 @@ async function run() {
 
   if (command) {
     const workspaceRoot = explicitWorkspace ? path.resolve(explicitWorkspace) : findWorkspace(process.cwd())
-    if (!workspaceRoot || findWorkspace(workspaceRoot) !== workspaceRoot) {
-      return cliError(`no pack catalog or pack found${explicitWorkspace ? ` at ${terminalSafeText(explicitWorkspace)}` : " above the current directory"}; pass --workspace <dir> (a directory with packs/<name>/opencode-pack.json, or a pack)`, 1)
+    if (!workspaceRoot || (explicitWorkspace && !isWorkspaceRoot(workspaceRoot))) {
+      return cliError(`no pack catalog or pack found${explicitWorkspace ? ` at ${terminalSafeText(explicitWorkspace)}` : " above the current directory"}; pass --workspace <dir> (a pack, a catalog containing pack manifests, or a folder of OpenCode agents)`, 1)
     }
     return command === "bridge" ? runBridge(workspaceRoot, explicitSource) : WORKSPACE_COMMANDS[command](workspaceRoot)
   }
@@ -1627,8 +1696,8 @@ async function run() {
 
   if (explicitWorkspace) {
     const resolved = path.resolve(explicitWorkspace)
-    if (findWorkspace(resolved) !== resolved) {
-      return cliError(`no pack catalog or pack found at ${terminalSafeText(explicitWorkspace)}; pass --workspace <dir> (a directory with packs/<name>/opencode-pack.json, or a pack)`, 1)
+    if (!isWorkspaceRoot(resolved)) {
+      return cliError(`no pack catalog or pack found at ${terminalSafeText(explicitWorkspace)}; pass --workspace <dir> (a pack, a catalog containing pack manifests, or a folder of OpenCode agents)`, 1)
     }
     tuiWorkspaceRoot = resolved
   } else if (explicitSource !== undefined) {

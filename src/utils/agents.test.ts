@@ -1108,7 +1108,8 @@ test("resource discovery lists the pack's skills, tool families and tools, and M
     ["tool-family", "slide_*", true],
     ["tool", "slide_build", false],
     ["tool", "slide_preview", true],
-    ["tool", "helper", false]
+    ["tool", "helper", false],
+    ["tool", "notes", false]
   ])
   assert.equal(resources.tools.find(tool => tool.name === "slide_preview")!.familyKey, "slide_*")
   assert.equal(resources.tools.find(tool => tool.name === "slide_build")!.relativePath, path.join("tools", "slides", "slide_build.ts"))

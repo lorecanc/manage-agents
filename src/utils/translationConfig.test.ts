@@ -35,12 +35,12 @@ test("translation defaults define the planning, execution and light tiers", () =
   assert.deepEqual(DEFAULT_TRANSLATION_CONFIG.tiers.light.codex, { model: "gpt-5.6-luna", reasoningEffort: "max" })
   assert.equal(DEFAULT_TRANSLATION_CONFIG.roles.executor, "light")
   assert.equal(DEFAULT_TRANSLATION_CONFIG.roles.explorer, "light")
-  assert.equal(DEFAULT_TRANSLATION_CONFIG.prefix, "pipeline-")
-  assert.equal(resolveRole(agent("pipeline-orchestrator.md"), DEFAULT_TRANSLATION_CONFIG), "orchestrator")
+  assert.equal(DEFAULT_TRANSLATION_CONFIG.prefix, "")
+  assert.equal(resolveRole(agent("pipeline-orchestrator.md"), DEFAULT_TRANSLATION_CONFIG), "pipeline-orchestrator")
 })
 
 test("authorName falls back to the default and honors AGENT_AUTHOR_NAME", () => {
-  assert.equal(DEFAULT_AUTHOR_NAME, "Lorenzo Cancellara")
+  assert.equal(DEFAULT_AUTHOR_NAME, "manage-agents")
   assert.equal(authorName({}), DEFAULT_AUTHOR_NAME)
   assert.equal(authorName({ AGENT_AUTHOR_NAME: "Ada Lovelace" }), "Ada Lovelace")
   assert.equal(authorName({ AGENT_AUTHOR_NAME: "  Grace Hopper  " }), "Grace Hopper")

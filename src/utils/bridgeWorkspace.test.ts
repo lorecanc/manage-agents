@@ -4,6 +4,9 @@ import os from "node:os"
 import path from "node:path"
 import test, { type TestContext } from "node:test"
 import { bridgeConfirmationsNeeded, bridgePack, prepareBridgeWorkspace, resolveBridgeWorkspaceTrust } from "./bridgeWorkspace.js"
+import { defaultTarget } from "./lock.js"
+import { realpathThroughExistingAncestor } from "./pathValidation.js"
+import { saveConfigOverride } from "./sourceCustomization.js"
 import { DEFAULT_TRANSLATION_CONFIG, type TranslationConfig } from "./translationConfig.js"
 
 const manifest = (name: string, requires: Record<string, string> = {}) =>
@@ -97,6 +100,84 @@ test("prepareBridgeWorkspace merges MCP and LSP declarations with later packs wi
     mcp: { servers: { shared: { type: "local", command: ["lib-mcp"] }, "lib-only": { type: "local", command: ["lib-only"] } } },
     lsp: { md: { command: ["marksman"], extensions: [".md"] } }
   })
+})
+
+test("prepareBridgeWorkspace applies overrides.json config patches (default scope) to the merged servers", (t) => {
+  const catalog = writeCatalog(t)
+  const configHome = tempDir(t, "bridge-config-override-")
+  const engineConfig = path.join(configHome, "manage-agents")
+  fs.mkdirSync(engineConfig, { recursive: true })
+  fs.writeFileSync(path.join(engineConfig, "overrides.json"), JSON.stringify({
+    version: 1,
+    default: {
+      lib: { config: {
+        "mcp.servers": {
+          shared: { disabled: true },
+          "lib-only": { command: ["lib-only", "--standalone"] },
+        },
+      } },
+    },
+    targets: {},
+  }))
+  const packScopedEnv = { ...process.env, XDG_CONFIG_HOME: configHome }
+
+  const workspace = prepareBridgeWorkspace(catalog, "app", packScopedEnv)
+  t.after(workspace.cleanup)
+
+  const merged = JSON.parse(fs.readFileSync(path.join(workspace.root, "opencode.json"), "utf8"))
+  assert.deepEqual(merged.mcp.servers.shared, { type: "local", command: ["lib-mcp"], disabled: true }, "pack entry deep-merged with the override")
+  assert.deepEqual(merged.mcp.servers["lib-only"], { type: "local", command: ["lib-only", "--standalone"] }, "command replaced")
+})
+
+test("prepareBridgeWorkspace applies target-scope overrides of the default OpenCode target (what `override config-set` writes without --global)", (t) => {
+  const catalog = writeCatalog(t)
+  const configHome = tempDir(t, "bridge-config-override-target-")
+  const engineConfig = path.join(configHome, "manage-agents")
+  fs.mkdirSync(engineConfig, { recursive: true })
+  fs.writeFileSync(path.join(engineConfig, "overrides.json"), JSON.stringify({
+    version: 1,
+    default: {},
+    targets: {
+      // The scope key `override config-set` uses: the realpath-resolved default OpenCode target ($XDG_CONFIG_HOME/opencode).
+      [realpathThroughExistingAncestor(path.join(configHome, "opencode"))]: {
+        lib: { config: { "mcp.servers": { "lib-only": { disabled: true } } } },
+      },
+    },
+  }))
+  const packScopedEnv = { ...process.env, XDG_CONFIG_HOME: configHome }
+
+  const workspace = prepareBridgeWorkspace(catalog, "app", packScopedEnv)
+  t.after(workspace.cleanup)
+
+  const merged = JSON.parse(fs.readFileSync(path.join(workspace.root, "opencode.json"), "utf8"))
+  assert.deepEqual(merged.mcp.servers["lib-only"], { type: "local", command: ["lib-only"], disabled: true }, "target-scope override reaches the bridge")
+})
+
+test("TUI sequence: the MCP toggle (`saveConfigOverride`) is what an exported bridge sees", (t) => {
+  const catalog = writeCatalog(t, {
+    "packs/demo/opencode-pack.json": manifest("demo"),
+    "packs/demo/opencode.json": JSON.stringify({ mcp: { servers: { cupertino: { type: "local", command: ["cupertino-mcp"], disabled: true } } } }),
+    "packs/demo/agents/demo-helper.md": agent("Demo helper"),
+  })
+  const configHome = tempDir(t, "tui-toggle-")
+  const env = { ...process.env, XDG_CONFIG_HOME: configHome }
+  const outputDir = path.join(catalog, "bridges", "claude-code", "demo-plugin")
+  const bridge = () => bridgePack({ workspaceRoot: catalog, pack: "demo", target: "claude", outputDir, config, pluginName: "demo-plugin", prefix: "demo-", trusted: true, env })
+
+  // Before any toggle: the shipped `disabled` server is not required by any agent, so the export omits it.
+  bridge()
+  assert.equal(fs.existsSync(path.join(outputDir, ".mcp.json")), false, "a disabled, unrequired server produces no .mcp.json")
+
+  // The TUI's `togglePackMcpServer` resolves and writes exactly this target scope (App.tsx).
+  const target = realpathThroughExistingAncestor(path.resolve(defaultTarget(env)))
+  saveConfigOverride("demo", "mcp.servers", "cupertino", { command: ["cupertino-mcp", "standalone"], disabled: null }, { target, env })
+
+  bridge()
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(path.join(outputDir, ".mcp.json"), "utf8")).mcpServers,
+    { cupertino: { command: "cupertino-mcp", args: ["standalone"] } },
+    "the TUI-written override (with its own command, disabled removed) reaches the re-exported bridge",
+  )
 })
 
 test("prepareBridgeWorkspace returns only the requested pack's agents, parsed from the temp tree", (t) => {
@@ -240,4 +321,25 @@ test("bridgePack refuses an output inside the catalog reached through a symlink"
 
   assert.throws(() => bridgePack({ workspaceRoot: catalog, pack: "app", target: "claude", config, pluginName: "app-plugin", prefix: "app-", outputDir: path.join(catalog, "bridges", "claude-code", "app-plugin") }), /goes through the symlink/)
   assert.deepEqual(fs.readdirSync(outside), [])
+})
+
+test("nested agent identities, custom tools and the declared primary survive both bridges", t => {
+  const catalog = writeCatalog(t, {
+    "collection/team/opencode-pack.json": manifest("editorial"),
+    "collection/team/agents/desk.md": "---\ndescription: Desk editor\nmode: primary\n---\nDelegate to @news/review and use `edition_proof`.\n",
+    "collection/team/agents/news/review.md": agent("News review"),
+    "collection/team/agents/books/review.md": agent("Book review"),
+    "collection/team/tools/editorial/edition_proof.mjs": "export default {}\n",
+  })
+  for (const target of ["claude", "codex"] as const) {
+    const outputDir = path.join(catalog, "bridges", target, "press")
+    const result = bridgePack({ workspaceRoot: catalog, pack: "editorial", target, outputDir, config, pluginName: "press", prefix: "", trusted: true })
+    const agentsDir = target === "claude" ? path.join(outputDir, "agents") : path.join(outputDir, ".codex", "agents")
+    const ext = target === "claude" ? ".md" : ".toml"
+    for (const name of ["news-review", "books-review"]) assert.ok(fs.existsSync(path.join(agentsDir, name + ext)), name)
+    const desk = fs.readFileSync(path.join(agentsDir, "desk" + ext), "utf8")
+    assert.ok(desk.includes(target === "claude" ? "@press:news-review" : "@news-review"))
+    assert.ok(desk.includes("**not available** in this environment: `edition_proof`"))
+    assert.equal("plugin" in result ? result.plugin.orchestratorName : result.orchestratorName, "desk")
+  }
 })

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import type { ChangeResult, PlannedWrite, ReconcilePlan } from "./installer.js"
-import { describeChangeResult, formatLockChange } from "./changeReport.js"
+import { changeToast, describeChangeResult, formatLockChange } from "./changeReport.js"
 
 function plan(overrides: Partial<ReconcilePlan> = {}): ReconcilePlan {
   return {
@@ -110,4 +110,43 @@ test("pack-controlled text is stripped of terminal escapes and control character
   assert.ok(failed.includes("ERROR: badclickrednext"))
   assert.ok(failed.includes("Done: tarclickrednextget is up to date. Replaced content was saved; undo with `manage-agents restore id`."))
   assert.equal(formatLockChange({ name: "plain", kind: "removed", from: "local@1.0.0" }), "  removed plain local@1.0.0")
+})
+
+test("a declined change is toasted as not applied, never as success", () => {
+  const toast = changeToast("/target", result({ status: "declined" }))
+
+  assert.ok(toast.startsWith("✗ "), toast)
+  assert.ok(toast.includes("Not confirmed: nothing was written."), toast)
+  assert.ok(!toast.startsWith("✓"), toast)
+})
+
+test("an unchanged or applied change is toasted as success", () => {
+  const unchanged = changeToast("/target", result({ status: "unchanged" }))
+  const applied = changeToast("/target", result({ status: "applied", changes: [{ name: "demo", kind: "upgrade", from: "local@1.0.0", to: "local@1.1.0" }], plan: plan() }))
+
+  assert.ok(unchanged.startsWith("✓ "), unchanged)
+  assert.ok(unchanged.includes("already up to date"), unchanged)
+  assert.ok(applied.startsWith("✓ "), applied)
+  assert.ok(applied.includes("is up to date"), applied)
+  assert.ok(!applied.includes("Packs:"), applied)
+})
+
+test("a failed change is toasted with its first error and a dry run is not success", () => {
+  const failed = changeToast("/target", result({
+    status: "failed",
+    change: { desired: {} as any, lock: {} as any, problems: ["demo requires ghost"] }
+  }))
+  const dryRun = changeToast("/target", result({ status: "dry-run" }))
+  const withChanges = changeToast("/target", result({
+    status: "failed",
+    changes: [{ name: "demo", kind: "upgrade", from: "local@1.0.0", to: "local@1.1.0" }],
+    plan: plan({ conflicts: ["conflict"] })
+  }))
+
+  assert.ok(failed.startsWith("✗ "), failed)
+  assert.ok(failed.includes("ERROR: demo requires ghost"), failed)
+  assert.ok(dryRun.startsWith("✗ "), dryRun)
+  assert.ok(withChanges.startsWith("✗ "), withChanges)
+  assert.ok(withChanges.includes("ERROR: conflict"), withChanges)
+  assert.ok(!withChanges.includes("Packs:"), withChanges)
 })

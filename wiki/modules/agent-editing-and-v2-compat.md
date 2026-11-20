@@ -51,9 +51,9 @@ graph LR
 
 `findAgentFiles(workspaceRoot, sourceDir?, options?)` locates agent `.md` files without ever following symbolic links:
 
-1. **Source root resolution**: When `sourceDir` is omitted, `resolveSourceSubdir(workspaceRoot)` returns `"."` if [`opencode-pack.json`](../api/pack-contract-reference.md) exists at the workspace root, `"packs"` if a `packs/` directory exists, or `"."` otherwise. Both `isWorkspaceRelativePath` and `isPathInsideWorkspace` guard against directory traversal.
-2. **Symlink-safe walk**: Recursively traverses directories while skipping `IGNORED_DIRS` (`node_modules`, `.git`, `.opencode`, `agent-manager`, `backups`, `dist`, `build`). Every entry is inspected with `fs.lstatSync`; [symbolic links are never traversed or read](../concepts/security-and-trust-model.md). Links found inside an active agent container, and links reported by the virtual-pack loose-agent scan, are included in `(agents as AgentList).warnings`.
-3. **V1 and V2 container directories**: Any non-root directory named `agents`, `agent`, `mode`, or `modes` activates Markdown discovery for its subtree. Agents found under `mode/` or `modes/` default to `frontmatter.mode = "primary"` when `mode` is absent or otherwise falsy. If the workspace is a [virtual pack root](./pack-validation-and-virtual-packs.md) (`isVirtualPackRoot`), `scanLooseAgentFiles()` supplements the walk with loose agent definitions.
+1. With no explicit `sourceDir`, discovery starts at the workspace root and visits outermost pack manifests up to four levels deep. The pack name comes from the manifest.
+2. Each pack contributes Markdown from its `agents/`, `agent/`, `mode/`, and `modes/` directories. Legacy modes default to primary. The Catalog also lists packs with zero agents.
+3. Manifest-free workspaces use the virtual-pack scanner. Both discovery paths skip symbolic links.
 4. **Category assignment**: Each `AgentInfo.category` resolves to the enclosing pack name via `packNameOf(filePath, workspaceRoot)` (nearest `opencode-pack.json`), falling back to `computeCategories(filenames)`, which picks the longest hyphen-delimited prefix shared by two or more agent filenames (or `"general"`).
 
 ### Frontmatter Parsing & Delegation Graph Extraction

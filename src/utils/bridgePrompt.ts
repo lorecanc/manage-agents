@@ -1,4 +1,4 @@
-import type { AgentInfo } from "./agents.js"
+import { agentId, type AgentInfo } from "./agents.js"
 import { clampListScroll } from "./layout.js"
 import { terminalSafeText } from "./terminalText.js"
 import {
@@ -319,7 +319,7 @@ export function buildPackBridgePreview(
 
   const items: BridgeAgentMappingItem[] = packAgents.map(agent => {
     const resolved = resolveModelTarget(agent, index, draftConfig, target)
-    const stem = agent.filename.replace(/\.md$/i, "")
+    const stem = agentId(agent)
     const strippedName = prefix && stem.startsWith(prefix) ? stem.slice(prefix.length) : stem
     tierCounts[resolved.tier] = (tierCounts[resolved.tier] ?? 0) + 1
     return {

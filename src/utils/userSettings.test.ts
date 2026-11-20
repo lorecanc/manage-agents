@@ -7,8 +7,10 @@ import { tempDir, writePack } from "../../test/helpers.js"
 import { changeTarget, installChange, reconcileChange, uninstallChange, type ChangeOptions } from "./installer.js"
 import { addSource, type SourceRegistry } from "./sources.js"
 import {
-  buildRuntimeRouting, effectiveOverrides, loadOverrideSettings, loadRoutingSettings, patchFrontmatter, saveOverrideSettings, saveRoutingSettings,
-  scopeOf, setOverride, setPackCallers, setPackRules, setRoutes, unsetOverride, unsetRoutes,
+  buildRuntimeRouting, effectiveOverrides, loadOverrideSettings, loadRoutingSettings, patchFrontmatter, patchedConfigSections, removeConfigEntry,
+  saveOverrideSettings, saveRoutingSettings,
+  scopeOf, setConfigOverride, setOverride, setPackCallers, setPackRules, setRoutes, unsetConfigOverride, unsetOverride, unsetRoutes,
+  type ConfigSection,
 } from "./userSettings.js"
 
 const FLOW = {
@@ -42,6 +44,81 @@ test("patchFrontmatter sets and removes fields and keeps the body byte for byte"
   assert.equal(patchFrontmatter("---\nmode: subagent\nmodel: a/b\n---\n\nbody  \n", { model: null, steps: 30 }), "---\nmode: subagent\nsteps: 30\n---\n\nbody  \n")
   assert.equal(patchFrontmatter("no frontmatter\n", { hidden: true }), "---\nhidden: true\n---\nno frontmatter\n")
   assert.equal(patchFrontmatter("---\nmodel: a/b\n---\nx", { model: null }), "x")
+})
+
+test("patchedConfigSections: merge, nested null, entry null, creation and mcp schema", () => {
+  const config = {
+    mcp: { servers: { db: { type: "local", command: ["db-mcp"], environment: { OLD: "1" } } } },
+    lsp: { md: { command: ["marksman"] } },
+  }
+  const merged = patchedConfigSections(config, {
+    "mcp.servers": { db: { disabled: true, command: ["mine"], environment: { NEW: "2" } } },
+    lsp: { md: { disabled: true } },
+  }, "base")
+  assert.deepEqual(merged["mcp.servers"].db, { type: "local", command: ["mine"], disabled: true, environment: { OLD: "1", NEW: "2" } })
+  assert.deepEqual(merged.lsp.md, { command: ["marksman"], disabled: true })
+  assert.equal(merged.formatter, undefined, "empty sections are not contributed")
+
+  // The pack file is never touched: sections are clones of the parsed config.
+  assert.deepEqual(config.mcp.servers.db, { type: "local", command: ["db-mcp"], environment: { OLD: "1" } })
+
+  // A null field removes a nested field; an entry null removes the entry from the contribution.
+  assert.deepEqual(
+    patchedConfigSections(config, { "mcp.servers": { db: { environment: { OLD: null }, disabled: null } } }, "base")["mcp.servers"].db,
+    { type: "local", command: ["db-mcp"] },
+  )
+  assert.deepEqual(patchedConfigSections(config, { "mcp.servers": { db: null } }, "base")["mcp.servers"] ?? {}, {})
+
+  // A patch on a key the pack does not have creates the entry.
+  assert.deepEqual(
+    patchedConfigSections(config, { "mcp.servers": { fresh: { type: "remote", url: "https://x" } } }, "base")["mcp.servers"].fresh,
+    { type: "remote", url: "https://x" },
+  )
+
+  // What survives a patch must still be a usable MCP server.
+  assert.throws(() => patchedConfigSections(config, { "mcp.servers": { db: { type: null } } }, "base"), /needs "type": "local" or "remote" after the override/)
+  assert.throws(() => patchedConfigSections(config, { "mcp.servers": { db: { command: null } } }, "base"), /needs "command"/)
+})
+
+test("config overrides: validation, layering, edit helpers and persistence", (t) => {
+  const { env, target } = setup(t)
+  const overrides = loadOverrideSettings(env)
+  setConfigOverride(scopeOf(overrides, null), "flow", "mcp.servers", "docs", { disabled: true })
+  assert.throws(() => setConfigOverride(scopeOf(overrides, null), "flow", "mcp.servers", "docs", { type: "weird" }), /must be "local" or "remote"/)
+  assert.throws(() => setConfigOverride(scopeOf(overrides, null), "flow", "mcp.servers", "docs\x01", {}), /control characters/)
+  assert.throws(() => setConfigOverride(scopeOf(overrides, null), "flow", "agents" as unknown as ConfigSection, "x", { a: 1 }), /unknown section/)
+  assert.throws(() => setConfigOverride(scopeOf(overrides, null), "flow", "mcp.servers", "empty-fresh", {}), /give at least one/)
+  setConfigOverride(scopeOf(overrides, target), "flow", "lsp", "md", { command: ["marksman", "--stdio"] })
+
+  // Target fields win over default fields; null is kept (it removes the field from the pack's entry).
+  const eff = effectiveOverrides(overrides, target, "flow")
+  assert.deepEqual(eff.config["mcp.servers"]!.docs, { disabled: true }, "the target scope carries no docs override of its own yet")
+  setConfigOverride(scopeOf(overrides, target), "flow", "mcp.servers", "docs", { disabled: null })
+  assert.deepEqual(effectiveOverrides(overrides, target, "flow").config["mcp.servers"]!.docs, { disabled: null })
+
+  saveOverrideSettings(overrides, env)
+  const roundTripped = loadOverrideSettings(env)
+  assert.deepEqual(roundTripped.default.flow.config!["mcp.servers"]!.docs, { disabled: true })
+  assert.deepEqual(roundTripped.targets[target].flow.config!["mcp.servers"]!.docs, { disabled: null })
+  assert.deepEqual(effectiveOverrides(roundTripped, target, "flow").config.lsp!.md, { command: ["marksman", "--stdio"] })
+
+  // Entry removal is `null` at the key; config-unset clears it again.
+  removeConfigEntry(scopeOf(overrides, target), "flow", "mcp.servers", "docs")
+  assert.equal(effectiveOverrides(overrides, target, "flow").config["mcp.servers"]!.docs, null)
+  assert.equal(unsetConfigOverride(scopeOf(overrides, target), "flow", "mcp.servers", "docs", []), true)
+  assert.equal(unsetConfigOverride(scopeOf(overrides, target), "flow", "mcp.servers", "docs", []), false)
+  assert.equal(unsetConfigOverride(scopeOf(overrides, null), "flow", "mcp.servers", "docs", []), true, "clear the default-scope override too")
+  assert.equal(effectiveOverrides(overrides, target, "flow").config["mcp.servers"]?.docs, undefined)
+
+  // Dotted field paths drop nested fields only.
+  setConfigOverride(scopeOf(overrides, target), "flow", "mcp.servers", "docs", { environment: { A: "1", B: "2" } })
+  assert.equal(unsetConfigOverride(scopeOf(overrides, target), "flow", "mcp.servers", "docs", ["environment.A"]), true)
+  assert.deepEqual(effectiveOverrides(overrides, target, "flow").config["mcp.servers"]!.docs, { environment: { B: "2" } })
+
+  fs.writeFileSync(path.join(env.XDG_CONFIG_HOME, "manage-agents", "overrides.json"), JSON.stringify({ version: 1, default: { flow: { config: { nonsense: {} } } }, targets: {} }))
+  assert.throws(() => loadOverrideSettings(env), /unknown section/)
+  fs.writeFileSync(path.join(env.XDG_CONFIG_HOME, "manage-agents", "overrides.json"), JSON.stringify({ version: 1, default: { flow: { config: { "mcp.servers": { x: 3 } } } }, targets: {} }))
+  assert.throws(() => loadOverrideSettings(env), /must be an object or null/)
 })
 
 test("settings: validation, scopes, effective merge and edits", (t) => {

@@ -1,5 +1,5 @@
 import React from "react"
-import type { AgentInfo } from "../utils/agents.js"
+import { agentId, type AgentInfo } from "../utils/agents.js"
 import { callersLabel, INHERIT, type ArchetypeAgent, type PackFlowsView, type UnifiedFlowItem } from "../utils/archetypes.js"
 import { clampListScroll } from "../utils/layout.js"
 import { displayWidth, middleEllipsis, terminalSafeText } from "../utils/terminalText.js"
@@ -123,12 +123,12 @@ export function buildFlowsNavRows(
 ): FlowsNavData {
   const agentByShortName = new Map<string, AgentInfo>()
   for (const agent of agents) {
-    agentByShortName.set(agent.filename.replace(/\.md$/, ""), agent)
+    agentByShortName.set(agentId(agent), agent)
   }
 
   const inboundByAgentName = new Map<string, string[]>()
   for (const agent of agents) {
-    const callerName = agent.filename.replace(/\.md$/, "")
+    const callerName = agentId(agent)
     for (const target of agent.allowedSubagents ?? []) {
       const list = inboundByAgentName.get(target) ?? []
       if (!list.includes(callerName)) list.push(callerName)
@@ -165,7 +165,7 @@ export function buildFlowsNavRows(
     })
 
     for (const ag of [...packAgents].sort((a, b) => a.filename.localeCompare(b.filename))) {
-      const shortName = ag.filename.replace(/\.md$/, "")
+      const shortName = agentId(ag)
       const outbound = ag.allowedSubagents ?? []
       const deadRefCount = outbound.filter(sub => !agentByShortName.has(sub)).length
       const inbound = inboundByAgentName.get(shortName) ?? []
@@ -536,7 +536,7 @@ export function FlowsWorkspace({
                   >
                     <box height={1} flexShrink={0} flexDirection="row" justifyContent="space-between" width="100%">
                       <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: THEME.accentBlue }} b>
-                        {middleEllipsis(`◉ @${terminalSafeText(activeAgent.filename.replace(/\.md$/, ""))}`, Math.max(14, rightInner - 18))}
+                        {middleEllipsis(`◉ @${terminalSafeText(agentId(activeAgent))}`, Math.max(14, rightInner - 18))}
                       </text>
                       <text
                         height={1}
@@ -553,7 +553,7 @@ export function FlowsWorkspace({
                     </box>
 
                     {(() => {
-                      const shortName = activeAgent.filename.replace(/\.md$/, "")
+                      const shortName = agentId(activeAgent)
                       const inbound = inboundByAgentName.get(shortName) ?? []
                       return (
                         <box flexDirection="column" overflow="hidden">

@@ -6,11 +6,11 @@ import { escapeRegExp, extractFrontmatter, normalizeAgentBody } from "./agents.j
 import type { AgentInfo } from "./agents.js"
 import { buildInferenceIndex, DEFAULT_TRANSLATION_CONFIG, resolveMarketplaceName, resolveModelTarget, authorName, unusedModelMapKeys, validateMarketplaceName } from "./translationConfig.js"
 import type { TranslationConfig } from "./translationConfig.js"
-import { isTestFile } from "./packs.js"
+import { toolModuleName, toolModulePaths } from "./packs.js"
 import { assertInsideRealWorkspace, realpathThroughExistingAncestor } from "./pathValidation.js"
 import { isKnownPermissionKey, translatePermissionsV2ToV1 } from "./v2Compat.js"
 import { isServerDisabled, readMcpServers } from "./opencodeMcp.js"
-import { adaptToolReferences, collectBashAllowlist, isOpenCodeCustomToolKey, renderBashAllowlistSection, type BashAllowlist } from "./bridgeToolReferences.js"
+import { adaptToolReferences, legacyAgentAlias, collectBashAllowlist, isOpenCodeCustomToolKey, renderBashAllowlistSection, type BashAllowlist } from "./bridgeToolReferences.js"
 
 type ResolvedModelTarget = ReturnType<typeof resolveModelTarget>
 type ResolvedTargets = Map<string, ResolvedModelTarget>
@@ -38,8 +38,8 @@ function promotesAsk(value: unknown): boolean {
  * an MCP server (`<server>_<tool>`), so it cannot fabricate a server for a
  * built-in key.
  */
-function isMcpPermissionKey(key: string): boolean {
-  return key.includes("_") && !isKnownPermissionKey(key) && !isOpenCodeCustomToolKey(key)
+function isMcpPermissionKey(key: string, customTools: ReadonlySet<string>): boolean {
+  return key.includes("_") && !isKnownPermissionKey(key) && !isOpenCodeCustomToolKey(key, customTools)
 }
 
 const markdownCode = (value: string) => {
@@ -140,7 +140,7 @@ function stripPrefix(filename: string, prefix: string): string {
 type AgentNameMap = Map<string, string>
 
 function baseAgentName(filename: string, prefix: string): string {
-  return stripPrefix(path.basename(filename), prefix).replace(/\.md$/i, "")
+  return stripPrefix(filename, prefix).replace(/\.md$/i, "")
 }
 
 function addNameAlias(nameMap: AgentNameMap, alias: string, canonical: string) {
@@ -159,7 +159,7 @@ function buildAgentNameMap(agents: AgentInfo[], prefix: string): {
   const warnings: string[] = []
 
   for (const agent of agents) {
-    const full = path.basename(agent.filename).replace(/\.md$/i, "")
+    const full = agent.filename.replace(/\.md$/i, "")
     const stripped = baseAgentName(agent.filename, prefix)
     const baseCanonical = normalizeClaudeAgentName(stripped)
     let canonical = baseCanonical
@@ -198,18 +198,7 @@ function resolveAgentAlias(rawName: string, prefix: string, names: AgentNameMap)
     if (resolved) return resolved
   }
 
-  // A few legacy pipeline prompts used role words in the middle of an agent
-  // name (for example `docs-orchestrator_grounding` while the file is
-  // `docs_grounding`). Treat those as compatibility aliases, but only when
-  // the resulting name maps to exactly one generated agent.
-  const compatibility = normalizeClaudeAgentName(stripPrefix(value, prefix))
-    .replace(/(^|-)orchestrator(?=-|$)/g, "$1")
-    .replace(/(^|-)agent(?=-|$)/g, "$1")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "")
-  const compatibilityResolved = names.get(compatibility)
-  if (compatibilityResolved) return compatibilityResolved
-  return null
+  return legacyAgentAlias(normalizeClaudeAgentName(stripPrefix(value, prefix)), names) ?? null
 }
 
 /**
@@ -250,11 +239,11 @@ function isGlobalPermissionDeny(perms: Record<string, any>): boolean {
 }
 
 /** Servers carrying a whole-server (`${server}_*`) deny. */
-function serverScopedDeniedServers(frontmatters: Array<Record<string, any>>): Set<string> {
+function serverScopedDeniedServers(frontmatters: Array<Record<string, any>>, customTools: ReadonlySet<string>): Set<string> {
   const denied = new Set<string>()
   for (const frontmatter of frontmatters) {
     for (const [key, value] of Object.entries(normalizedPermissions(frontmatter))) {
-      if (!isMcpPermissionKey(key) || (value !== "deny" && value !== false)) continue
+      if (!isMcpPermissionKey(key, customTools) || (value !== "deny" && value !== false)) continue
       const server = key.replace(/_.*$/, "")
       if (server && key === `${server}_*`) denied.add(server)
     }
@@ -273,7 +262,8 @@ function buildToolsString(
   warnings?: string[],
   pluginName?: string,
   requiredMcpServers: string[] = [],
-  availableMcpServers?: ReadonlySet<string>
+  availableMcpServers?: ReadonlySet<string>,
+  customTools: ReadonlySet<string> = new Set()
 ): string {
   const tools: string[] = []
   const perms = normalizedPermissions(frontmatter)
@@ -359,7 +349,7 @@ function buildToolsString(
   const deniedServers = new Set<string>()
   const allowedServers = new Set<string>()
   for (const [key, value] of Object.entries(perms)) {
-    if (!isMcpPermissionKey(key)) continue
+    if (!isMcpPermissionKey(key, customTools)) continue
     const server = key.replace(/_.*$/, "")
     if (!server) continue
     const wholeServer = key === `${server}_*`
@@ -409,13 +399,13 @@ function buildToolsString(
 /**
  * Collect warnings about features that don't map cleanly to Claude Code.
  */
-function collectWarnings(frontmatter: Record<string, any>, enabledMcpServers?: Set<string>): string[] {
+function collectWarnings(frontmatter: Record<string, any>, enabledMcpServers: Set<string>, customTools: ReadonlySet<string>): string[] {
   const warnings: string[] = []
   const perms = normalizedPermissions(frontmatter)
 
   if (enabledMcpServers) {
     for (const key of Object.keys(perms)) {
-      if (!isMcpPermissionKey(key)) continue
+      if (!isMcpPermissionKey(key, customTools)) continue
       const server = key.replace(/_.*$/, "")
       if (!enabledMcpServers.has(server)) {
         warnings.push(`MCP server '${server}' is not enabled in the generated Claude .mcp.json`)
@@ -448,7 +438,7 @@ function collectWarnings(frontmatter: Record<string, any>, enabledMcpServers?: S
     const grantsSomething = value === "allow" || value === true ||
       (typeof value === "object" && value !== null && !Array.isArray(value))
     const droppedBuiltin = grantsSomething &&
-      (DROPPED_PERMISSION_KEYS.includes(key) || isOpenCodeCustomToolKey(key))
+      (DROPPED_PERMISSION_KEYS.includes(key) || isOpenCodeCustomToolKey(key, customTools))
     const droppedCustomTool = grantsSomething && !isKnownPermissionKey(key) && !key.includes("_")
     if (droppedBuiltin || droppedCustomTool) {
       warnings.push(`permission '${key}' is not representable in Claude Code plugin agents; dropped`)
@@ -498,7 +488,7 @@ function rewriteBodyReferences(
   }
 
   const unresolved = new Set<string>()
-  const regex = /@([A-Za-z0-9][A-Za-z0-9_-]*)(?::[A-Za-z0-9][A-Za-z0-9_-]*)?/g
+  const regex = /@([A-Za-z0-9][A-Za-z0-9_-]*(?:\/[A-Za-z0-9_-]+)*)(?::[A-Za-z0-9][A-Za-z0-9_-]*)?/g
   const rewritten = body.replace(regex, (whole, token: string) => {
     // Scoped references are already canonical and must remain idempotent.
     if (whole.includes(":")) return whole
@@ -520,12 +510,12 @@ function rewriteBodyReferences(
 /**
  * Append MCP notes to the body if there are MCP tool permissions.
  */
-function permissionMcpServers(frontmatter: Record<string, any>): string[] {
+function permissionMcpServers(frontmatter: Record<string, any>, customTools: ReadonlySet<string>): string[] {
   const perms = normalizedPermissions(frontmatter)
   const servers: string[] = []
 
   for (const [key, value] of Object.entries(perms)) {
-    if (isMcpPermissionKey(key) && (value === "allow" || value === true)) {
+    if (isMcpPermissionKey(key, customTools) && (value === "allow" || value === true)) {
       servers.push(key.replace(/_.*$/, ""))
     }
   }
@@ -533,8 +523,8 @@ function permissionMcpServers(frontmatter: Record<string, any>): string[] {
   return [...new Set(servers)]
 }
 
-function requiredMcpServersForAgent(agent: AgentInfo, knownMcpServers: Set<string>): string[] {
-  const required = new Set(permissionMcpServers(agent.frontmatter))
+function requiredMcpServersForAgent(agent: AgentInfo, knownMcpServers: Set<string>, customTools: ReadonlySet<string>): string[] {
+  const required = new Set(permissionMcpServers(agent.frontmatter, customTools))
   if (isGlobalPermissionDeny(normalizedPermissions(agent.frontmatter))) return [...required]
   const searchable = `${agent.description}\n${agent.body}`.toLowerCase()
   for (const server of knownMcpServers) {
@@ -728,7 +718,6 @@ interface OpenCodeCompanions {
   skills: string[]
 }
 
-const TOOL_CODE_RE = /\.(?:ts|mts|cts|js|mjs|cjs)$/
 
 function resolveCompanionSourcePath(workspaceRoot: string, relative: string): string | null {
   const candidate = path.join(workspaceRoot, relative)
@@ -765,7 +754,7 @@ function listEntries(
 function scanOpenCodeCompanions(workspaceRoot: string): OpenCodeCompanions {
   return {
     plugins: listEntries(workspaceRoot, "plugins", entry => entry.isDirectory()),
-    tools: listEntries(workspaceRoot, "tools", entry => !entry.isDirectory() && TOOL_CODE_RE.test(entry.name) && !entry.name.startsWith("_") && !isTestFile(entry.name), true),
+    tools: toolModulePaths(workspaceRoot),
     commands: listEntries(workspaceRoot, "commands", entry => !entry.isDirectory() && entry.name.endsWith(".md"), true),
     skills: listEntries(workspaceRoot, "skills", (entry, relative) => entry.isDirectory() && fs.existsSync(path.join(workspaceRoot, relative, "SKILL.md")))
   }
@@ -838,7 +827,7 @@ function rewriteCommandBody(
     })
     .replace(/\$ARGUMENTS/g, () => "$request")
   // Sibling command names are only resolvable in Claude Code with the plugin scope.
-  const scopedNames = [...commandNames].filter(name => name.startsWith("pipeline-")).sort((a, b) => b.length - a.length)
+  const scopedNames = [...commandNames].sort((a, b) => b.length - a.length)
   const scoped = scopedNames.length === 0
     ? rewritten
     : rewritten.replace(
@@ -953,7 +942,8 @@ export function convertAgent(
   pluginName?: string,
   knownMcpServers: Set<string> = new Set(),
   agents: AgentInfo[] = [agent],
-  resolvedTargets: ReadonlyMap<string, ResolvedModelTarget> = new Map()
+  resolvedTargets: ReadonlyMap<string, ResolvedModelTarget> = new Map(),
+  customTools: ReadonlySet<string> = new Set()
 ): ClaudeCodeAgent {
   const strippedFilename = stripPrefix(agent.filename, prefix)
   const name = names?.get(strippedFilename.replace(/\.md$/i, "").toLowerCase())
@@ -982,7 +972,7 @@ export function convertAgent(
   }
 
   // tools
-  const requiredMcpServers = requiredMcpServersForAgent(agent, knownMcpServers)
+  const requiredMcpServers = requiredMcpServersForAgent(agent, knownMcpServers, customTools)
   const toolsStr = buildToolsString(
     agent.frontmatter,
     agent.allowedSubagents,
@@ -991,7 +981,8 @@ export function convertAgent(
     warnings,
     pluginName,
     requiredMcpServers,
-    knownMcpServers.size > 0 ? knownMcpServers : undefined
+    knownMcpServers.size > 0 ? knownMcpServers : undefined,
+    customTools,
   )
   newFm.tools = toolsStr || []
 
@@ -1005,6 +996,7 @@ export function convertAgent(
 
   // Translate OpenCode tool names and flag OpenCode-only tools near the top.
   body = adaptToolReferences(body, "claude", agent.frontmatter, {
+    customTools,
     mcpServers: requiredMcpServers.filter(server => body.includes(`${server}_`))
   }).body
 
@@ -1029,11 +1021,14 @@ export function buildClaudeCodePlugin(
   prefix: string,
   config: TranslationConfig = DEFAULT_TRANSLATION_CONFIG,
   knownMcpServers: Set<string> = new Set(),
-  resolvedTargets: ReadonlyMap<string, ResolvedModelTarget> = resolveTargets(agents, config, "claude")
+  resolvedTargets?: ReadonlyMap<string, ResolvedModelTarget>,
+  customTools: ReadonlySet<string> = new Set()
 ): ClaudeCodePlugin {
   const safePluginName = normalizeAndValidateClaudePluginName(pluginName)
+  config = { ...config, prefix }
+  resolvedTargets ??= resolveTargets(agents, config, "claude")
   const { names, warnings } = buildAgentNameMap(agents, prefix)
-  const converted = agents.map(a => convertAgent(a, prefix, config, names, safePluginName, knownMcpServers, agents, resolvedTargets))
+  const converted = agents.map(a => convertAgent(a, prefix, config, names, safePluginName, knownMcpServers, agents, resolvedTargets, customTools))
   for (const agent of converted) {
     if (agent.warnings) {
       warnings.push(...agent.warnings.map(w => `[${agent.name}] ${w}`))
@@ -1044,7 +1039,7 @@ export function buildClaudeCodePlugin(
   for (const agent of agents) {
     const generatedName = names.get(baseAgentName(agent.filename, prefix).toLowerCase())
       || normalizeClaudeAgentName(baseAgentName(agent.filename, prefix))
-    for (const server of requiredMcpServersForAgent(agent, knownMcpServers)) {
+    for (const server of requiredMcpServersForAgent(agent, knownMcpServers, customTools)) {
       if (!mcpRequirements[server]) mcpRequirements[server] = []
       mcpRequirements[server].push(generatedName)
     }
@@ -1292,7 +1287,7 @@ export function writeClaudeCodePlugin(
     "- `.lsp.json` mirrors enabled OpenCode LSP declarations.",
     "- `.lsp.json` documents the project LSP setup and is not read by `claude plugin validate`.",
     "- Agent-to-agent references are rewritten to Claude's canonical lowercase-hyphen names.",
-    "- OpenCode tool names in prompts are translated (`todowrite` → `TodoWrite`, `question` → `AskUserQuestion`, Task tool → `Agent`, ...). Prompts that rely on OpenCode-only tools (`pipeline_*`) start with a runtime note saying they are unavailable here and that the documented fallbacks apply.",
+    "- OpenCode tool names in prompts are translated (`todowrite` → `TodoWrite`, `question` → `AskUserQuestion`, Task tool → `Agent`, ...). Prompts that rely on custom tools shipped by the pack start with a runtime note saying they are unavailable here and that the documented fallbacks apply.",
     "",
     "## Model connection",
     "",
@@ -1359,9 +1354,12 @@ export function bridgeToClaudeCode(
   // agent identifiers. Validate the input first, then normalize harmless
   // underscores/dots instead of emitting a manifest the CLI will reject.
   const safePluginName = normalizeAndValidateClaudePluginName(pluginName)
+  config = { ...config, prefix }
   const resolvedTargets = resolveTargets(agents, config, "claude")
-  const explicitlyRequiredMcpServers = new Set(agents.flatMap(agent => permissionMcpServers(agent.frontmatter)))
-  const serverScopedDenies = serverScopedDeniedServers(agents.map(agent => agent.frontmatter))
+  const companions = scanOpenCodeCompanions(workspaceRoot)
+  const customTools = new Set(companions.tools.map(toolModuleName))
+  const explicitlyRequiredMcpServers = new Set(agents.flatMap(agent => permissionMcpServers(agent.frontmatter, customTools)))
+  const serverScopedDenies = serverScopedDeniedServers(agents.map(agent => agent.frontmatter), customTools)
   const mcpConfig = buildClaudeMcpConfig(workspaceRoot, explicitlyRequiredMcpServers, serverScopedDenies).config
   const availableMcpServers = mcpConfig && typeof mcpConfig.mcpServers === "object"
     ? new Set<string>(Object.keys(mcpConfig.mcpServers))
@@ -1369,12 +1367,11 @@ export function bridgeToClaudeCode(
   // Collect per-agent warnings
   const allWarnings: string[] = []
   for (const agent of agents) {
-    const w = collectWarnings(agent.frontmatter, availableMcpServers)
+    const w = collectWarnings(agent.frontmatter, availableMcpServers, customTools)
     allWarnings.push(...w.map(msg => `[${agent.filename}] ${msg}`))
   }
 
-  const plugin = buildClaudeCodePlugin(agents, safePluginName, prefix, config, availableMcpServers, resolvedTargets)
-  const companions = scanOpenCodeCompanions(workspaceRoot)
+  const plugin = buildClaudeCodePlugin(agents, safePluginName, prefix, config, availableMcpServers, resolvedTargets, customTools)
   for (const file of companions.plugins) {
     allWarnings.push(`OpenCode plugin '${file}' is not transpiled; see the README section 'OpenCode plugins and tools'`)
   }

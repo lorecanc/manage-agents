@@ -23,6 +23,16 @@ export type PackFlowsMode =
 
 export type PackFlowDraftState = FlowDraftInput & { previousKey?: string }
 
+/** One MCP server entry the pack contributes, as the effective (override-patched) contribution sees it. */
+export interface PackMcpServerRow {
+  name: string
+  enabled: boolean
+  overridden: boolean
+}
+
+/** Rows of the pack config screen: a flow branch, the "+ new" card, or an MCP server toggle. */
+type PackConfigRow = UnifiedFlowItem | { mcp: PackMcpServerRow } | null
+
 export const PERMISSION_POLICY_ROWS: ReadonlyArray<{ key: string; label: string }> = [
   { key: "*", label: "* (All permissions fallback)" },
   { key: "shell", label: "shell / bash (command execution)" },
@@ -190,6 +200,8 @@ export interface PackFlowsModalProps {
   callerScroll: number
   flowSubFocus: number
   flowSubScroll: number
+  /** MCP servers the pack contributes (config screen rows, after the +new card). */
+  mcpServers: ReadonlyArray<PackMcpServerRow>
   termWidth: number
   termHeight: number
   onClose: () => void
@@ -214,6 +226,7 @@ export interface PackFlowsModalProps {
   onFocusSubRow: (index: number) => void
   onCycleSubRow: (index: number) => void
   onScrollSubRows: (delta: number) => void
+  onToggleMcpServer: (name: string) => void
 }
 
 export function PackFlowsModal({
@@ -234,6 +247,7 @@ export function PackFlowsModal({
   callerScroll,
   flowSubFocus,
   flowSubScroll,
+  mcpServers,
   termWidth,
   termHeight,
   onClose,
@@ -258,6 +272,7 @@ export function PackFlowsModal({
   onFocusSubRow,
   onCycleSubRow,
   onScrollSubRows,
+  onToggleMcpServer,
 }: PackFlowsModalProps) {
   const blockedAllowTools =
     mode === "routing-editor" && routingDraft && routingView
@@ -932,7 +947,7 @@ export function PackFlowsModal({
           )
         })() : (() => {
           // Mode: routing-configs (Master-Detail with Live Dependency Graph on wide screens, stacked cards on compact)
-          const allFlowItems: Array<UnifiedFlowItem | null> = [...routingView.flows, null]
+          const allFlowItems: PackConfigRow[] = [...routingView.flows, null, ...mcpServers.map(mcp => ({ mcp }))]
           const clampedFocus = Math.max(0, Math.min(allFlowItems.length - 1, routingFocus))
           const safeConfigOffset = clampListScroll(
             clampedFocus,
@@ -941,7 +956,51 @@ export function PackFlowsModal({
             layout.configViewportRows,
           )
           const visibleFlowItems = allFlowItems.slice(safeConfigOffset, safeConfigOffset + layout.configViewportRows)
-          const focusedFlow = allFlowItems[clampedFocus] ?? null
+          const isMcpRow = (row: PackConfigRow | null | undefined): row is { mcp: PackMcpServerRow } => Boolean(row && "mcp" in row)
+          const focusedRow = allFlowItems[clampedFocus] ?? null
+          const focusedFlow: UnifiedFlowItem | null = !isMcpRow(focusedRow) ? (focusedRow as UnifiedFlowItem | null) : null
+          const focusedMcp: PackMcpServerRow | null = isMcpRow(focusedRow) ? focusedRow.mcp : null
+
+          const mcpBadge = (server: PackMcpServerRow) => ({ label: server.enabled ? "ON" : "OFF", fg: server.enabled ? THEME.accentGreen : THEME.accentRed })
+          const renderMcpRow = (server: PackMcpServerRow, index: number, focused: boolean, width: number) => {
+            const badge = mcpBadge(server)
+            const titleBudget = Math.max(10, width - 16)
+            return (
+              <box
+                key={`mcp-${server.name}`}
+                width="100%"
+                height={layout.branchRowHeight}
+                flexShrink={0}
+                flexDirection="column"
+                backgroundColor={focused ? THEME.bgRowFocus : "transparent"}
+                paddingLeft={1}
+                paddingRight={1}
+                onMouseDown={() => {
+                  if (focused) onToggleMcpServer(server.name)
+                  else onFocusBranch(index)
+                }}
+              >
+                <box width="100%" height={1} flexDirection="row" justifyContent="space-between">
+                  <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: focused ? "#ffffff" : THEME.accentCyan }} b>
+                    {middleEllipsis(
+                      `${focused ? "▎" : " "} ⚡ MCP ${terminalSafeText(server.name)}${server.overridden ? " ✎" : ""}`,
+                      titleBudget,
+                    )}
+                  </text>
+                  <box height={1} paddingLeft={1} paddingRight={1} backgroundColor={server.enabled ? THEME.bgSuccessSoft : THEME.bgDangerSoft}>
+                    <text height={1} wrapMode="none" style={{ textColor: badge.fg }} b>
+                      {`[${badge.label}]`}
+                    </text>
+                  </box>
+                </box>
+                {layout.branchRowHeight === 2 && (
+                  <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: focused ? THEME.accentCyan : THEME.fgMuted }}>
+                    {middleEllipsis("   ╰─▶ [ENTER]/[T] toggle · saved in overrides.json", Math.max(12, width - 4))}
+                  </text>
+                )}
+              </box>
+            )
+          }
 
           const callersText = routingView.callers.length > 0
             ? routingView.callers.map(c => `@${c.name}`).join(" ∨ ")
@@ -970,6 +1029,51 @@ export function PackFlowsModal({
 
           const renderRightDependencyGraph = () => {
             const graphInnerRows = Math.max(4, layout.bodyHeight - 2)
+            if (focusedMcp) {
+              const badge = mcpBadge(focusedMcp)
+              return (
+                <box flexDirection="column" width="100%" flexGrow={1} overflow="hidden">
+                  <box width="100%" height={1} flexShrink={0} flexDirection="row" justifyContent="space-between">
+                    <text height={1} wrapMode="none" style={{ textColor: THEME.accentCyan }} b>
+                      {"⚡ MCP SERVER"}
+                    </text>
+                    <box height={1} paddingLeft={1} paddingRight={1} backgroundColor={focusedMcp.enabled ? THEME.bgSuccessSoft : THEME.bgDangerSoft}>
+                      <text height={1} wrapMode="none" style={{ textColor: badge.fg }} b>
+                        {`[${badge.label}]`}
+                      </text>
+                    </box>
+                  </box>
+                  <text height={1} flexShrink={0} wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgPrimary }} b>
+                    {middleEllipsis(`  ${terminalSafeText(focusedMcp.name)}`, rightInner)}
+                  </text>
+                  <text height={1} flexShrink={0} wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgSecondary }} marginTop={1}>
+                    {middleEllipsis(
+                      focusedMcp.enabled
+                        ? "Contributed enabled by this pack's opencode.json."
+                        : "Disabled for this target (the pack still contributes it, with an override).",
+                      rightInner,
+                    )}
+                  </text>
+                  <text height={1} flexShrink={0} wrapMode="none" overflow="hidden" style={{ textColor: focusedMcp.overridden ? THEME.accentPurple : THEME.fgMuted }}>
+                    {middleEllipsis(
+                      focusedMcp.overridden
+                        ? "✎ Patched by your overrides.json → config (mcp.servers)."
+                        : "Pack default; a toggle writes overrides.json → config (mcp.servers).",
+                      rightInner,
+                    )}
+                  </text>
+                  <text height={1} flexShrink={0} wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgSecondary }} marginTop={1}>
+                    {middleEllipsis("[ENTER] / [T] / click: toggle on/off (reconciles the target).", rightInner)}
+                  </text>
+                  <text height={1} flexShrink={0} wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgMuted }}>
+                    {middleEllipsis(
+                      `CLI: override config-set ${terminalSafeText(packName)}/mcp.servers/${terminalSafeText(focusedMcp.name)} ...`,
+                      rightInner,
+                    )}
+                  </text>
+                </box>
+              )
+            }
             if (!focusedFlow) {
               return (
                 <box flexDirection="column" width="100%" flexGrow={1} overflow="hidden">
@@ -1324,7 +1428,7 @@ export function PackFlowsModal({
                         alignItems="center"
                       >
                         <text height={1} wrapMode="none" style={{ textColor: THEME.accentCyan }} b>
-                          {`IF Branches (${routingView.flows.length})`}
+                          {`IF Branches (${routingView.flows.length})${mcpServers.length ? ` + MCP (${mcpServers.length})` : ""}`}
                         </text>
                         <text height={1} wrapMode="none" style={{ textColor: THEME.fgMuted }}>
                           {`${clampedFocus + 1}/${allFlowItems.length}`}
@@ -1335,6 +1439,8 @@ export function PackFlowsModal({
                         {visibleFlowItems.map((flow, idx) => {
                           const index = safeConfigOffset + idx
                           const focused = index === clampedFocus
+
+                          if (isMcpRow(flow)) return renderMcpRow(flow.mcp, index, focused, leftInner)
 
                           if (!flow) {
                             return (
@@ -1460,6 +1566,7 @@ export function PackFlowsModal({
                     {visibleFlowItems.map((flow, idx) => {
                       const index = safeConfigOffset + idx
                       const focused = index === clampedFocus
+                      if (isMcpRow(flow)) return renderMcpRow(flow.mcp, index, focused, innerWidth)
                       if (!flow) {
                         return (
                           <box
@@ -1539,7 +1646,7 @@ export function PackFlowsModal({
                 >
                   <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgSecondary }}>
                     {middleEllipsis(
-                      `↑/↓ Branch · [Enter] Edit/New · [C] Callers${!isReadOnlyGitSource ? (routingView.hasManifest ? " · [W] Export" : " · [I] Init") : ""} · [D] Delete`,
+                      `↑/↓ Branch · [Enter] Edit/New${mcpServers.length ? " · [T] MCP on/off" : ""} · [C] Callers${!isReadOnlyGitSource ? (routingView.hasManifest ? " · [W] Export" : " · [I] Init") : ""} · [D] Delete`,
                       Math.max(18, innerWidth - 16),
                     )}
                   </text>

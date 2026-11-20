@@ -1,5 +1,6 @@
 import fs from "node:fs"
 import path from "node:path"
+import { createHash } from "node:crypto"
 import { isDeepStrictEqual } from "node:util"
 import YAML from "yaml"
 import {
@@ -61,7 +62,7 @@ import {
   type DelegationEffect,
   type PolicyEffect,
 } from "./values.js"
-import { scanLooseAgentFiles } from "./virtualPacks.js"
+import { isVirtualPackRoot, scanLooseAgentFiles } from "./virtualPacks.js"
 
 export function resolvedDefaultTarget(env: NodeJS.ProcessEnv = process.env): string {
   return realpathThroughExistingAncestor(path.resolve(defaultTarget(env)))
@@ -605,6 +606,12 @@ export function formatReconcileLines(outcome: ReconcileOutcome): string[] {
     `Saved in user settings, but reconciling ${outcome.target} did not complete:`,
     ...describeChangeResult(outcome.target, result),
   ]
+}
+
+/** Local standalone packs store generated artifacts outside their installable tree. */
+export function standaloneBridgeKey(root: string): string | null {
+  if (!fs.existsSync(path.join(root, MANIFEST_FILE)) && !isVirtualPackRoot(root)) return null
+  return path.join("local", createHash("sha256").update(fs.realpathSync(root)).digest("hex"))
 }
 
 export function sourceTranslationConfigLocation(

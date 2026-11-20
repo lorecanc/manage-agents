@@ -5,8 +5,10 @@ import { fileURLToPath } from "node:url"
 import semver from "semver"
 import YAML from "yaml"
 import { atomicWriteRestrictedFile, extractFrontmatter, renderAgentFile } from "./agents.js"
+import { manifestName } from "./catalog.js"
 import { assertInsideRealWorkspace, realpathThroughExistingAncestor } from "./pathValidation.js"
 import {
+  discoverPackDirs,
   CONFIG_KEYS,
   CONTRACT_VERSION,
   hasErrors,
@@ -853,29 +855,9 @@ export function resolveEditablePackDir(workspaceRoot: string, preferredPackName?
   if (!rootStat || !rootStat.isDirectory() || rootStat.isSymbolicLink()) return null
   const realRoot = fs.realpathSync(root)
   if (fs.lstatSync(path.join(realRoot, MANIFEST_FILE), { throwIfNoEntry: false })?.isFile()) return realRoot
-  const packsDir = path.join(realRoot, "packs")
-  const packsStat = fs.lstatSync(packsDir, { throwIfNoEntry: false })
-  if (packsStat?.isDirectory() && !packsStat.isSymbolicLink()) {
-    const verifyPackSubdir = (candidate: string): string | null => {
-      const st = fs.lstatSync(candidate, { throwIfNoEntry: false })
-      if (!st || !st.isDirectory() || st.isSymbolicLink()) return null
-      const manifestStat = fs.lstatSync(path.join(candidate, MANIFEST_FILE), { throwIfNoEntry: false })
-      if (!manifestStat?.isFile() || manifestStat.isSymbolicLink()) return null
-      const realCandidate = fs.realpathSync(candidate)
-      assertInsideRealWorkspace(realRoot, realCandidate, candidate)
-      return realCandidate
-    }
-    if (preferredPackName && PACK_NAME_RE.test(preferredPackName)) {
-      const verified = verifyPackSubdir(path.join(packsDir, preferredPackName))
-      if (verified) return verified
-    }
-    const subdirs = fs
-      .readdirSync(packsDir, { withFileTypes: true })
-      .filter(entry => entry.isDirectory() && !entry.isSymbolicLink())
-      .map(entry => verifyPackSubdir(path.join(packsDir, entry.name)))
-      .filter((dir): dir is string => dir !== null)
-      .sort()
-    if (subdirs.length >= 1) return subdirs[0]
+  for (const dir of discoverPackDirs(realRoot)) {
+    if (!fs.lstatSync(path.join(dir, MANIFEST_FILE)).isFile()) continue
+    if (!preferredPackName || manifestName(dir) === preferredPackName) return dir
   }
   return null
 }

@@ -93,3 +93,12 @@ test("packDir discovers non-symlink packs nested up to DISCOVERY_DEPTH when not 
   assert.equal(packDir(root, "alpha"), nested)
   assert.equal(packDir(root, "escaped"), null)
 })
+
+test("manifest identities take precedence over conventional folder names", t => {
+  const root = tempDir(t)
+  const first = writePack(path.join(root, "packs", "notes"), {}, { name: "paper" })
+  const second = writePack(path.join(root, "library", "handbook"), {}, { name: "notes" })
+  assert.equal(packDir(root, "paper"), first)
+  assert.equal(packDir(root, "notes"), second)
+  assert.equal(packDir(root, "handbook"), null)
+})

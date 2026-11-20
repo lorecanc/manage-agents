@@ -12,13 +12,14 @@ import {
   type ConditionalRule,
 } from "./values.js"
 import { atomicWriteRestrictedFile, extractFrontmatter } from "./agents.js"
-import { PACK_NAME_RE, type PackManifest } from "./packs.js"
+import { CONTROL_CHAR_RE, PACK_NAME_RE, type PackManifest } from "./packs.js"
 import { engineConfigDir } from "./sources.js"
 
 // User settings applied at reconcile, never written into packs:
 //   routing.json    pack -> trigger -> subagent ID -> "provider/model#variant" | "inherit",
 //                   plus optional $callers, $reference and $rules (IF/OR over models, tools, permissions, delegations)
 //   overrides.json  pack -> agents|commands -> ID -> frontmatter field -> value (null removes the field)
+//                   pack -> config -> section -> key -> patch (null removes the entry; a null field removes the field)
 // Both have a "default" scope and per-target scopes ("targets.<absolute target path>"); the target scope wins.
 
 export const INHERIT = "inherit"
@@ -30,7 +31,19 @@ export interface PackFlowEntry {
   [trigger: string]: unknown
 }
 export type FieldPatch = Record<string, unknown>
-export interface PackOverrides { agents?: Record<string, FieldPatch>; commands?: Record<string, FieldPatch> }
+/** Object sections of opencode.json a config override may patch ("agents"/"commands" stay frontmatter overrides). */
+export const CONFIG_SECTIONS = ["mcp.servers", "lsp", "formatter", "experimental"] as const
+export type ConfigSection = (typeof CONFIG_SECTIONS)[number]
+/**
+ * Patch of one config entry: nested objects merge recursively, `null` removes a field, arrays and scalars replace.
+ * At the entry level `null` means the pack contributes no such entry at all.
+ */
+export type ConfigPatch = Record<string, unknown>
+export interface PackOverrides {
+  agents?: Record<string, FieldPatch>
+  commands?: Record<string, FieldPatch>
+  config?: Record<string, Record<string, ConfigPatch | null>>
+}
 
 interface Scoped<T> { version: 1; default: Record<string, T>; targets: Record<string, Record<string, T>> }
 export type RoutingSettings = Scoped<PackFlowEntry>
@@ -104,8 +117,62 @@ function checkFlowEntry(value: unknown, where: string): string | null {
   return null
 }
 
+const AGENT_MCP_FIELDS = new Set(["type", "command", "url", "disabled", "enabled"])
+
+/** Shape check of one well-known mcp.servers field inside a config patch (a partial entry, so absent fields pass). */
+function checkMcpPatchField(field: string, value: unknown, where: string): string | null {
+  if (value === null) return null
+  if (field === "type") return value === "local" || value === "remote" ? null : `${where}.${field} must be "local" or "remote"`
+  if (field === "command") {
+    const ok = typeof value === "string"
+      ? value.length > 0 && !CONTROL_CHAR_RE.test(value)
+      : Array.isArray(value) && value.length > 0 && value.every(part => typeof part === "string" && !CONTROL_CHAR_RE.test(part))
+    return ok ? null : `${where}.${field} must be a non-empty string or list of strings`
+  }
+  if (field === "url") return typeof value === "string" ? null : `${where}.${field} must be a string`
+  if (field === "disabled" || field === "enabled") return typeof value === "boolean" ? null : `${where}.${field} must be a boolean`
+  return null
+}
+
+/** Walks a config patch: keys must be control-char free, string values too; mcp.servers fields get schema checks. */
+function checkConfigPatch(section: string, patch: Record<string, unknown>, where: string): string | null {
+  for (const [field, value] of Object.entries(patch)) {
+    if (CONTROL_CHAR_RE.test(field)) return `${where}: keys must not contain control characters`
+    if (section === "mcp.servers" && AGENT_MCP_FIELDS.has(field)) {
+      const problem = checkMcpPatchField(field, value, where)
+      if (problem) return problem
+    }
+    const problem = checkConfigValue(value, `${where}.${field}`)
+    if (problem) return problem
+  }
+  return null
+}
+
+function checkConfigValue(value: unknown, where: string): string | null {
+  if (value === null || typeof value === "boolean" || typeof value === "number") return null
+  if (typeof value === "string") return CONTROL_CHAR_RE.test(value) ? `${where} must not contain control characters` : null
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index++) {
+      const problem = checkConfigValue(value[index], `${where}[${index}]`)
+      if (problem) return problem
+    }
+    return null
+  }
+  if (isObject(value)) {
+    for (const [key, item] of Object.entries(value)) {
+      if (CONTROL_CHAR_RE.test(key)) return `${where}: keys must not contain control characters`
+      const problem = checkConfigValue(item, `${where}.${key}`)
+      if (problem) return problem
+    }
+    return null
+  }
+  return `${where} must be a JSON value`
+}
+
 function checkOverrides(value: unknown, where: string): string | null {
-  if (!isObject(value) || Object.keys(value).some(key => key !== "agents" && key !== "commands")) return `${where} accepts only "agents" and "commands"`
+  if (!isObject(value) || Object.keys(value).some(key => key !== "agents" && key !== "commands" && key !== "config")) {
+    return `${where} accepts only "agents", "commands" and "config"`
+  }
   for (const kind of ["agents", "commands"] as const) {
     const entries = value[kind]
     if (entries === undefined) continue
@@ -116,6 +183,22 @@ function checkOverrides(value: unknown, where: string): string | null {
       const unknown = Object.keys(patch).find(field => !allowed.has(field))
       if (unknown) return `${where}.${kind}.${id}: "${unknown}" cannot be overridden (allowed: ${[...allowed].join(", ")})`
       if (patch.model !== undefined && patch.model !== null && !isModelRef(patch.model)) return `${where}.${kind}.${id}.model must be "provider/model[#variant]" or null`
+    }
+  }
+  const config = value.config
+  if (config === undefined) return null
+  if (!isObject(config)) return `${where}.config must be an object keyed by section`
+  for (const [section, entries] of Object.entries(config)) {
+    if (!(CONFIG_SECTIONS as readonly string[]).includes(section)) {
+      return `${where}.config."${section}": unknown section (allowed: ${CONFIG_SECTIONS.join(", ")})`
+    }
+    if (!isObject(entries)) return `${where}.config.${section} must be an object keyed by ID`
+    for (const [key, patch] of Object.entries(entries)) {
+      if (CONTROL_CHAR_RE.test(key)) return `${where}.config.${section}: keys must not contain control characters`
+      if (patch === null) continue
+      if (!isObject(patch)) return `${where}.config.${section}.${key} must be an object or null (null removes the entry)`
+      const problem = checkConfigPatch(section, patch, `${where}.config.${section}.${key}`)
+      if (problem) return problem
     }
   }
   return null
@@ -160,12 +243,121 @@ export function scopeOf<T>(settings: Scoped<T>, target: string | null): Record<s
   return ownChild(settings.targets, target)
 }
 
-/** Overrides of one pack for one target: the target scope patches the default field by field. */
-export function effectiveOverrides(settings: OverrideSettings, target: string, pack: string): Required<PackOverrides> {
-  const out: Required<PackOverrides> = { agents: {}, commands: {} }
-  for (const scope of [own(settings.default, pack), own(own(settings.targets, target), pack)]) {
+/**
+ * Merges a config patch into a target in place: nested objects merge, a null field is removed, arrays and scalars
+ * replace. When a nested merge only deletes keys and empties a plain object, that object goes too (an empty `environment`
+ * left by `environment.OLD=null` never reaches opencode.json; pack-authored empty objects are preserved).
+ */
+function applyConfigPatch(target: Record<string, unknown>, patch: Record<string, unknown>): boolean {
+  let deleted = false
+  for (const [field, value] of Object.entries(patch)) {
+    const current = own(target, field)
+    if (value === null) {
+      if (current !== undefined) {
+        delete target[field]
+        deleted = true
+      }
+    } else if (isObject(value) && isObject(current)) {
+      const childDeleted = applyConfigPatch(current, value)
+      if (childDeleted && !Object.keys(current).length) {
+        delete target[field]
+        deleted = true
+      }
+    } else setOwn(target, field, structuredClone(value))
+  }
+  return deleted
+}
+
+/**
+ * Layers patches the way agents/commands fields layer: target fields win, nested objects merge, `null` is kept (it
+ * means "remove the field from the pack entry", exactly like a null frontmatter override).
+ */
+function layerConfigPatch(target: Record<string, unknown>, patch: Record<string, unknown>): void {
+  for (const [field, value] of Object.entries(patch)) {
+    const current = own(target, field)
+    if (isObject(value) && isObject(current)) layerConfigPatch(current, value)
+    else setOwn(target, field, structuredClone(value))
+  }
+}
+
+/** One pack entry with a patch applied: `base` is cloned, a null patch field removes the field. */
+export function deepPatchEntry(base: Record<string, unknown> | undefined, patch: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  const source = base ?? {}
+  for (const key of Object.getOwnPropertyNames(source)) setOwn(out, key, structuredClone(own(source, key)))
+  applyConfigPatch(out, patch)
+  return out
+}
+
+/** Minimal mcp.servers entry schema (as pack validation): what remains after a patch must still be a usable server. */
+function checkMergedMcpServer(name: string, server: unknown, where: string): string | null {
+  if (!isObject(server)) return `${where}: mcp.servers.${name} must be an object`
+  if (server.type !== "local" && server.type !== "remote") return `${where}: mcp.servers.${name} needs "type": "local" or "remote" after the override`
+  if (server.type === "local") {
+    const command = server.command
+    const ok = typeof command === "string"
+      ? command.length > 0 && !CONTROL_CHAR_RE.test(command)
+      : Array.isArray(command) && command.length > 0 && command.every(part => typeof part === "string" && !CONTROL_CHAR_RE.test(part))
+    if (!ok) return `${where}: mcp.servers.${name} needs "command" (a non-empty string or list of strings) after the override`
+  }
+  if (server.url !== undefined && typeof server.url !== "string") return `${where}: mcp.servers.${name}.url must be a string`
+  return null
+}
+
+const getConfigPath = (config: Record<string, any>, section: string): unknown =>
+  section.split(".").reduce<any>((value, key) => isObject(value) ? value[key] : undefined, config)
+
+/**
+ * One pack's config object sections with its config overrides applied: entries deep-merge, a key of `null` means the
+ * pack contributes no such entry, a patch on a key the pack does not have creates the entry. The result of every
+ * patched mcp.servers entry must still satisfy the minimal server schema. Base entries are cloned, never shared.
+ */
+export function patchedConfigSections(
+  config: Record<string, any>,
+  overrides: Record<string, Record<string, ConfigPatch | null>>,
+  where: string,
+): Record<string, Record<string, unknown>> {
+  const out: Record<string, Record<string, unknown>> = {}
+  for (const section of CONFIG_SECTIONS) {
+    const base = getConfigPath(config, section)
+    const entries: Record<string, unknown> = {}
+    if (isObject(base)) for (const key of Object.getOwnPropertyNames(base)) setOwn(entries, key, structuredClone(own(base, key)))
+    for (const [key, patch] of Object.entries(own(overrides, section) ?? {})) {
+      if (patch === null) {
+        if (Object.hasOwn(entries, key)) delete entries[key]
+        continue
+      }
+      if (!isObject(patch)) continue
+      const merged = deepPatchEntry(isObject(own(entries, key)) ? own(entries, key) as Record<string, unknown> : undefined, patch)
+      const problem = section === "mcp.servers" ? checkMergedMcpServer(key, merged, where) : null
+      if (problem) throw new Error(problem)
+      setOwn(entries, key, merged)
+    }
+    if (Object.keys(entries).length) setOwn(out, section, entries)
+  }
+  return out
+}
+
+/**
+ * Overrides of one pack: the target scope patches the default field by field (config patches layer the same way they
+ * apply). `target` null uses only the default scope.
+ */
+export function effectiveOverrides(settings: OverrideSettings, target: string | null, pack: string): Required<PackOverrides> {
+  const out: Required<PackOverrides> = { agents: {}, commands: {}, config: {} }
+  const scopes = [own(settings.default, pack), ...(target === null ? [] : [own(own(settings.targets, target), pack)])]
+  for (const scope of scopes) {
     for (const kind of ["agents", "commands"] as const) {
       for (const [id, patch] of Object.entries(scope?.[kind] ?? {})) for (const [field, value] of Object.entries(patch)) setOwn(ownChild(out[kind], id), field, value)
+    }
+    for (const [section, entries] of Object.entries(scope?.config ?? {})) {
+      for (const [key, patch] of Object.entries(entries)) {
+        const sectionOut = ownChild(out.config, section)
+        if (patch === null) { setOwn(sectionOut, key, null); continue }
+        const current = own(sectionOut, key)
+        const layered = deepPatchEntry(isObject(current) ? current as Record<string, unknown> : undefined, {})
+        layerConfigPatch(layered, patch)
+        setOwn(sectionOut, key, layered)
+      }
     }
   }
   return out
@@ -267,6 +459,51 @@ export function unsetOverride(scope: Record<string, PackOverrides>, pack: string
   if (!patch) return false
   if (!fields.length) delete scope[pack]![kind]![id]
   else for (const field of fields) delete patch[field]
+  return true
+}
+
+/** Deep-merges fields into the config override of one entry; null fields stay null (they remove the field from the pack entry). */
+export function setConfigOverride(scope: Record<string, PackOverrides>, pack: string, section: ConfigSection, key: string, fields: ConfigPatch): void {
+  if (!PACK_NAME_RE.test(pack)) throw new Error(`invalid pack name "${pack}"`)
+  if (CONTROL_CHAR_RE.test(key)) throw new Error(`config key "${key}" must not contain control characters`)
+  const existing = own(own(own(scope, pack)?.config, section), key)
+  const next = deepPatchEntry(isObject(existing) ? existing as Record<string, unknown> : undefined, {})
+  layerConfigPatch(next, fields)
+  if (!Object.keys(next).length) throw new Error("give at least one <field>=<value> (null removes a field, config-remove drops the entry)")
+  const problem = checkOverrides({ config: { [section]: { [key]: next } } }, `${pack}`)
+  if (problem) throw new Error(problem)
+  setOwn(ownChild(ownChild(ownChild(scope, pack) as Record<string, any>, "config"), section), key, next)
+}
+
+/** Makes the pack contribute no such entry at all (`null` removes it from the contribution). */
+export function removeConfigEntry(scope: Record<string, PackOverrides>, pack: string, section: ConfigSection, key: string): void {
+  if (!PACK_NAME_RE.test(pack)) throw new Error(`invalid pack name "${pack}"`)
+  const problem = checkOverrides({ config: { [section]: { [key]: null } } }, `${pack}`)
+  if (problem) throw new Error(problem)
+  setOwn(ownChild(ownChild(ownChild(scope, pack) as Record<string, any>, "config"), section), key, null)
+}
+
+/** Drops some overridden fields (dotted names address nested fields), or the whole entry override when none is named. */
+export function unsetConfigOverride(scope: Record<string, PackOverrides>, pack: string, section: ConfigSection, key: string, fields: string[]): boolean {
+  const entries = own(own(scope, pack)?.config, section)
+  const entry = own(entries ?? {}, key)
+  if (entries === undefined || entry === undefined) return false
+  if (!fields.length) {
+    delete entries[key]
+    return true
+  }
+  let container: Record<string, unknown> = entry as Record<string, unknown>
+  for (const field of fields) {
+    const segments = field.split(".")
+    for (let index = 0; index < segments.length - 1; index++) {
+      const next = own(container, segments[index])
+      if (!isObject(next)) return false
+      container = next
+    }
+    const leaf = segments[segments.length - 1]
+    if (!Object.hasOwn(container, leaf)) return false
+    delete container[leaf]
+  }
   return true
 }
 

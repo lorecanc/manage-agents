@@ -163,6 +163,8 @@ Within `default.<pack>` and `targets["<abs-path>"].<pack>`:
 
 Managed by `loadOverrideSettings` and `saveOverrideSettings` (`src/utils/userSettings.ts`). Written with mode `0o644` using the same `{ version: 1, default, targets }` scoped envelope as `routing.json`. During `reconcile`, `effectiveOverrides` merges `default.<pack>` and `targets["<abs-path>"].<pack>` field by field, rewriting both installed `agents/*.md` / `commands/*.md` YAML frontmatter (via [Agent Editing, V2 Compatibility & Git Transactions](../modules/agent-editing-and-v2-compat.md), leaving the Markdown body untouched byte-for-byte) and corresponding `agents` / `commands` object entries in `<target>/opencode.json`.
 
+The `config` kind patches the object sections a pack **contributes** to `opencode.json` — `mcp.servers`, `lsp`, `formatter`, `experimental` — without touching the pack or its lock: `patchedConfigSections()` deep-merges each patched entry (nested objects merge, arrays and scalars replace, `null` removes a field; `patchedConfigSections` throws when a patched `mcp.servers` entry stops satisfying the minimal server schema), a key of `null` makes the pack contribute no such entry, and a patch on a key the pack does not have creates the entry. Because the override acts on the contribution, an entry patched to match what the user already has in `opencode.json` is claimed `"kept"` by the installer: no conflict, no `--adopt`, and the entry stays the user's — it is never updated or removed by the pack again. The same patches apply to bridge workspaces (`prepareBridgeWorkspace` layers the `default` scope plus the default OpenCode target's scope, i.e. exactly what `override config-set` writes without `--global`, so a re-exported Claude Code / Codex bridge shows the patched MCP servers).
+
 ```json
 {
   "version": 1,
@@ -183,6 +185,13 @@ Managed by `loadOverrideSettings` and `saveOverrideSettings` (`src/utils/userSet
           "agent": "pipeline",
           "subagent": true
         }
+      },
+      "config": {
+        "mcp.servers": {
+          "cupertino": { "command": ["cupertino-mcp", "standalone"] },
+          "docs": { "disabled": true },
+          "old-server": null
+        }
       }
     }
   },
@@ -190,12 +199,16 @@ Managed by `loadOverrideSettings` and `saveOverrideSettings` (`src/utils/userSet
 }
 ```
 
+Edited through `manage-agents override config-set <pack>/<section>/<key> <field>=<value>...` (dotted field names such as `environment.FOO=x` nest; value is YAML, `null` removes the field), `override config-unset <pack>/<section>/<key> [<field>...]`, and `override config-remove <pack>/<section>/<key>` (the pack no longer contributes the entry). The TUI pack detail (conditional flows modal) lists the pack's MCP servers with an `[ON]/[OFF]` toggle that writes `{ "disabled": true }` / `{ "disabled": null }`.
+
 #### Allowed Override Fields & `null` Unpin Sentinel
 
 - **Allowed `agents.<id>` fields (`AGENT_FIELDS`)**: `description`, `mode`, `model`, `permissions`, `hidden`, `color`, `steps`, `disabled`, `request`, `temperature`, `top_p`.
 - **Allowed `commands.<id>` fields (`COMMAND_FIELDS`)**: `description`, `agent`, `model`, `subagent`.
 - **`model` validation**: Must be `"provider/model[#variant]"` or `null`.
-- **`null` deletion / unpin sentinel**: Setting any field to `null` removes that key from the installed frontmatter (`patchFrontmatter`) and target `opencode.json` (`packContribution`). Running `manage-agents models unpin <pack>/<agent>` writes `{ "model": null }`, stripping even a model hardcoded in the pack's own Markdown file so the subagent follows dynamic routing instead of remaining pinned.
+- **`config` sections (`CONFIG_SECTIONS`)**: `mcp.servers`, `lsp`, `formatter`, `experimental`. For `mcp.servers`, well-known fields (`type`, `command`, `url`, `disabled`, `enabled`) are shape-checked (`type` must be `local`/`remote`, `command` a non-empty string or list of strings); keys and string values must be control-character free.
+- **`null` deletion / unpin sentinel**: Setting any field to `null` removes that key from the installed frontmatter (`patchFrontmatter`) and target `opencode.json` (`packContribution`). Running `manage-agents models unpin <pack>/<agent>` writes `{ "model": null }`, stripping even a model hardcoded in the pack's own Markdown file so the subagent follows dynamic routing instead of remaining pinned. In `config` patches the same sentinel removes the field from the contributed entry (a nested deletion that empties a plain object removes the object too), and `null` **at the key** removes the entry from the contribution entirely.
+- **Divergence is deliberate**: overriden/kept entries are the user's. The pack will never update or remove them again — overrides exist to diverge consciously, not to keep managing those entries.
 
 ---
 
@@ -514,7 +527,7 @@ Every environment variable inspected or sanitized by the [launcher](../modules/l
 | `AGENT_MANAGER_AUTO_COMMIT` | `"0"` | `src/utils/repositoryTransaction.ts` (`parseAutoCommitArgs`, `autoCommitEnabled`), `src/index.tsx` (`run`) | Must be `"0"` or `"1"` if set (throws an error otherwise). When `"1"` (unless overridden by `--no-auto-commit`), wraps local workspace mutations in an atomic [Git commit transaction](../modules/agent-editing-and-v2-compat.md) using `.git/agent-manager.lock` when the repository is clean and on a branch. |
 | `AGENT_MANAGER_UI_CONFIG` | Unset (`<engineConfigDir>/ui.json`) | `src/utils/uiConfig.ts` (`loadUiConfig`, `saveUiConfig`) | Redirects the TUI layout/motion config path to the specified regular file and marks UI settings read-only (`saveUiConfig` throws if invoked while set). |
 | `AGENT_MANAGER_REDUCED_MOTION` | Unset (`false` unless set in `ui.json`) | `src/ui/animations.ts` (`isReducedMotionPreferred`) | Setting `"1"` or `"true"` disables OpenTUI smooth number transitions, flash decays, toast progress timelines, and animated spinners (rendering a static `◌` indicator instead). |
-| `AGENT_AUTHOR_NAME` | `"Lorenzo Cancellara"` | `src/utils/translationConfig.ts` (`authorName`) | Overrides the author name written into generated Claude Code and Codex plugin manifests and READMEs. Must match `/^[\p{L}\p{N} '’.\-]{1,100}$/u`; invalid values log a warning to `stderr` and fall back to the default. |
+| `AGENT_AUTHOR_NAME` | `"manage-agents"` | `src/utils/translationConfig.ts` (`authorName`) | Overrides the author name written into generated Claude Code and Codex plugin manifests and READMEs. Must match `/^[\p{L}\p{N} '’.\-]{1,100}$/u`; invalid values log a warning to `stderr` and fall back to the default. |
 | `MANAGE_AGENTS_REPO` | Repository from `release-signing.json` or `package.json` (`lorecanc/manage-agents`) | `src/utils/selfUpdate.ts` (`resolveReleaseTrustPolicy`) | Overrides the `<owner>/<repo>` GitHub repository used by `manage-agents self-update` (`update --self`) and `manage-agents release sign` when `--repo` is not passed (see [Bridge Translation & Release Config Reference](./translation-and-release-config.md)). |
 | `MANAGE_AGENTS_RELEASE_PUBLIC_KEY` | Unset (uses `release-signing.json`) | `src/utils/selfUpdate.ts` (`resolveReleaseTrustPolicy`) | Adds a trusted Ed25519 SPKI public key (PEM) to the release trust policy and enforces Ed25519 signature verification during `self-update`. Throws if its key ID collides with a different configured key. |
 | `RELEASE_SIGNING_PRIVATE_KEY` | Unset | `src/utils/selfUpdate.ts` (`signReleaseAssets`) | Supplies the Ed25519 PKCS#8 private key (PEM; literal `\n` sequences are unescaped) for `manage-agents release sign` when `--private-key-file` is omitted. Required if `release-signing.json` configures Ed25519 trust. |

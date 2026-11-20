@@ -86,6 +86,20 @@ export const PACK_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/
 export const CONTROL_CHAR_RE = /[\u0000-\u001f\u007f-\u009f]/
 export const DISCOVERY_DEPTH = 4
 export const SKIPPED_DIRS = new Set([".git", "node_modules", ".opencode"])
+
+/** Outermost manifests in stable order, using the same depth limit for sources and workspaces. */
+export function* discoverPackDirs(root: string, depth = 0): Generator<string> {
+  if (!fs.lstatSync(root, { throwIfNoEntry: false })?.isDirectory()) return
+  if (fs.lstatSync(path.join(root, MANIFEST_FILE), { throwIfNoEntry: false })) {
+    yield root
+    return
+  }
+  if (depth >= DISCOVERY_DEPTH) return
+  for (const entry of fs.readdirSync(root, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+    if (entry.isDirectory() && !SKIPPED_DIRS.has(entry.name)) yield* discoverPackDirs(path.join(root, entry.name), depth + 1)
+  }
+}
+
 const CONTRACT_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)$/
 const MANIFEST_KEYS = new Set(["$schema", "contract", "name", "version", "description", "requires", "archetype", "routingDefaults", "flowDefaults"])
 export const ROOT_FILE_RE = /^(?:opencode-pack\.json|opencode\.jsonc?|AGENTS\.md|(?:README|LICENSE|LICENCE|CHANGELOG)(?:\.(?:md|txt|rst))?)$/i
@@ -601,6 +615,22 @@ export const hasErrors = (validation: PackValidation) => validation.issues.some(
 const NOT_INSTALLED_RE = /^(?:opencode-pack\.json|(?:README|LICENSE|LICENCE|CHANGELOG)(?:\.(?:md|txt|rst))?)$/i
 
 /** Tests and their helpers (`*.test.*`) stay in the pack, next to the code they test, and are never installed. */
+/** Runtime tool modules shipped by a pack, including nested namespaces. */
+export function toolModulePaths(root: string): string[] {
+  const files: string[] = []
+  const visit = (dir: string) => {
+    for (const entry of fs.readdirSync(path.join(root, dir), { withFileTypes: true })) {
+      const rel = path.posix.join(dir, entry.name)
+      if (entry.isDirectory()) visit(rel)
+      else if (entry.isFile() && CODE_RE.test(rel) && !entry.name.startsWith("_") && !/\.d\.[cm]?ts$/.test(rel) && !isTestFile(rel)) files.push(rel)
+    }
+  }
+  if (fs.lstatSync(path.join(root, "tools"), { throwIfNoEntry: false })?.isDirectory()) visit("tools")
+  return files.sort()
+}
+
+export const toolModuleName = (file: string) => path.basename(file, path.extname(file))
+
 export const isTestFile = (file: string) => /\.test\.[^/]+$/.test(file)
 
 /** Files the installer copies: everything except tests, the manifest and the root README, LICENSE and CHANGELOG. */

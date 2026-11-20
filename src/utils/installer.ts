@@ -11,7 +11,7 @@ import { hasErrors, installableFiles, MANIFEST_FILE, MAX_SCANNED_BYTES, parseJso
 import { hashFile, orderByRequires, packContent, parsePackRequest, resolvePacks, type ResolveOptions } from "./resolver.js"
 import { discoverAllPacks, findSource, lastFetchedRevision, pullSource, revisionSnapshot, sourceRevision, type GitOptions, type SourceRegistry } from "./sources.js"
 import { own, setOwn } from "./values.js"
-import { buildRuntimeRouting, effectiveOverrides, loadOverrideSettings, loadRoutingSettings, patchFrontmatter, resolveEffectiveCallers, routesOfEntry, type PackOverrides } from "./userSettings.js"
+import { buildRuntimeRouting, CONFIG_SECTIONS, effectiveOverrides, loadOverrideSettings, loadRoutingSettings, patchFrontmatter, patchedConfigSections, resolveEffectiveCallers, routesOfEntry, type PackOverrides } from "./userSettings.js"
 import { validateVirtualPack, VIRTUAL_PACK_VERSION, virtualManifestHash } from "./virtualPacks.js"
 
 export interface DesiredState {
@@ -225,7 +225,7 @@ const arrayKey = (section: string, entry: unknown) => section === "plugins" ? pl
  * The pack's opencode.json(c) and AGENTS.md as target config entries. Every shipped plugin is registered; the
  * plugins registered only implicitly are listed in `implicitPlugins`, so a dependent pack can configure them.
  */
-export function packContribution(pack: LoadedPack, target: string, overrides: Required<PackOverrides> = { agents: {}, commands: {} }): { contribution: Contribution; implicitPlugins: Set<string> } {
+export function packContribution(pack: LoadedPack, target: string, overrides: Required<PackOverrides> = { agents: {}, commands: {}, config: {} }): { contribution: Contribution; implicitPlugins: Set<string> } {
   const contribution: Contribution = { plugins: [], skills: [], instructions: [], objects: {} }
   if (pack.configText && Buffer.byteLength(pack.configText, "utf8") > MAX_SCANNED_BYTES) throw new Error(`pack configuration exceeds maximum scanned size (${MAX_SCANNED_BYTES} bytes)`)
   const config = pack.configText !== null ? parseJsonc(pack.configText) as Record<string, any> : {}
@@ -250,6 +250,14 @@ export function packContribution(pack: LoadedPack, target: string, overrides: Re
   for (const section of OBJECT_SECTIONS) {
     const value = getPath(config, section)
     if (isObject(value) && Object.keys(value).length) contribution.objects[section] = { ...value }
+  }
+  // Config overrides act on the contribution (never on the pack): an entry patched to match what the user already has
+  // in opencode.json is claimed "kept", with no conflict and no --adopt.
+  const patched = patchedConfigSections(config, overrides.config, pack.name)
+  for (const section of CONFIG_SECTIONS) {
+    const entries = own(patched, section)
+    if (entries) setOwn(contribution.objects, section, entries)
+    else if (Object.hasOwn(contribution.objects, section)) delete contribution.objects[section]
   }
   for (const kind of ["agents", "commands"] as const) {
     const section = contribution.objects[kind]

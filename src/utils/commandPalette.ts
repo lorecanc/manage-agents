@@ -21,6 +21,7 @@ export interface ShortcutChip {
 
 export interface ShortcutContext {
   workspaceTab: WorkspaceTab
+  packAgentCount?: number
   itemType?: "file" | "folder" | null
   selectedCount: number
   isVirtualPack?: boolean
@@ -90,7 +91,7 @@ export function buildContextualShortcuts(ctx: ShortcutContext): ShortcutChip[] {
 
   if (ctx.workspaceTab === "sources") {
     const chips: ShortcutChip[] = [
-      { key: "Enter", label: "Activate", actionId: "source-activate", accent: true },
+      { key: "Enter", label: "Open Catalog", actionId: "source-activate", accent: true },
       { key: "/", label: "Connect / Filter", actionId: "source-search" },
       { key: "P", label: "Pull / Sync", actionId: "source-pull" },
       { key: "R", label: "Reconcile Target", actionId: "target-reconcile" },
@@ -118,7 +119,9 @@ export function buildContextualShortcuts(ctx: ShortcutContext): ShortcutChip[] {
   }
 
   if (ctx.itemType === "folder") {
-    const chips: ShortcutChip[] = [
+    const chips: ShortcutChip[] = ctx.packAgentCount === 0 ? [
+      { key: "E", label: "Install / Update", actionId: "pack-install", accent: true },
+    ] : [
       { key: "Enter", label: "Toggle Pack", actionId: "folder-toggle" },
       { key: "M", label: "IF/OR Flows", actionId: "pack-flows", accent: true },
       { key: "E", label: "Install / Update", actionId: "pack-install", accent: true },

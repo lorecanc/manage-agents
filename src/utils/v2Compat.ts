@@ -243,9 +243,6 @@ const V1_ONLY_PERMISSION_KEYS = new Set([
   "list_mcp_resource_templates",
 ])
 
-/** Repository custom tools (`tools/dev-tools/dev_*.ts`, `tools/pipeline/pipeline_*.ts`) are V2-only as well. */
-const CUSTOM_TOOL_ACTION = /^(?:dev|pipeline)_[a-z][a-z0-9_]*$/
-
 /**
  * MCP tool action: `<server>_<tool>` or the `<server>_*` wildcard. The server
  * prefix must start with an alphanumeric so inherited names such as
@@ -257,7 +254,7 @@ function resolveV2PermissionKey(action: string): string | null {
   const mapped = mapActionToPermissionKey(action)
   if (mapped) return mapped
   if (V1_ONLY_PERMISSION_KEYS.has(action)) return null
-  if (V2_PASSTHROUGH_ACTIONS.has(action) || CUSTOM_TOOL_ACTION.test(action)) return action
+  if (V2_PASSTHROUGH_ACTIONS.has(action)) return action
   return MCP_ACTION_NAME.test(action) ? action : null
 }
 
@@ -265,7 +262,7 @@ function resolveV1PermissionKey(key: string): string | null {
   const mapped = mapPermissionKeyToAction(key)
   if (mapped) return mapped
   if (V1_ONLY_PERMISSION_KEYS.has(key)) return null
-  if (V2_PASSTHROUGH_ACTIONS.has(key) || CUSTOM_TOOL_ACTION.test(key)) return key
+  if (V2_PASSTHROUGH_ACTIONS.has(key)) return key
   return MCP_ACTION_NAME.test(key) ? key : null
 }
 
@@ -287,13 +284,9 @@ const KNOWN_PERMISSION_KEYS = new Set([
 /**
  * Single source of truth for "built-in tool permission key vs MCP server key".
  * Bridges must call this instead of keeping their own key lists.
- *
- * The `dev_*` / `pipeline_*` test mirrors `isOpenCodeCustomToolKey` in
- * bridgeToolReferences.ts, which cannot be imported here without a module
- * cycle (that file already imports this one).
  */
 export function isKnownPermissionKey(key: string): boolean {
-  return KNOWN_PERMISSION_KEYS.has(key) || CUSTOM_TOOL_ACTION.test(key)
+  return KNOWN_PERMISSION_KEYS.has(key)
 }
 
 // --- Frontmatter translation ---

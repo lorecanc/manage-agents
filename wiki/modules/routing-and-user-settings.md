@@ -207,6 +207,16 @@ Subagent pinning is implemented by coupling `overrides.json` with `buildRuntimeR
 - **Pin (`models pin <pack>/<agent> <provider/model[#variant]>`)**: Calls `setOverride(scope, pack, "agents", agent, { model: "<ref>" })`. During reconciliation, the installed agent receives that fixed `model` in its frontmatter, causing `buildRuntimeRouting()` to list the agent in `archetypes[pack].pinned` so `manage-agents-router` skips it.
 - **Unpin (`models unpin <pack>/<agent>`)**: Calls `setOverride(scope, pack, "agents", agent, { model: null })`. Setting `model: null` strips `model` from the installed frontmatter—even when the pack's own `.md` file originally hardcoded a model—turning the subagent into a routable (`related`) agent controlled by `routing.json`.
 
+### Config Overrides (`override config-set` / `config-unset` / `config-remove`)
+
+`checkOverrides()` additionally accepts a `config` kind for the object sections a pack contributes (`CONFIG_SECTIONS`: `mcp.servers`, `lsp`, `formatter`, `experimental`; `agents`/`commands` stay frontmatter overrides):
+
+- `setConfigOverride(scope, pack, section, key, fields)` deep-merges `fields` into the entry's patch: target fields win over default fields, nested objects merge, `null` is kept and means "remove the field from the pack's entry" (the same semantics as `models unpin`). Well-known `mcp.servers` fields (`type`, `command`, `url`, `disabled`, `enabled`) are shape-checked, and all keys/values must be control-character free.
+- `removeConfigEntry(scope, pack, section, key)` stores `null` at the key: the pack contributes no such entry at all.
+- `unsetConfigOverride(scope, pack, section, key, fields)` drops overridden fields (dotted names address nested fields) or the whole entry override when no field is named.
+
+At reconcile, `patchedConfigSections(config, overrides.config, pack)` applies the layered patches to the pack's parsed `opencode.json(c)` — cloned, never shared: entries deep-merge (`deepPatchEntry`), `null` keys remove entries, unknown keys create them, and a patched `mcp.servers` entry that stops satisfying the minimal server schema fails the change. The result feeds both `packContribution()` (so a patched entry identical to the user's existing config is claimed `"kept"`, with no conflict and no `--adopt`) and `prepareBridgeWorkspace()` (which layers the `default` scope plus the default OpenCode target's scope — exactly what `override config-set` writes without `--global` — so re-exported bridges show the patched MCP servers too). The TUI pack flows modal exposes the pack's MCP servers with an `[ON]/[OFF]` toggle writing `{ "disabled": true }` / `{ "disabled": null }` via `saveConfigOverride()`; entries that match the user's `opencode.json` stay the user's and are never updated or removed by the pack again — overrides are for diverging consciously.
+
 ### Frontmatter Overrides & `patchFrontmatter()`
 
 `checkOverrides()` restricts `overrides.json` patches to an explicit allowlist of frontmatter keys:

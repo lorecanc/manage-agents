@@ -371,7 +371,7 @@ modelli, impostazioni Claude. Le opzioni principali:
 |---|---|
 | `--target`, `-t` | `claude` (default) o `codex` |
 | `--output`, `-o` | directory di output |
-| `--name`, `-n` | nome del plugin (default `decent-pipeline`) |
+| `--name`, `-n` | nome del plugin (default `translated-agents`) |
 | `--prefix`, `-p` | prefisso da togliere dai nomi degli agenti (default `<pack>-`) |
 | `--config` | file di configurazione alternativo |
 | `--model <sorgente>=<destinazione>` | mappa un modello; ripetibile, accetta liste separate da virgole |
@@ -395,6 +395,12 @@ per riattivare validazione o registrazione: rimetti a `true` `claude.autoValidat
 Poi, salvo disattivazione, esegue `claude plugin validate --strict` e registra il plugin in Claude Code, a livello
 utente e una sola volta. Se `claude` non è nel `PATH`, i due passaggi vengono saltati con un avviso. A ogni esecuzione
 il bridge cancella i file generati che non produce più.
+
+**Progetto Codex.** Avvia `codex -C <directory-di-output>` e autorizza il progetto quando Codex lo richiede, oppure
+apri la cartella nell’app Codex. La cartella contiene i subagent in `.codex/agents/`, le skill in `.agents/skills/` e
+la configurazione MCP in `.codex/config.toml`. Per avviare un flusso, chiedi a Codex di delegare il compito al subagent
+principale indicato al termine dell’export. Il README generato riporta anche i comandi per installare skill e MCP
+come plugin tramite il marketplace locale. I subagent si caricano dal progetto.
 
 **Permessi.** La traduzione lavora per tool: `shell` diventa `Bash`, `edit` diventa `Write`/`Edit`, `task` diventa
 `Agent`, le chiavi MCP diventano `mcp__<server>__*`. Le regole granulari (allowlist della shell, glob di `edit`, stati

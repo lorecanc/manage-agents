@@ -4,8 +4,8 @@ import path from "node:path"
 import { randomBytes } from "node:crypto"
 import YAML from "yaml"
 import { isPathInsideWorkspace, isWorkspaceRelativePath } from "./pathValidation.js"
-import { packDir, readManifest, resolvePackClosure } from "./catalog.js"
-import { MANIFEST_FILE } from "./packs.js"
+import { manifestName, packDir, resolvePackClosure } from "./catalog.js"
+import { discoverPackDirs, MANIFEST_FILE, toolModuleName, toolModulePaths } from "./packs.js"
 import { derivePackSlug, isVirtualPackRoot, scanLooseAgentFiles } from "./virtualPacks.js"
 import { detectFrontmatterVersion, translateFrontmatterV1ToV2, translateFrontmatterV2ToV1 } from "./v2Compat.js"
 import { isServerDisabled, readMcpServers } from "./opencodeMcp.js"
@@ -27,6 +27,8 @@ export function extractFrontmatter(content: string): { yamlText: string | null; 
 }
 
 export interface AgentInfo {
+  /** Pack-relative OpenCode identity, including nested namespaces. */
+  id?: string
   filename: string
   currentPath: string
   targetPath: string
@@ -40,6 +42,8 @@ export interface AgentInfo {
   /** Original frontmatter format detected when parsing the file */
   frontmatterVersion?: "v1" | "v2" | "unknown"
 }
+
+export const agentId = (agent: AgentInfo) => agent.id ?? agent.filename.replace(/\.md$/i, "")
 
 export const AGENT_TUNING_MODES = ["subagent", "primary", "all"] as const
 export type AgentTuningMode = (typeof AGENT_TUNING_MODES)[number]
@@ -232,30 +236,13 @@ export function parseTuneCliArgs(args: readonly string[]): ParsedTuneCliArgs {
   }
 }
 
-/** Where agents are discovered: the workspace itself when it is a single pack, else a catalog's packs/. */
-export function resolveSourceSubdir(workspaceRoot: string): string {
-  if (fs.existsSync(path.join(workspaceRoot, MANIFEST_FILE))) return "."
-  return fs.existsSync(path.join(workspaceRoot, "packs")) ? "packs" : "."
-}
-
-/**
- * Pack holding a file: the nearest opencode-pack.json between the file and the workspace root. In a catalog the pack
- * is its directory under packs/ (what packDir resolves); a single pack is named by its manifest.
- */
+/** Identity of the nearest enclosing pack, including a manifest-free virtual pack. */
 export function packNameOf(filePath: string, workspaceRoot: string): string | null {
   const root = path.resolve(workspaceRoot)
-  for (let dir = path.dirname(path.resolve(filePath)); dir.startsWith(root); dir = path.dirname(dir)) {
-    const manifest = path.join(dir, MANIFEST_FILE)
-    if (fs.existsSync(manifest)) {
-      if (path.dirname(dir) === path.join(root, "packs")) return path.basename(dir)
-      try {
-        const name = readManifest(dir).name
-        return typeof name === "string" && name ? name : path.basename(dir)
-      } catch {
-        return path.basename(dir)
-      }
-    }
-    if (dir === root) break
+  if (!isPathInsideWorkspace(root, path.resolve(filePath))) return null
+  for (let dir = path.dirname(path.resolve(filePath)); ; dir = path.dirname(dir)) {
+    if (fs.existsSync(path.join(dir, MANIFEST_FILE))) return manifestName(dir)
+    if (dir === root || path.dirname(dir) === dir) break
   }
   if (isVirtualPackRoot(root)) return derivePackSlug(path.basename(root))
   return null
@@ -425,18 +412,9 @@ export function discoverAgentResources(
       }
     }
     // Tool modules live in per-pack namespaces (tools/<pack>/<name>.ts); their plugins register them by file name.
-    const toolRoot = path.join(resourceRoot, "tools")
-    if (resourcePathStat(toolRoot)?.isDirectory()) {
-      for (const namespace of fs.readdirSync(toolRoot)) {
-        const namespaceDir = path.join(toolRoot, namespace)
-        if (!resourcePathStat(namespaceDir)?.isDirectory()) continue
-        for (const entry of fs.readdirSync(namespaceDir)) {
-          if (!entry.endsWith(".ts") || entry.endsWith(".d.ts") || entry.includes(".test.") || entry.startsWith("_")) continue
-          if (resourcePathStat(path.join(namespaceDir, entry))?.isFile()) toolPaths.set(entry.slice(0, -3), path.join("tools", namespace, entry))
-        }
-      }
-    }
-    Object.assign(repoMcpObj, readMcpServers(readConfigFile(path.join(resourceRoot, "opencode.json")).config))
+    for (const modulePath of toolModulePaths(resourceRoot)) toolPaths.set(toolModuleName(modulePath), modulePath)
+    const configPath = ["opencode.json", "opencode.jsonc"].map(name => path.join(resourceRoot, name)).find(file => resourcePathStat(file)?.isFile())
+    if (configPath) Object.assign(repoMcpObj, readMcpServers(readConfigFile(configPath).config))
   }
 
   const skills: AgentResourceItem[] = [{
@@ -590,7 +568,7 @@ export function updateAgentResources(
   return { changedPaths: [agentPath] }
 }
 
-export type AgentList = AgentInfo[] & { warnings?: string[] }
+export type AgentList = AgentInfo[] & { warnings?: string[]; packNames?: string[] }
 
 export interface NamingAnalysis {
   isValid: boolean
@@ -1022,9 +1000,9 @@ export function renameAgent(
   }
   newFilename = sanitizeFilename(newFilename)
 
-  const oldFilename = path.basename(oldPath)
-  const oldNameNoExt = oldFilename.replace(/\.md$/, "")
-  const newNameNoExt = newFilename.replace(/\.md$/, "")
+  const renamed = agents.find(agent => agent.currentPath === oldPath)
+  const oldNameNoExt = renamed ? agentId(renamed) : path.basename(oldPath, ".md")
+  const newNameNoExt = path.posix.join(path.posix.dirname(oldNameNoExt), newFilename.replace(/\.md$/, ""))
 
   const dir = path.dirname(oldPath)
   const newPath = path.join(dir, newFilename)
@@ -1084,7 +1062,7 @@ export function renameAgent(
 
     // Also check raw body references if old name appears as subagent call
     let newBody = body
-    const referenceRegex = new RegExp("@" + escapeRegExp(oldNameNoExt) + "(?![A-Za-z0-9_-])", "g")
+    const referenceRegex = new RegExp("@" + escapeRegExp(oldNameNoExt) + "(?![A-Za-z0-9_/-])", "g")
     if (referenceRegex.test(body)) {
       referenceRegex.lastIndex = 0
       newBody = body.replace(referenceRegex, `@${newNameNoExt}`)
@@ -1194,7 +1172,7 @@ export function findAgentFiles(
   sourceDir?: string,
   options?: { contentTransform?: (filePath: string, rawContent: string) => string },
 ): AgentList {
-  const resolvedSourceDir = sourceDir || resolveSourceSubdir(workspaceRoot)
+  const resolvedSourceDir = sourceDir || "."
   if (!isWorkspaceRelativePath(resolvedSourceDir)) {
     throw new Error(`sourceDir must stay inside workspace; received '${resolvedSourceDir}'`)
   }
@@ -1210,7 +1188,7 @@ export function findAgentFiles(
   const skippedLinks: string[] = []
 
   /** agentDir: the agents/, agent/, mode/ or modes/ directory the walk is inside, if any (agents may be nested). */
-  function walk(dir: string, agentDir: string | null = null) {
+  function walk(dir: string, agentDir: string | null = null, containerRoot?: string) {
     const basename = path.basename(dir)
     if (IGNORED_DIRS.has(basename)) {
       return
@@ -1236,6 +1214,7 @@ export function findAgentFiles(
       // V2 compatibility: 'agents', 'agent', 'mode', 'modes' are all valid agent directories (never the workspace root itself)
       const agentKind = agentDir ?? (dir !== resolvedRoot && (basename === "agents" || basename === "agent" || basename === "mode" || basename === "modes") ? basename : null)
       const isAgentsDir = agentKind !== null
+      const agentRoot = containerRoot ?? (isAgentsDir ? dir : undefined)
 
       for (const file of files) {
         const fullPath = path.join(dir, file)
@@ -1249,6 +1228,7 @@ export function findAgentFiles(
             const raw = options?.contentTransform ? options.contentTransform(fullPath, fs.readFileSync(fullPath, "utf-8")) : undefined
             const agent = parseAgentFile(fullPath, workspaceRoot, raw)
             if (agent) {
+              agent.id = path.relative(agentRoot!, fullPath).split(path.sep).join("/").slice(0, -3)
               // V2: agents in 'mode' or 'modes' directories are primary agents
               if ((agentKind === "mode" || agentKind === "modes") && !agent.frontmatter.mode) {
                 agent.frontmatter.mode = "primary"
@@ -1259,15 +1239,19 @@ export function findAgentFiles(
             console.error(`Error parsing agent file ${file}:`, e)
           }
         } else {
-          walk(fullPath, agentKind)
+          walk(fullPath, agentKind, agentRoot)
         }
       }
     }
   }
 
-  walk(sourceRoot)
-  if (!sourceDir && isVirtualPackRoot(resolvedRoot)) {
-    const seenPaths = new Set(agents.map(agent => path.resolve(agent.currentPath)))
+  const packDirs = sourceDir ? [] : [...discoverPackDirs(resolvedRoot)]
+  if (sourceDir) walk(sourceRoot)
+  for (const dir of packDirs) {
+    if (!fs.lstatSync(path.join(dir, MANIFEST_FILE)).isFile()) continue
+    for (const kind of ["agents", "agent", "mode", "modes"]) walk(path.join(dir, kind), kind)
+  }
+  if (!sourceDir && !packDirs.length) {
     const { agents: looseAgents, skippedLinks: looseSkipped } = scanLooseAgentFiles(resolvedRoot)
     for (const link of looseSkipped) {
       const fullLink = path.join(resolvedRoot, ...link.split("/"))
@@ -1275,22 +1259,23 @@ export function findAgentFiles(
     }
     for (const loose of looseAgents) {
       const fullPath = path.join(resolvedRoot, ...loose.sourceRel.split("/"))
-      if (seenPaths.has(path.resolve(fullPath))) continue
       try {
         const raw = options?.contentTransform ? options.contentTransform(fullPath, fs.readFileSync(fullPath, "utf-8")) : undefined
         const agent = parseAgentFile(fullPath, workspaceRoot, raw)
         if (agent) {
+          agent.id = loose.id
           if ((loose.containerKind === "mode" || loose.containerKind === "modes") && !agent.frontmatter.mode) {
             agent.frontmatter.mode = "primary"
           }
           agents.push(agent)
-          seenPaths.add(path.resolve(fullPath))
         }
       } catch (e) {
         console.error(`Error parsing agent file ${loose.sourceRel}:`, e)
       }
     }
   }
+  const names = packDirs.map(manifestName).filter(name => name !== null)
+  if (names.length) (agents as AgentList).packNames = names
   const warnings = [
     ...(agents.length === 0 ? [`No agents found under sourceDir '${resolvedSourceDir}' (${sourceRoot})`] : []),
     ...skippedLinks.map(link => `Skipped symlink ${path.relative(workspaceRoot, link)}: agents are never read or edited through links`),

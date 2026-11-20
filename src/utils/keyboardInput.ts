@@ -3,7 +3,7 @@ import { terminalSafeText } from "./terminalText.js"
 export const PASTE_START = "\x1b[200~"
 export const PASTE_END = "\x1b[201~"
 
-const MAX_PASTE_CHARS = 4096
+export const MAX_PASTE_CHARS = 4096
 const MAX_PASTE_EVENTS = 256
 
 export interface PasteBuffer {

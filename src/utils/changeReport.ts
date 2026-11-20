@@ -33,3 +33,15 @@ export function describeChangeResult(target: string, result: ChangeResult): stri
   lines.push(outcome[result.status])
   return lines
 }
+
+/** The only two statuses that mean the target ended in the desired state. */
+const changeSucceeded = (status: ChangeResult["status"]) => status === "applied" || status === "unchanged"
+
+/** One-line toast for a change outcome, for the TUI (and anywhere else that needs a single line). */
+export function changeToast(target: string, result: ChangeResult): string {
+  const lines = describeChangeResult(target, result)
+  const last = lines[lines.length - 1]
+  if (changeSucceeded(result.status)) return `✓ ${last}`
+  const detail = result.status === "failed" ? lines.find(line => line.startsWith("ERROR:")) ?? last : last
+  return `✗ ${detail}`
+}

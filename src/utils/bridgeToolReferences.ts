@@ -85,17 +85,16 @@ const CODEX_TABLE: TargetToolTable = {
 
 const TABLES: Record<BridgeTarget, TargetToolTable> = { claude: CLAUDE_TABLE, codex: CODEX_TABLE }
 
-/**
- * OpenCode custom tools shipped by this repository (`tools/dev-tools/dev_*.ts`, `tools/pipeline/pipeline_*.ts`).
- * Any `pipeline_<name>` identifier (and the four `dev_*` tools) is treated as one, so new tools are covered
- * without editing this list; the named ones are always recognized.
- */
-export const OPENCODE_ONLY_TOOLS = ["pipeline_state", "pipeline_commit", "dev_verify", "dev_smoke", "dev_serve", "dev_env"] as const
-const OPENCODE_CUSTOM_TOOL = /\b(?:pipeline_[a-z][a-z0-9_]*|dev_(?:env|verify|smoke|serve))\b/g
+/** Module names and their family wildcards identify tools contributed by this pack. */
+export function isOpenCodeCustomToolKey(key: string, tools: ReadonlySet<string>): boolean {
+  if (tools.has(key)) return true
+  return key.endsWith("_*") && [...tools].some(tool => tool.startsWith(key.slice(0, -1)))
+}
 
-/** True for permission keys that name an OpenCode custom tool rather than an MCP server. */
-export function isOpenCodeCustomToolKey(key: string): boolean {
-  return (OPENCODE_ONLY_TOOLS as readonly string[]).includes(key) || /^(?:dev|pipeline)_[a-z][a-z0-9_]*$/.test(key)
+/** Older prompts sometimes insert a role word inside a delegated agent's name. */
+export function legacyAgentAlias(normalized: string, aliases: ReadonlyMap<string, string>): string | undefined {
+  const compact = normalized.split("-").filter(word => word !== "orchestrator" && word !== "agent").join("-")
+  return aliases.get(compact)
 }
 
 /** Marker that makes the note idempotent across repeated rewrites. */
@@ -134,14 +133,15 @@ export function adaptToolReferences(
   body: string,
   target: BridgeTarget,
   frontmatter?: Record<string, any>,
-  options: { mcpServers?: string[] } = {}
+  options: { mcpServers?: string[]; customTools?: ReadonlySet<string> } = {}
 ): ToolReferenceResult {
   if (body.includes(RUNTIME_NOTE_MARKER)) return { body, unavailable: [], renamed: [] }
   const table = TABLES[target]
 
   const unavailable = new Set<string>()
-  for (const key of permissionKeys(frontmatter)) if (isOpenCodeCustomToolKey(key)) unavailable.add(key)
-  for (const match of body.matchAll(OPENCODE_CUSTOM_TOOL)) unavailable.add(match[0])
+  const customTools = options.customTools ?? new Set<string>()
+  for (const key of permissionKeys(frontmatter)) if (isOpenCodeCustomToolKey(key, customTools)) unavailable.add(key)
+  for (const token of body.match(/[\w-]+/g) ?? []) if (customTools.has(token)) unavailable.add(token)
 
   const guidance = table.guidance.filter(entry => body.search(entry.pattern) !== -1)
   let rewritten = body
@@ -173,7 +173,7 @@ export function adaptToolReferences(
   if (mcpServers.length > 0) {
     lines.push(target === "claude"
       ? `> - MCP tools named \`<server>_<tool>\` in this prompt are exposed as \`mcp__<server>__<tool>\` (plugin-scoped: \`mcp__plugin_<plugin>_<server>__<tool>\`); servers: ${mcpServers.map(server => `\`${server}\``).join(", ")}.`
-      : `> - MCP tools named \`<server>_<tool>\` in this prompt come from the plugin's MCP servers: ${mcpServers.map(server => `\`${server}\``).join(", ")}.`)
+      : `> - For MCP tools named \`<server>_<tool>\` in this prompt, look up the tool by server and name in Codex. Configured servers include ${mcpServers.map(server => `\`${server}\``).join(", ")}.`)
   }
   return { body: insertNearTop(rewritten, lines.join("\n")), unavailable: sortedUnavailable, renamed }
 }

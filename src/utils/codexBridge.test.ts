@@ -5,6 +5,7 @@ import path from "node:path"
 import test from "node:test"
 import {
   bridgeToCodex,
+  codexNextSteps,
   resolveCodexModel,
   writeCodexPlugin,
 } from "./codexBridge.js"
@@ -33,9 +34,9 @@ function agent(
 }
 
 test("Codex roles map planning to Sol/high and execution to Luna/max", () => {
-  const primary = agent("pipeline-orchestrator.md", "github-copilot/claude-opus-5", { mode: "primary" }, "")
-  const opus = agent("pipeline-reviewer.md", "github-copilot/claude-opus-5", {}, "")
-  const luna = agent("pipeline-explorer.md", "github-copilot/gpt-5.6-luna", {}, "")
+  const primary = agent("orchestrator.md", "github-copilot/claude-opus-5", { mode: "primary" }, "")
+  const opus = agent("reviewer.md", "github-copilot/claude-opus-5", {}, "")
+  const luna = agent("explorer.md", "github-copilot/gpt-5.6-luna", {}, "")
 
   assert.deepEqual(resolveCodexModel(primary), { model: "gpt-5.6-sol", reasoningEffort: "high" })
   assert.deepEqual(resolveCodexModel(opus), { model: "gpt-5.6-luna", reasoningEffort: "max" })
@@ -69,14 +70,20 @@ test("bridge emits manifest, Codex agents, skills and translated links", () => {
   const manifestPath = path.join(output, ".codex-plugin", "plugin.json")
   const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"))
   assert.equal(manifest.name, "decent-pipeline")
-  assert.equal(manifest.author.name, "Lorenzo Cancellara")
-  assert.equal(manifest.skills, "./skills/")
+  assert.equal(manifest.author.name, "manage-agents")
+  assert.equal(manifest.skills, "./.agents/skills/")
+  const marketplace = JSON.parse(fs.readFileSync(path.join(output, ".agents", "plugins", "marketplace.json"), "utf8"))
+  assert.equal(marketplace.name, "decent-pipeline-local")
+  assert.deepEqual(marketplace.plugins[0].source, { source: "local", path: "./" })
 
   const orchestratorToml = fs.readFileSync(path.join(output, ".codex", "agents", "orchestrator.toml"), "utf8")
   assert.match(orchestratorToml, /model = "gpt-5\.6-sol"/)
   assert.match(orchestratorToml, /model_reasoning_effort = "high"/)
   assert.match(orchestratorToml, /@fast-lane/)
-  assert.ok(fs.existsSync(path.join(output, "skills", "orchestrator", "SKILL.md")))
+  assert.equal(fs.readFileSync(path.join(output, ".codex", "config.toml"), "utf8"), "[agents]\nmax_depth = 2\n")
+  assert.ok(fs.existsSync(path.join(output, manifest.skills, "orchestrator", "SKILL.md")))
+  assert.match(codexNextSteps(result)[1], /delegate the task to the orchestrator subagent/)
+  assert.equal(codexNextSteps({ ...result, pluginDir: "/my project's bridge" })[0], `  codex -C '/my project'"'"'s bridge'`)
   assert.match(fs.readFileSync(path.join(output, "README.md"), "utf8"), /Source and configuration/)
   assert.match(fs.readFileSync(path.join(output, "README.md"), "utf8"), /`bridges\/translation-config\.json`/)
   assert.doesNotMatch(fs.readFileSync(path.join(output, "README.md"), "utf8"), /\.agent-manager|`src\/`|general\//)
@@ -111,6 +118,7 @@ test("role targets can be overridden without changing source agents", () => {
   assert.equal(result.plugin.agents[1].model, "custom-default")
   assert.equal(result.plugin.skills.length, 0)
   assert.ok(!fs.existsSync(path.join(output, "README.md")))
+  assert.ok(!fs.existsSync(path.join(output, ".agents")))
 })
 
 test("codex.modelMap maps the source model into the emitted TOML without a reasoning effort", () => {
@@ -249,8 +257,67 @@ test("Codex plugin mirrors enabled MCP servers in a valid companion layer", () =
   assert.equal(manifest.mcpServers, "./.mcp.json")
   const mcp = JSON.parse(fs.readFileSync(path.join(output, ".mcp.json"), "utf8"))
   assert.deepEqual(Object.keys(mcp.mcpServers), ["docs", "cupertino"])
+  const projectConfig = fs.readFileSync(path.join(output, ".codex", "config.toml"), "utf8")
+  assert.match(projectConfig, /\[mcp_servers\."docs"\]\ncommand = "docs-mcp"\nargs = \["--stdio"\]/)
+  assert.match(projectConfig, /\[mcp_servers\."cupertino"\]/)
   assert.match(fs.readFileSync(path.join(output, "README.md"), "utf8"), /## MCP setup/)
   assert.ok(result.files.some(file => file.split(path.sep).join("/").endsWith("/.mcp.json")))
+})
+
+test("Codex exports MCP credentials by environment name and preserves tool denies", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-mcp-settings-"))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  fs.writeFileSync(path.join(root, "opencode.jsonc"), `// MCP settings
+  ${JSON.stringify({ mcp: { servers: {
+    local_docs: {
+      type: "local", command: ["docs-mcp", "two words"], disabled: true,
+      environment: { DOCS_KEY: "{env:DOCS_KEY}", ALIAS_KEY: "{env:ORIGINAL_KEY}", LANGUAGE: "en" }
+    },
+    remote_docs: {
+      type: "remote", url: "https://example.test/mcp", timeout: 2500,
+      headers: { Authorization: "Bearer {env:DOCS_TOKEN}", "X-Account": "{env:DOCS_ACCOUNT}", Accept: "application/json" }
+    }
+  } } })}`)
+  const worker = agent("worker.md", "any", { permission: {
+    "local_docs_*": "allow", local_docs_remove_record: "deny"
+  } }, "")
+  const output = path.join(root, "codex")
+  const result = bridgeToCodex([worker], "test", "", output, root)
+  const { mcpServers } = JSON.parse(fs.readFileSync(path.join(output, ".mcp.json"), "utf8"))
+  assert.deepEqual(mcpServers.local_docs, {
+    command: "docs-mcp", args: ["two words"], env: { LANGUAGE: "en" },
+    env_vars: ["DOCS_KEY", "ALIAS_KEY"], disabled_tools: ["remove_record"]
+  })
+  assert.deepEqual(mcpServers.remote_docs, {
+    url: "https://example.test/mcp", bearer_token_env_var: "DOCS_TOKEN",
+    env_http_headers: { "X-Account": "DOCS_ACCOUNT" }, http_headers: { Accept: "application/json" }, tool_timeout_sec: 2.5
+  })
+  const projectConfig = fs.readFileSync(path.join(output, ".codex", "config.toml"), "utf8")
+  assert.match(projectConfig, /disabled_tools = \["remove_record"\]/)
+  assert.match(projectConfig, /env_http_headers = \{ "X-Account" = "DOCS_ACCOUNT" \}/)
+  assert.ok(result.warnings.some(warning => warning.includes("'ALIAS_KEY'")))
+  assert.ok(result.warnings.some(warning => warning.includes("entire Codex session")))
+
+  const deny = agent("reviewer.md", "any", { permission: { "local_docs_*": "deny" } }, "")
+  assert.throws(() => bridgeToCodex([worker, deny], "test", "", path.join(root, "denied"), root), /deny pattern Codex cannot enforce/)
+  const noMcp = path.join(root, "without-mcp")
+  bridgeToCodex([worker, deny], "test", "", noMcp, root, {
+    ...DEFAULT_TRANSLATION_CONFIG,
+    codex: { ...DEFAULT_TRANSLATION_CONFIG.codex, emitMcp: false, emitSkills: false }
+  })
+  assert.ok(!fs.existsSync(path.join(noMcp, ".mcp.json")))
+  assert.ok(!fs.existsSync(path.join(noMcp, ".codex", "config.toml")))
+})
+
+test("Codex detects collisions before writing the generated project", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-collision-"))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const output = path.join(root, "codex")
+  assert.throws(() => bridgeToCodex([
+    agent("docs-review_code.md", "any", {}, ""),
+    agent("docs-review-code.md", "any", {}, "")
+  ], "docs", "docs-", output, root), /Multiple agents map to the Codex name 'review-code'/)
+  assert.ok(!fs.existsSync(output))
 })
 
 test("translates V1 and V2 OpenCode MCP declarations to the same Codex .mcp.json", () => {
@@ -366,6 +433,8 @@ test("writeCodexPlugin refuses a symlinked output pointing outside the workspace
 test("Codex bridge translates OpenCode tool names and flags OpenCode-only tools once", () => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "codex-bridge-tools-"))
   const output = path.join(workspace, "bridges", "codex")
+  fs.mkdirSync(path.join(workspace, "tools", "extra"), { recursive: true })
+  for (const name of ["pipeline_state", "dev_env"]) fs.writeFileSync(path.join(workspace, "tools", "extra", `${name}.js`), "export default {}")
   const body = "# Orchestrator\n\nUse `todowrite` to track work. Call `pipeline_state` if it is available; otherwise use the fallback.\nAsk the user (use `question`) and launch two Task calls in one turn.\nRun dev_env before smoke tests."
   const orchestrator = agent("pipeline-orchestrator.md", "any", { mode: "primary", permission: { pipeline_state: "allow", pipeline_commit: "deny", todowrite: "allow", bash: { "*": "deny", "git status*": "allow", "rm *": "ask" } } }, body)
   const result = bridgeToCodex([orchestrator], "decent-pipeline", "pipeline-", output, workspace)

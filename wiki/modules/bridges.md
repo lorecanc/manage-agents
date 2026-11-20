@@ -177,7 +177,7 @@ Claude Code plugin agents do not support `permissionMode` or `disallowedTools` f
 | `webfetch`, `websearch`, `skill`, `lsp`, `question`, `todowrite` | `WebFetch`, `WebSearch`, `Skill`, `LSP`, `AskUserQuestion`, `TodoWrite` | Included when `objectAllowsAny` is true. `webfetch` URL patterns warn and drop. |
 | `<server>_*` / `<server>_<tool>` | `mcp__<server>__*`, `mcp__plugin_<plugin>_<server>__*` | If any tool on `<server>` is denied, server wildcards are suppressed and only explicit `<tool>` allows are emitted (with a warning). |
 | `ask` rules | Tool included in `tools` | Scalar `ask` or `*: ask` on `PROMOTED_ASK_KEYS` (`websearch`, `skill`, `lsp`, `question`, `todowrite`, `edit`, `bash`, `shell`, `webfetch`) warns that `ask` is promoted to allow. |
-| OpenCode-only keys | *(dropped)* | `doom_loop`, `external_directory`, `artifact`, `file-diff`, `mcp-resource`, `opencode_*`, custom `pipeline_*`/`dev_*` tools, `hidden: true`, and `temperature` emit warnings and are omitted. |
+| OpenCode-only keys | *(dropped)* | `doom_loop`, `external_directory`, `artifact`, `file-diff`, `mcp-resource`, `opencode_*`, custom tools shipped by the pack, `hidden: true`, and `temperature` emit warnings and are omitted. |
 
 ### Validation, Registration & Next Steps
 
@@ -192,14 +192,14 @@ Claude Code plugin agents do not support `permissionMode` or `disallowedTools` f
 
 The Codex path resolves model and reasoning-effort targets, translates the requested pack's agents, and writes the plugin manifest and project-level configuration beneath the supplied output directory. Its result exposes the generated plugin, files, warnings, and per-agent resolution preview; the shared workspace wrapper stages and mirrors the output as described above.
 
-- `.codex-plugin/plugin.json`: Codex manifest (`renderManifest`) declaring `name`, `version: "1.0.0"`, `author`, `interface` metadata (`capabilities: ["Skills", "Subagents"]` when skills are enabled), and relative pointers to `./skills/` and `./.mcp.json`.
+- `.codex-plugin/plugin.json` points to `./.agents/skills/` and `./.mcp.json` when emitted. `.agents/plugins/marketplace.json` lists the plugin for local installation when it includes skills or MCP.
 - `.codex/agents/<name>.toml`: Agent definitions rendered by `renderCodexAgentToml`:
   - `name`, `description`, `model`, and optional `model_reasoning_effort` (mapped from `ModelTarget.reasoningEffort`, such as `"high"` or `"max"`).
   - `developer_instructions`: Prompt body with `@agent` mentions rewritten to normalized Codex subagent names (`rewriteReferences`), adapted tool references, and an appended `## Delegation targets` section listing allowed `@<subagent>` targets (`appendDelegationTargets`).
   - `sandbox_mode`: Computed by `resolveSandboxMode(agent)`. Emits `"workspace-write"` if any of `write`, `edit`, `apply_patch`, `patch`, `multiedit`, `bash`, `shell`, or `execute` has an allow rule (`true`, `"allow"`, or an allowing pattern); otherwise emits `"read-only"`. (`danger-full-access` is never emitted by the bridge.)
-- `skills/<name>/SKILL.md`: Emitted for every translated agent when `codex.emitSkills !== false` (`renderCodexSkill`), wrapping `developerInstructions` with `name` and `description` frontmatter as the replacement for deprecated `~/.codex/prompts`.
-- `.mcp.json`: Emitted when `codex.emitMcp !== false` and servers exist (`buildCodexMcpConfig`), translating remote servers to `{ url }` and stdio servers to `{ command, args, env }` while enforcing the same server-wide deny check as Claude Code.
-- `README.md`: Emitted when `codex.emitReadme !== false` (`renderReadme`), documenting generated artifacts, MCP setup, non-enforced per-agent bash allowlists, primary orchestrator (`@orchestrator`), and translation warnings.
+- `.agents/skills/<name>/SKILL.md` carries each translated agent's instructions when `codex.emitSkills !== false`.
+- `.codex/config.toml` supplies project settings for trusted folders. For a pack with a primary agent and additional agents, it permits the primary subagent to delegate one level deeper. The project and plugin's `.mcp.json` use the same MCP entries. The bridge translates stdio environment forwarding and HTTP authentication references. Explicit tool denies become session-wide `disabled_tools`. An unrepresentable deny pattern blocks export of the server and fails the bridge if a translated agent requires it.
+- `README.md` documents project launch, plugin installation, MCP setup, translation warnings, and the name of the primary agent when present. The CLI and the TUI both print the project launch command.
 
 ## Prompt Tool Adaptation & Drift Checking
 
@@ -209,7 +209,7 @@ The Codex path resolves model and reasoning-effort targets, translates the reque
 
 - **Claude Code (`CLAUDE_TABLE`)**: Rewrites `\btodowrite\b` to `TodoWrite`, `\bTask (tool|calls?|call\(s\))` to `Agent ...`, and backticked tool identifiers so prose words remain intact: `` `question` `` -> `` `AskUserQuestion` ``, `` `task` `` -> `` `Agent` ``, `` `read` `` -> `` `Read` ``, `` `grep` `` -> `` `Grep` ``, `` `glob` `` -> `` `Glob` ``, `` `lsp` `` -> `` `LSP` ``, `` `skill` `` -> `` `Skill` ``, `` `webfetch` `` -> `` `WebFetch` ``, `` `websearch` `` -> `` `WebSearch` ``, `` `bash` `` -> `` `Bash` ``, `` `edit` `` -> `` `Edit` ``, and `` `write` `` -> `` `Write` ``.
 - **Codex (`CODEX_TABLE`)**: Rewrites `\btodowrite\b` to `update_plan` and records targeted guidance bullets when prompts mention `` `question` `` (ask directly in reply), `` `task` `` / `Task tool` (delegate to subagents under `Delegation targets`), `` `read` `` / `` `grep` `` / `` `glob` `` / `` `lsp` `` (use shell commands such as `rg` or `sed -n`), or `` `edit` `` / `` `write` `` (use `apply_patch`).
-- **OpenCode-only custom tools & runtime note**: Scans permissions and prompt text for `OPENCODE_ONLY_TOOLS` (`pipeline_state`, `pipeline_commit`, `dev_verify`, `dev_smoke`, `dev_serve`, `dev_env`) and any `pipeline_<name>` identifier (`isOpenCodeCustomToolKey`). When renames, guidance, MCP servers, or unavailable tools are present, `insertNearTop` injects a single blockquote immediately after a leading `# Heading` (or at line 1) guarded by `RUNTIME_NOTE_MARKER` (`Runtime note (OpenCode bridge)`) for idempotency.
+- **OpenCode-only custom tools & runtime note**: Matches permissions and prompt text against tool modules in the pack and its dependencies. When renames, guidance, MCP servers, or unavailable tools are present, `insertNearTop` injects a single blockquote immediately after a leading `# Heading` (or at line 1) guarded by `RUNTIME_NOTE_MARKER` (`Runtime note (OpenCode bridge)`) for idempotency.
 
 ### Byte-Exact Drift Verification (`bridgeCheck.ts`)
 

@@ -3,11 +3,13 @@ import fs from "node:fs"
 import path from "node:path"
 import os from "node:os"
 import { isDeepStrictEqual } from "node:util"
-import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react"
+import { useKeyboard, usePaste, useRenderer, useTerminalDimensions } from "@opentui/react"
 import {
   extractFrontmatter,
   findAgentFiles,
+  agentId,
   AgentInfo,
+  type AgentList,
   updateAgentsModel,
   repairAgentModels,
   updateAgentsColor,
@@ -68,6 +70,7 @@ import {
   saveUserPackCallers,
   saveUserPackFlow,
   sourceBridgeOutputDir,
+  standaloneBridgeKey,
   sourceTranslationConfigLocation,
   type FlowDraftInput,
 } from "./utils/sourceCustomization.js"
@@ -90,7 +93,7 @@ import {
   type ScaffoldResourceKind,
   type SemverReleaseKind,
 } from "./utils/packOnboarding.js"
-import { bridgeConfirmationsNeeded, bridgePack, resolveBridgeWorkspaceTrust } from "./utils/bridgeWorkspace.js"
+import { bridgeConfirmationsNeeded, bridgePack, resolveBridgeWorkspaceTrust, type BridgePackOptions } from "./utils/bridgeWorkspace.js"
 import {
   applyBridgeDraftToConfig,
   buildPackBridgePreview,
@@ -126,6 +129,7 @@ import {
   type TranslationTier,
 } from "./utils/translationConfig.js"
 import { claudeNextSteps } from "./utils/claudeNextSteps.js"
+import { codexNextSteps } from "./utils/codexBridge.js"
 import { registerPlugin, validatePlugin } from "./utils/claudePluginCli.js"
 import { AUTO_COMMIT_MESSAGES, autoCommitEnabled, repositoryTransaction, type TransactionWarning } from "./utils/repositoryTransaction.js"
 import {
@@ -145,7 +149,7 @@ import { loadUiConfig, saveUiConfig } from "./utils/uiConfig.js"
 import { displayWidth, middleEllipsis, terminalSafeText } from "./utils/terminalText.js"
 import { buildContextualShortcuts, filterPaletteCommands, type PaletteCommand, type WorkspaceTab } from "./utils/commandPalette.js"
 import { buildSourceWorkspaceRows } from "./utils/sourceRows.js"
-import { consumePasteSequence, emptyPasteBuffer, sanitizePasteText, type PasteBuffer } from "./utils/keyboardInput.js"
+import { MAX_PASTE_CHARS, consumePasteSequence, emptyPasteBuffer, sanitizePasteText, type PasteBuffer } from "./utils/keyboardInput.js"
 import { loadRecentSourcePaths, recordRecentSourcePath, saveRecentSourcePaths, suggestLocalPaths, type RecentSourcePaths } from "./utils/recentSourcePaths.js"
 import { buildPreviewUnifiedDiff, fractionalBar, gaugeBar, lerpColor, sanitizeHexColor, terminalSafeMarkdown, THEME } from "./utils/uiTheme.js"
 import { isReducedMotionPreferred, useAnimatedNumber, useFlashDecay, usePulseLoop } from "./ui/animations.js"
@@ -318,6 +322,13 @@ interface ColorTreeItem {
   value: string
 }
 
+/** Standalone pack roots cannot contain generated bridge or config files. */
+function externalBridgeKey(ds: ActiveDataSource | null): string | null {
+  if (!ds) return null
+  if (ds.kind === "source" && ds.source.kind === "git") return ds.source.name
+  return standaloneBridgeKey(ds.root)
+}
+
 export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNotice, listShare = 2 / 3, reducedMotion: reducedMotionProp, uiConfigWarning, configReadOnly = false, uiConfigRevision = "missing", initialModelCatalog }: AppProps) {
   const renderer = useRenderer()
   const [reducedMotionState, setReducedMotionState] = useState<boolean>(() => isReducedMotionPreferred(reducedMotionProp))
@@ -368,7 +379,8 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   const mutate = <T,>(paths: string[], operation: keyof typeof AUTO_COMMIT_MESSAGES, fn: () => T) =>
     repositoryTransaction(workspaceRoot, paths, AUTO_COMMIT_MESSAGES[operation], fn)
   // Data State
-  const [agents, setAgents] = useState<AgentInfo[]>([])
+  const [agents, setAgents] = useState<AgentList>([])
+  const bridgeStorageKey = useMemo(() => externalBridgeKey(activeDataSource), [activeDataSource, agents])
   const [models, setModels] = useState<string[]>(() => (initialModelCatalog?.status === "verified" ? initialModelCatalog.models : []))
   const [modelCatalog, setModelCatalog] = useState<ModelCatalog>(() => initialModelCatalog ?? { status: "unavailable", models: [] })
   const [repairGroupKey, setRepairGroupKey] = useState<string | null>(null)
@@ -521,8 +533,9 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   const loadTranslationFor = (ds: ActiveDataSource | null): TranslationConfig | null => {
     if (!ds) return null
     try {
-      if (ds.kind === "source" && ds.source.kind === "git") {
-        const loc = sourceTranslationConfigLocation(ds.source.name, ds.root)
+      const key = externalBridgeKey(ds)
+      if (key) {
+        const loc = sourceTranslationConfigLocation(key, ds.root)
         const baseRoot = fs.existsSync(loc.configPath) ? loc.configRoot : ds.root
         return loadTranslationConfig(baseRoot, loc.readPath, { persistMigration: false })
       }
@@ -959,11 +972,12 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     setViewMode("pack-init")
   }
 
-  const switchToDataSource = (next: ActiveDataSource, options: { keepTab?: boolean } = {}) => {
+  const switchToDataSource = (next: ActiveDataSource, beforeActivate?: () => void) => {
     const loadedAgents = next.kind === "source" && next.source.kind === "git"
       ? loadSourceAgents(next.root)
       : findAgentFiles(next.root)
     const loadedConfig = loadTranslationFor(next)
+    beforeActivate?.()
     setActiveDataSource(next)
     setActiveRevision(next.kind === "source" ? sourceRevision(next.source) : null)
     if (next.kind === "source") setActiveSourceName(next.source.name)
@@ -978,7 +992,8 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     setSearchQuery("")
     setIsSearching(false)
     setLayoutStatus("")
-    if (!options.keepTab) setWorkspaceTab("catalog")
+    setWorkspaceTab("catalog")
+    setActivePane("list")
     refreshTargetStatus()
     const isNextVirtual = Boolean(next.root && isVirtualPackRoot(next.root))
     if (isNextVirtual && !promptedVirtualRootsRef.current.has(next.root)) {
@@ -998,8 +1013,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       }
       const registry = loadSources()
       registry.active = source.name
-      saveSources(registry)
-      switchToDataSource({ kind: "source", source, root: sourceRoot(source) }, { keepTab: true })
+      switchToDataSource({ kind: "source", source, root: sourceRoot(source) }, () => saveSources(registry))
     } catch (error: any) {
       setSourcesStatus(`Could not open ${source.name}: ${terminalSafeText(error?.message || error)}`)
     }
@@ -1021,21 +1035,21 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     if (!trimmed) return
     try {
       const registry = loadSources()
+      const spec = validateSourceSpec(trimmed)
+      if ("error" in spec) throw new Error(spec.error)
       const existing = registry.sources.find(candidate =>
-        candidate.kind === "local"
-          ? (() => { try { return candidate.path === fs.realpathSync(path.resolve(trimmed)) } catch { return false } })()
-          : candidate.url.toLowerCase().replace(/\.git$/i, "") === `https://github.com/${trimmed.replace(/^(?:github|gh):/i, "").split("#")[0].replace(/\.git$/i, "").toLowerCase()}`
+        candidate.kind === "local" ? spec.kind === "local" && candidate.path === spec.path :
+          spec.kind === "git" && candidate.ref === spec.ref && candidate.url.replace(/\.git$/, "") === spec.spec.replace(/\.git$/, "")
       )
       const source = existing ?? addSource(registry, deriveSourceName(trimmed, registry), trimmed)
       registry.active = source.name
-      saveSources(registry)
-      if (source.kind === "local") rememberSourcePath(source, trimmed)
-      if (source.kind === "git" && !fs.existsSync(path.join(sourceRoot(source), ".git"))) {
+      if (source.kind === "git" && (!existing || !sourceRevision(source))) {
         pullSource(source)
       }
+      switchToDataSource({ kind: "source", source, root: sourceRoot(source) }, () => saveSources(registry))
+      if (source.kind === "local") rememberSourcePath(source, trimmed)
       setSourcesQuery("")
       setSourcesInputFocused(false)
-      switchToDataSource({ kind: "source", source, root: sourceRoot(source) }, { keepTab: true })
     } catch (error: any) {
       setSourcesStatus(`Attach failed: ${terminalSafeText(error?.message || error)}`)
     }
@@ -1314,8 +1328,8 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         roles: bridgeDraftRoles,
       })
       let txWarning: TransactionWarning | undefined
-      if (activeDataSource.kind === "source" && activeDataSource.source.kind === "git") {
-        const loc = sourceTranslationConfigLocation(activeDataSource.source.name, workspaceRoot)
+      if (bridgeStorageKey) {
+        const loc = sourceTranslationConfigLocation(bridgeStorageKey, workspaceRoot)
         saveTranslationConfig(loc.configRoot, nextConfig, loc.configPath)
       } else {
         const tx = mutate([translationConfigPath(workspaceRoot)], "config", () => saveTranslationConfig(workspaceRoot, nextConfig))
@@ -1393,18 +1407,19 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         pluginName: trimmedName,
         modelCatchAll: bridgeModelTarget,
       })
+      const bridgeOptions: Omit<BridgePackOptions, "outputDir"> = { workspaceRoot, pack, target: bridgeTarget, config, pluginName: trimmedName, prefix, trusted, allowUntrustedExecutable: true }
       let result: ReturnType<typeof bridgePack>
       let txWarning: TransactionWarning | undefined
-      if (activeDataSource.kind === "source" && activeDataSource.source.kind === "git") {
-        const loc = sourceTranslationConfigLocation(activeDataSource.source.name, workspaceRoot)
-        const outputDir = sourceBridgeOutputDir(activeDataSource.source.name, bridgeTarget, safePluginName)
+      if (bridgeStorageKey) {
+        const loc = sourceTranslationConfigLocation(bridgeStorageKey, workspaceRoot)
+        const outputDir = sourceBridgeOutputDir(bridgeStorageKey, bridgeTarget, safePluginName)
         saveTranslationConfig(loc.configRoot, config, loc.configPath)
-        result = bridgePack({ workspaceRoot, pack, target: bridgeTarget, outputDir, config, pluginName: trimmedName, prefix, trusted, allowUntrustedExecutable: true })
+        result = bridgePack({ ...bridgeOptions, outputDir })
       } else {
         const outputDir = path.join(workspaceRoot, "bridges", bridgeTarget === "codex" ? "codex" : "claude-code", safePluginName)
         const tx = mutate([translationConfigPath(workspaceRoot), outputDir], "bridge", () => {
           saveTranslationConfig(workspaceRoot, config)
-          return bridgePack({ workspaceRoot, pack, target: bridgeTarget, outputDir, config, pluginName: trimmedName, prefix, trusted, allowUntrustedExecutable: true })
+          return bridgePack({ ...bridgeOptions, outputDir })
         })
         result = tx.value
         txWarning = tx.warning
@@ -1420,7 +1435,9 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         const counts = result.preview.reduce<Record<string, number>>((acc, item) => { acc[item.source] = (acc[item.source] || 0) + 1; return acc }, {})
         lines.push(``, `Preview summary: ${Object.entries(counts).map(([source, count]) => `${count} by ${source}`).join(", ")}`, ...result.preview.map(item => `  ${item.agent} → ${item.role} → ${item.tier} → ${item.model} → ${item.source}`))
       }
-      lines.push(``, ...(bridgeTarget === "codex" || !("pluginName" in result) ? [`Codex project-scoped agents:`, `  cd ${result.pluginDir} && codex`, ``, `Plugin manifest:`, `  ${result.pluginDir}/.codex-plugin/plugin.json`] : [`Validate and run locally:`, ...claudeNextSteps(result.pluginName, result.orchestratorName, result.pluginDir)]))
+      lines.push("", ...("plugin" in result
+        ? ["Open the generated project in Codex:", ...codexNextSteps(result)]
+        : ["Validate and run locally:", ...claudeNextSteps(result.pluginName, result.orchestratorName, result.pluginDir)]))
       if (bridgeTarget === "claude" && "pluginName" in result) {
         let registrationSkipped = false
         if (bridgeConfig.claude.autoValidate !== false) {
@@ -1493,21 +1510,19 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     }
   }, [colorTreeItems.length])
 
+  const catalogPacks = useMemo(
+    () => [...new Set([...(agents.packNames ?? []), ...agents.map(agent => agent.category)])].sort(comparePackCategories),
+    [agents],
+  )
+
   // Filter and build active list items in real-time
   const activeItems = useMemo<ActiveItem[]>(() => {
-    const filtered = agents.filter((a) =>
-      a.filename.toLowerCase().includes(searchQuery.toLowerCase())
-    )
-
+    const query = searchQuery.trim().toLowerCase()
     const items: ActiveItem[] = []
-
-    // Get unique categories dynamically from the parsed agents
-    const categoriesSet = new Set<string>()
-    agents.forEach((a) => categoriesSet.add(a.category))
-    const categoriesList = Array.from(categoriesSet).sort(comparePackCategories)
-    categoriesList.forEach((cat) => {
-      const catAgents = filtered.filter((a) => a.category === cat)
-      if (catAgents.length === 0) return
+    catalogPacks.forEach(cat => {
+      const matchesPack = cat.toLowerCase().includes(query)
+      const catAgents = agents.filter(agent => agent.category === cat && (matchesPack || agentId(agent).toLowerCase().includes(query) || agent.filename.toLowerCase().includes(query)))
+      if (!matchesPack && !catAgents.length) return
 
       // A search opens every folder with matches, like the provider folders of the model selector.
       const isExpanded = searchQuery.trim() !== "" || expandedCategories.has(cat)
@@ -1532,11 +1547,11 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     })
 
     return items
-  }, [agents, searchQuery, expandedCategories])
+  }, [agents, catalogPacks, searchQuery, expandedCategories])
 
   const delegationItems = useMemo(
     () => delegationTargetAgent
-      ? agents.filter((a) => a.filename.replace(/\.md$/, "") !== delegationTargetAgent.filename.replace(/\.md$/, ""))
+      ? agents.filter((a) => agentId(a) !== agentId(delegationTargetAgent))
       : [],
     [agents, delegationTargetAgent]
   )
@@ -2281,7 +2296,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   }
 
   const jumpToCatalogAgent = (agentPath: string) => {
-    const jump = computeCatalogJumpState(agents, expandedCategories, agentPath, scrollOffset, maxVisibleItems, comparePackCategories)
+    const jump = computeCatalogJumpState(agents, expandedCategories, agentPath, scrollOffset, maxVisibleItems, comparePackCategories, catalogPacks)
     if (!jump) return
     pendingJumpIndexRef.current = jump.foundIndex
     setWorkspaceTab("catalog")
@@ -2908,15 +2923,15 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       { id: "agent-rename", label: "Rename Agent File & References", category: "Agent", shortcut: "R", keywords: ["refactor", "filename"], disabled: agents.length === 0 || isReadOnlyGitSource },
       { id: "repair-models", label: "Batch-Repair Invalid / Missing Models", category: "Pack", shortcut: "V", keywords: ["fix", "broken"], disabled: invalidModelGroups.length === 0 },
       { id: "pack-flows", label: "Configure Conditional IF/OR Pack Flows", category: "Pack", shortcut: "M", keywords: ["rules", "triggers", "routing"], disabled: agents.length === 0 },
-      { id: "pack-install", label: "Preview & Install Pack into OpenCode", category: "Target & Bridges", shortcut: "E", keywords: ["deploy", "update", "lock"], disabled: agents.length === 0 },
+      { id: "pack-install", label: "Preview & Install Pack into OpenCode", category: "Target & Bridges", shortcut: "E", keywords: ["deploy", "update", "lock"], disabled: catalogPacks.length === 0 },
       { id: "target-reconcile", label: "Reconcile Installed OpenCode Target Now", category: "Target & Bridges", shortcut: "R", keywords: ["sync", "drift", "opencode.json"] },
       { id: "engine-self-update", label: "Check / Apply manage-agents Engine Release Update", category: "Target & Bridges", shortcut: "Shift+U", keywords: ["self-update", "version", "upgrade", "github", "release"] },
       { id: "source-pull", label: "Pull Git Source & Refresh GitHub Repos", category: "Target & Bridges", shortcut: "P", keywords: ["fetch", "git", "sync"] },
       { id: "bridge-claude", label: "Generate Claude Code Plugin Bridge", category: "Target & Bridges", shortcut: "B", keywords: ["anthropic", "marketplace"], disabled: agents.length === 0 },
       { id: "bridge-codex", label: "Generate OpenAI Codex Bridge", category: "Target & Bridges", shortcut: "Shift+B", keywords: ["codex", "toml"], disabled: agents.length === 0 },
       { id: "pack-init", label: isReadOnlyGitSource ? "Clone & Onboard Virtual Git Repo into Pack" : "Onboard Virtual Folder into OpenCode Pack (1.1)", category: "Pack", shortcut: "I", keywords: ["virtual", "manifest", "onboard", "clone"], disabled: !isWorkspaceVirtualPack },
-      { id: "pack-doctor", label: "Open Pack Doctor & Auto-Fix Contract Issues", category: "Pack", shortcut: "D", keywords: ["validate", "doctor", "fix", "semver", "bump", "kit"], disabled: isWorkspaceVirtualPack || isReadOnlyGitSource || agents.length === 0 },
-      { id: "pack-scaffold", label: "Create New Pack Agent, Skill or Slash Command", category: "Pack", shortcut: "N", keywords: ["new", "scaffold", "add", "agent", "skill", "command"], disabled: isWorkspaceVirtualPack || isReadOnlyGitSource || agents.length === 0 },
+      { id: "pack-doctor", label: "Open Pack Doctor & Auto-Fix Contract Issues", category: "Pack", shortcut: "D", keywords: ["validate", "doctor", "fix", "semver", "bump", "kit"], disabled: isWorkspaceVirtualPack || isReadOnlyGitSource || catalogPacks.length === 0 },
+      { id: "pack-scaffold", label: "Create New Pack Agent, Skill or Slash Command", category: "Pack", shortcut: "N", keywords: ["new", "scaffold", "add", "agent", "skill", "command"], disabled: isWorkspaceVirtualPack || isReadOnlyGitSource || catalogPacks.length === 0 },
       { id: "layout-adjust", label: "Adjust List / Inspector Split Width", category: "View & Motion", shortcut: "Shift+L", keywords: ["resize", "columns"] },
       { id: "toggle-motion", label: reducedMotionState ? "Enable Smooth 60fps Micro-Animations" : "Enable Reduced Motion Mode", category: "View & Motion", shortcut: "Ctrl+E", keywords: ["animation", "motion", "fps"] },
       { id: "help", label: "Open Keyboard & Mouse Guide", category: "View & Motion", shortcut: "?", keywords: ["shortcuts", "cheatsheet"] },
@@ -2924,14 +2939,14 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     for (const ag of agents) {
       base.push({
         id: `jump:${ag.currentPath}`,
-        label: ag.filename.replace(/\.md$/, ""),
+        label: agentId(ag),
         category: "Jump to Agent",
         hint: `${ag.category} · ${modelDisplayValue(ag, true, modelCatalog)}`,
         keywords: [ag.category, ag.filename, String(ag.frontmatter.model ?? "")],
       })
     }
     return base
-  }, [agents, isReadOnlyGitSource, invalidModelGroups.length, isWorkspaceVirtualPack, reducedMotionState, modelCatalog, layout.showInspector])
+  }, [agents, catalogPacks, isReadOnlyGitSource, invalidModelGroups.length, isWorkspaceVirtualPack, reducedMotionState, modelCatalog, layout.showInspector])
 
   const filteredPaletteCommands = useMemo(
     () => filterPaletteCommands(paletteCommands, paletteQuery),
@@ -2942,12 +2957,13 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   const helpContent = useMemo(
     () =>
       buildHelpSections(helpTab, {
+        hasPacks: catalogPacks.length > 0,
         hasAgents: agents.length > 0,
         isReadOnlyGitSource,
         isVirtualPack: isWorkspaceVirtualPack,
         hasInvalidModels: modelCatalog.status === "verified" && invalidModelGroups.length > 0,
       }),
-    [helpTab, agents.length, isReadOnlyGitSource, isWorkspaceVirtualPack, modelCatalog.status, invalidModelGroups.length],
+    [helpTab, catalogPacks.length, agents.length, isReadOnlyGitSource, isWorkspaceVirtualPack, modelCatalog.status, invalidModelGroups.length],
   )
 
   useEffect(() => {
@@ -2980,7 +2996,11 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       return simple(setSearchQuery, () => {})
     }
     if (viewMode === "main" && workspaceTab === "sources" && sourcesInputFocused) {
-      return simple(setSourcesQuery, () => { setSourcesFocusIndex(0); setSourcesScrollOffset(0) })
+      return {
+        set: text => setSourcesQuery(query => query + text),
+        append: ch => setSourcesQuery(query => query + ch),
+        after: () => { setSourcesFocusIndex(0); setSourcesScrollOffset(0) },
+      }
     }
     if (viewMode === "pack-init") {
       const append = (ch: string) => {
@@ -3029,6 +3049,16 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     }
     return null
   }
+
+  usePaste(event => {
+    const target = resolvePasteTarget()
+    if (!target || event.metadata?.kind === "binary" || event.bytes.length > MAX_PASTE_CHARS * 4) return
+    const text = sanitizePasteText(new TextDecoder().decode(event.bytes))
+    if (text.length > MAX_PASTE_CHARS) return
+    target.set(text)
+    target.after()
+    event.preventDefault()
+  })
 
   // Keyboard navigation and actions
   useKeyboard((e) => {
@@ -3501,7 +3531,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         if (effectivePane === "inspector" && inspectorTab === "delegations" && currentItem?.agent) {
           const allowed = currentItem.agent.allowedSubagents || []
           const targetName = allowed[catalogDelFocus]
-          const targetAg = targetName ? agents.find(a => a.filename.replace(/\.md$/, "") === targetName) : undefined
+          const targetAg = targetName ? agents.find(a => agentId(a) === targetName) : undefined
           if (targetAg) {
             setActivePane("list")
             jumpToCatalogAgent(targetAg.currentPath)
@@ -3884,8 +3914,8 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
           const nextConfig = { ...translationConfig, roles: { ...translationConfig.roles } }
           roles.forEach(role => { nextConfig.roles[role] = chosenTier })
           let txWarning: TransactionWarning | undefined
-          if (activeDataSource?.kind === "source" && activeDataSource.source.kind === "git") {
-            const loc = sourceTranslationConfigLocation(activeDataSource.source.name, workspaceRoot)
+          if (bridgeStorageKey) {
+            const loc = sourceTranslationConfigLocation(bridgeStorageKey, workspaceRoot)
             saveTranslationConfig(loc.configRoot, nextConfig, loc.configPath)
           } else {
             const tx = mutate([translationConfigPath(workspaceRoot)], "config", () => saveTranslationConfig(workspaceRoot, nextConfig))
@@ -4366,7 +4396,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       } else if (key === "space") {
         const targetSubagent = delegationItems[focusedDelegationIndex]
         if (targetSubagent) {
-          const subName = targetSubagent.filename.replace(/\.md$/, "")
+          const subName = agentId(targetSubagent)
           setSelectedDelegations((prev) => {
             const next = new Set(prev)
             if (next.has(subName)) next.delete(subName)
@@ -4769,6 +4799,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   const contextualChips = buildContextualShortcuts({
     workspaceTab,
     itemType: currentItem?.type ?? null,
+    packAgentCount: categoryAgentCounts.get(activeFocusedPack) ?? 0,
     selectedCount: selectedAgentPaths.size,
     isVirtualPack: activeFocusedIsVirtual || isWorkspaceVirtualPack,
     isReadOnlyGitSource,
@@ -5045,9 +5076,9 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
             title={
               layout.showInspector
                 ? effectivePane === "list"
-                  ? ` ● Catalog (${new Set(agents.map(a => a.category)).size} packs · ${agents.length} agents) `
-                  : ` Catalog (${new Set(agents.map(a => a.category)).size} packs · ${agents.length} agents) · ⇧← `
-                : ` Catalog (${new Set(agents.map(a => a.category)).size} packs · ${agents.length} agents) `
+                  ? ` ● Catalog (${catalogPacks.length} packs · ${agents.length} agents) `
+                  : ` Catalog (${catalogPacks.length} packs · ${agents.length} agents) · ⇧← `
+                : ` Catalog (${catalogPacks.length} packs · ${agents.length} agents) `
             }
             titleColor={effectivePane === "list" ? THEME.accentBlue : THEME.fgSecondary}
             flexDirection="column"
@@ -5093,7 +5124,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                       ? `🔍 /${terminalSafeText(searchQuery)}▋`
                       : searchQuery
                         ? `🔍 Filter: ${terminalSafeText(searchQuery)}`
-                        : "🔍 Press / or click to filter agents...",
+                        : "🔍 Press / or click to filter packs and agents...",
                     Math.max(12, listContentWidth - 18),
                   )}
                 </text>
@@ -5139,8 +5170,8 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                       {!activeDataSource
                         ? "No data source connected. Press [O] or click Sources above."
                         : searchQuery
-                          ? `No agents match "${terminalSafeText(searchQuery)}".`
-                          : "No agent markdown files found in this source."}
+                          ? `No packs or agents match "${terminalSafeText(searchQuery)}".`
+                          : "No OpenCode packs or agents found. Press O to choose another source."}
                     </text>
                   </box>
                 ) : (
@@ -5226,10 +5257,8 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                       ? lerpColor(baseBg === "transparent" ? THEME.bgPanel : baseBg, THEME.bgRowFlash, mutationFlash)
                       : baseBg
                     const dotHex = resolveAgentHexColor(ag.frontmatter.color)
-                    const analysis = analyzeAgentName(ag.filename, allAgentFilenames)
-                    const hasOrderErr = analyzePermissionOrder(ag).hasOrderError
-                    const hasWarn = !analysis.isValid || hasOrderErr
-                    const shortName = ag.filename.replace(/\.md$/, "")
+                    const hasWarn = analyzePermissionOrder(ag).hasOrderError
+                    const shortName = agentId(ag)
                     const isOverridden = userOverridesSummary.overriddenAgents.has(`${ag.category}/${shortName}`)
                     const modelText = modelDisplayValue(ag, true, modelCatalog)
                     const isModelInvalid = modelText.startsWith("invalid:")
@@ -5468,7 +5497,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                           const ag = currentItem.agent
                           const dotHex = resolveAgentHexColor(ag.frontmatter.color)
                           const permSummary = getAgentPermissionSummary(ag)
-                          const shortName = ag.filename.replace(/\.md$/, "")
+                          const shortName = agentId(ag)
                           const isOverridden = userOverridesSummary.overriddenAgents.has(`${ag.category}/${shortName}`)
                           const riskColor = permSummary.riskLevel === "HIGH"
                             ? THEME.accentRed
@@ -5651,9 +5680,9 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                                   flexGrow={1}
                                 >
                                   <box flexDirection="row" justifyContent="space-between" flexShrink={0}>
-                                    <text style={{ textColor: THEME.fgPrimary }} b>Naming Status</text>
-                                    <text style={{ textColor: analysis.isValid ? THEME.accentGreen : THEME.accentAmber }} b>
-                                      {analysis.isValid ? "✓ Compliant" : "⚠ Non-Compliant"}
+                                    <text style={{ textColor: THEME.fgPrimary }} b>Filename style</text>
+                                    <text style={{ textColor: analysis.isValid ? THEME.accentGreen : THEME.fgSecondary }} b>
+                                      {analysis.isValid ? "Role convention" : "Custom"}
                                     </text>
                                   </box>
                                   <box flexDirection="row" marginTop={1}>
@@ -5662,7 +5691,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                                   </box>
                                   <box flexDirection="row">
                                     <text style={{ textColor: THEME.fgSecondary }} width="35%">Pack:</text>
-                                    <text style={{ textColor: THEME.accentAmber }}>{middleEllipsis(analysis.category || "(none)", 30)}</text>
+                                    <text style={{ textColor: THEME.accentAmber }}>{middleEllipsis(currentItem.category, 30)}</text>
                                   </box>
                                   <box flexDirection="row">
                                     <text style={{ textColor: THEME.fgSecondary }} width="35%">Role:</text>
@@ -5795,7 +5824,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                                       allowed.slice(graphScrollOffset, graphScrollOffset + delInspectorPageSize).map((subName, sliceIdx) => {
                                         const absIdx = graphScrollOffset + sliceIdx
                                         const isSubFocused = effectivePane === "inspector" && absIdx === catalogDelFocus
-                                        const targetAg = agents.find((a) => a.filename.replace(/\.md$/, "") === subName)
+                                        const targetAg = agents.find((a) => agentId(a) === subName)
                                         return (
                                           <box
                                             key={subName}
@@ -5936,7 +5965,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                                 )}
                               </text>
                               <box flexDirection="row" marginTop={1} gap={2}>
-                                <text
+                                {(categoryAgentCounts.get(currentItem.category) ?? 0) > 0 && (<text
                                   wrapMode="none"
                                   style={{ textColor: THEME.accentCyan }}
                                   u
@@ -5946,7 +5975,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                                   }}
                                 >
                                   [M] IF/OR Flows
-                                </text>
+                                </text>)}
                                 {isVirtual ? (
                                   <text
                                     wrapMode="none"
@@ -6245,7 +6274,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
             <box flexDirection="column" marginTop={1} flexGrow={1} minHeight={0} overflow="hidden">
               {visibleDelegationItems.map((ag, offsetIdx) => {
                 const idx = delegationScrollOffset + offsetIdx
-                const subName = ag.filename.replace(/\.md$/, "")
+                const subName = agentId(ag)
                 const isSelected = selectedDelegations.has(subName)
                 const isFocused = idx === focusedDelegationIndex
 

@@ -34,7 +34,7 @@ function fixture(filename: string, body = ""): AgentInfo {
 }
 
 function config(overrides: Partial<TranslationConfig> = {}): TranslationConfig {
-  return { ...DEFAULT_TRANSLATION_CONFIG, ...overrides,
+  return { ...DEFAULT_TRANSLATION_CONFIG, prefix: "pipeline-", ...overrides,
     claude: { ...DEFAULT_TRANSLATION_CONFIG.claude, ...overrides.claude } }
 }
 
@@ -238,7 +238,7 @@ test("writes Claude MCP and LSP layers from OpenCode config", () => {
   assert.ok(result.files.includes(".lsp.json"))
   assert.equal(
     JSON.parse(fs.readFileSync(path.join(output, ".claude-plugin", "plugin.json"), "utf8")).author.name,
-    "Lorenzo Cancellara"
+    "manage-agents"
   )
   const readme = fs.readFileSync(path.join(output, "README.md"), "utf8")
   assert.match(readme, /--agent pipeline:orchestrator/)
@@ -326,7 +326,7 @@ test("includes disabled MCP servers required by agents and emits setup guidance"
   assert.match(generated, /mcp__plugin_pipeline_codebase-memory-mcp__\*/)
   const readme = fs.readFileSync(path.join(output, "README.md"), "utf8")
   assert.match(readme, /## MCP setup/)
-  assert.match(readme, /Lorenzo Cancellara/)
+  assert.match(readme, /manage-agents/)
   assert.ok(
     result.warnings.some(warning => /disabled.*cupertino/i.test(warning)),
     `expected a disabled-server warning for 'cupertino', got ${JSON.stringify(result.warnings)}`
@@ -506,6 +506,8 @@ test("honors last-match-wins for webfetch permission objects", () => {
 
 test("never fabricates MCP servers from built-in permission keys", () => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "claude-builtin-perms-"))
+  fs.mkdirSync(path.join(workspace, "tools", "extra"), { recursive: true })
+  for (const name of ["dev_env", "pipeline_state"]) fs.writeFileSync(path.join(workspace, "tools", "extra", `${name}.js`), "export default {}")
   const agent = fixture("pipeline-executor.md")
   agent.frontmatter.permission = {
     apply_patch: "allow",
@@ -624,6 +626,8 @@ test("lists untranspiled OpenCode plugins and tools found in the workspace layou
 
 test("never fabricates MCP tools from custom pipeline tool permissions", () => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "claude-pipeline-tools-"))
+  fs.mkdirSync(path.join(workspace, "tools", "extra"), { recursive: true })
+  for (const name of ["pipeline_commit", "dev_serve", "dev_smoke", "pipeline_state"]) fs.writeFileSync(path.join(workspace, "tools", "extra", `${name}.js`), "export default {}")
   const agent = fixture("pipeline-executor.md")
   agent.frontmatter.permission = {
     pipeline_commit: "allow",
@@ -1019,15 +1023,15 @@ test("preserves command descriptions containing a colon", () => {
   assert.doesNotMatch(frontmatter, /Run the pipeline-bug pipeline command/)
 })
 
-test("scopes sibling pipeline command references to the plugin", () => {
+test("scopes sibling command references to the plugin", () => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "claude-command-scope-"))
   fs.mkdirSync(path.join(workspace, "commands"), { recursive: true })
-  fs.writeFileSync(path.join(workspace, "commands", "pipeline-bug.md"), "---\ndescription: Bug\n---\nFix it.\n")
-  fs.writeFileSync(path.join(workspace, "commands", "pipeline-ops.md"), [
+  fs.writeFileSync(path.join(workspace, "commands", "triage.md"), "---\ndescription: Bug\n---\nFix it.\n")
+  fs.writeFileSync(path.join(workspace, "commands", "cleanup.md"), [
     "---",
     "description: Ops",
     "---",
-    "If ops finds a code defect, propose the fix lane (`/pipeline-bug`).",
+    "If ops finds a code defect, propose the fix lane (`/triage`).",
     ""
   ].join("\n"))
   const output = path.join(workspace, "claude")
@@ -1040,9 +1044,9 @@ test("scopes sibling pipeline command references to the plugin", () => {
     workspace
   )
 
-  const content = fs.readFileSync(path.join(output, "skills", "pipeline-ops", "SKILL.md"), "utf8")
-  assert.match(content, /`\/decent-pipeline:pipeline-bug`/)
-  assert.doesNotMatch(content, /`\/pipeline-bug`/)
+  const content = fs.readFileSync(path.join(output, "skills", "cleanup", "SKILL.md"), "utf8")
+  assert.match(content, /`\/decent-pipeline:triage`/)
+  assert.doesNotMatch(content, /`\/triage`/)
 })
 
 test("bridge rejects command skill IDs containing control characters", (t) => {

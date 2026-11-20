@@ -12,6 +12,7 @@ export interface HelpTabMeta {
 }
 
 export interface HelpContext {
+  hasPacks?: boolean
   hasAgents: boolean
   isReadOnlyGitSource?: boolean
   isVirtualPack?: boolean
@@ -137,6 +138,7 @@ function buildGroupsForTab(
   tab: HelpTabId,
   ctx: HelpContext,
 ): { title: string; items: HelpShortcutItem[] }[] {
+  const noPacks = !(ctx.hasPacks ?? ctx.hasAgents)
   const noAgents = !ctx.hasAgents
   const readOnly = Boolean(ctx.isReadOnlyGitSource)
 
@@ -163,7 +165,7 @@ function buildGroupsForTab(
             { id: "cat-mark", keyLabel: "Space", title: "Mark or unmark focused agent for batch edits", scope: "Batch", actionId: "select-toggle", disabled: noAgents },
             { id: "cat-mark-pack", keyLabel: "A", title: "Mark or unmark all agents in focused pack", scope: "Batch", actionId: "select-category", disabled: noAgents },
             { id: "cat-mark-model", keyLabel: "S", title: "Mark agents sharing the same model in pack", scope: "Batch", actionId: "select-same-model", disabled: noAgents },
-            { id: "cat-filter", keyLabel: "/", title: "Live-filter agents by name, pack or model", scope: "Filter", actionId: "catalog-search", disabled: noAgents },
+            { id: "cat-filter", keyLabel: "/", title: "Filter by agent or pack name", scope: "Filter", actionId: "catalog-search", disabled: noPacks },
             { id: "cat-tabs", keyLabel: "1 – 6", title: "Switch Inspector sidebar tabs (or ◀/▶ when focused)", scope: "Sidebar" },
             { id: "cat-panes", keyLabel: "⇧← / ⇧→", title: "Switch focus between Main panel and Sidebar (also [ / ])", scope: "Panes", actionId: "pane-toggle" },
           ],
@@ -184,11 +186,11 @@ function buildGroupsForTab(
         {
           title: "Pack Maintenance & Bridges",
           items: [
-            { id: "flw-install", keyLabel: "E", title: "Preview diff & install or update pack into OpenCode", scope: "Target", actionId: "pack-install", disabled: noAgents },
+            { id: "flw-install", keyLabel: "E", title: "Preview diff & install or update pack into OpenCode", scope: "Target", actionId: "pack-install", disabled: noPacks },
             { id: "flw-repair", keyLabel: "V", title: "Batch-repair invalid or missing models", scope: "Pack", actionId: "repair-models", disabled: !ctx.hasInvalidModels },
             { id: "flw-init", keyLabel: "I", title: "Onboard virtual folder or GitHub repo into Contract 1.1 pack", scope: "Virtual", actionId: "pack-init", disabled: !ctx.isVirtualPack },
-            { id: "flw-doctor", keyLabel: "D", title: "Open Pack Doctor (validate, auto-fix V2/namespace, bump semver)", scope: "Pack", actionId: "pack-doctor", disabled: Boolean(ctx.isVirtualPack) || readOnly || noAgents },
-            { id: "flw-scaffold", keyLabel: "N", title: "Scaffold compliant agent, skill or command in pack", scope: "Author", actionId: "pack-scaffold", disabled: Boolean(ctx.isVirtualPack) || readOnly || noAgents },
+            { id: "flw-doctor", keyLabel: "D", title: "Open Pack Doctor (validate, auto-fix V2/namespace, bump semver)", scope: "Pack", actionId: "pack-doctor", disabled: Boolean(ctx.isVirtualPack) || readOnly || noPacks },
+            { id: "flw-scaffold", keyLabel: "N", title: "Scaffold compliant agent, skill or command in pack", scope: "Author", actionId: "pack-scaffold", disabled: Boolean(ctx.isVirtualPack) || readOnly || noPacks },
             { id: "flw-claude", keyLabel: "B", title: "Generate Claude Code plugin bridge", scope: "Bridge", actionId: "bridge-claude", disabled: noAgents },
             { id: "flw-codex", keyLabel: "Shift+B", title: "Generate OpenAI Codex bridge", scope: "Bridge", actionId: "bridge-codex", disabled: noAgents },
           ],
@@ -201,7 +203,7 @@ function buildGroupsForTab(
           title: "Sources & GitHub Discovery",
           items: [
             { id: "src-open", keyLabel: "O", title: "Jump to Sources & Target from Catalog or Flows", scope: "Cat/Flows", actionId: "ws-sources" },
-            { id: "src-activate", keyLabel: "Enter", title: "Activate selected source or connect repository", scope: "Sources", actionId: "source-activate" },
+            { id: "src-activate", keyLabel: "Enter", title: "Connect or activate a source and open its catalog", scope: "Sources", actionId: "source-activate" },
             { id: "src-input", keyLabel: "/ · A", title: "Focus repository URL or owner/repo input box", scope: "Sources", actionId: "source-search" },
             { id: "src-pull", keyLabel: "P", title: "Pull active Git source & refresh GitHub repos", scope: "Git", actionId: "source-pull" },
             { id: "src-gh", keyLabel: "G", title: "Sign in with GitHub CLI (gh auth login)", scope: "GitHub", actionId: "source-gh-auth" },

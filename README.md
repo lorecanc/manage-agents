@@ -37,7 +37,7 @@ graph TD
 |---|---|
 | **Pack** | Self-contained unit laid out like `~/.config/opencode/` and governed by `opencode-pack.json` ([Contract `1.1`](contract/CONTRACT.md), backward-compatible with `1.0`). |
 | **Virtual Pack** | In-memory pack view (`0.0.0-virtual`) synthesized automatically from manifest-free `.md` agent folders or project `.opencode/` directories before formal onboarding. |
-| **Workspace** | Local multi-pack catalog (`packs/<name>/opencode-pack.json`) or single pack edited by the TUI and workspace commands (`--workspace <dir>`, `$MANAGE_AGENTS_WORKSPACE`, or ancestor auto-discovery). |
+| **Workspace** | Local multi-pack catalog (manifests up to four directories deep) or single pack edited by the TUI and workspace commands (`--workspace <dir>`, `$MANAGE_AGENTS_WORKSPACE`, or ancestor auto-discovery). |
 | **Source** | Named local directory or Git/GitHub repository registered in `$XDG_CONFIG_HOME/manage-agents/sources.json`. Git checkouts live read-only under `$XDG_CACHE_HOME/manage-agents/sources/<name>`. |
 | **Target** | OpenCode config directory (default `$XDG_CONFIG_HOME/opencode`, i.e. `~/.config/opencode`). Tracks `desired.json`, `lock.json`, and `installed.json` inside `<target>/.manage-agents/`. |
 | **Archetype & `IF / OR` Flows** | Caller-driven routing where primary agents (`archetype.callers` or custom `$callers`) dynamically assign subagent models and narrowable `tools`, `permissions`, and `delegations` policies based on the active caller model (`*`, `provider`, or `provider/model`). |
@@ -137,8 +137,10 @@ manage-agents bridge check --pack flow                  # CI byte-for-byte drift
 Running `manage-agents` without a subcommand opens the full-screen React 19 + OpenTUI interface. Startup resolves in order:
 1. `--workspace <dir>` or `$MANAGE_AGENTS_WORKSPACE`
 2. `--source <name>` (pulls uncached Git sources automatically and marks `<name>` active)
-3. Nearest catalog (`packs/*/opencode-pack.json`), pack (`opencode-pack.json`), or virtual `.md` pack at or above `cwd`
+3. Nearest pack or conventional `packs/` catalog, then manifests inside the current Git repository, then a virtual pack in the current directory
 4. Active registered source in `sources.json`, or **Sources & Target** if none is attached yet
+
+In **Sources & Target**, press `/`, enter a local directory or Git repository, and press `Enter` to open its catalog. Select a pack and press `E` to preview the target changes. `Esc` cancels the preview. Packs containing only commands, tools, or skills also appear here.
 
 ### Three Switchable Workspaces
 
@@ -243,13 +245,15 @@ Bridge settings persist in `bridges/translation-config.json` (or `$XDG_CONFIG_HO
 
 | Construct | OpenCode V2 Pack | Claude Code Plugin (`bridges/claude-code/<name>`) | Codex Layer (`bridges/codex/<name>`) |
 |---|---|---|---|
-| **Manifest** | `opencode-pack.json` + `opencode.json(c)` | `.claude-plugin/plugin.json`, local `marketplace.json`, `icon.png` | `.codex-plugin/plugin.json` (`Subagents` + `Skills`) |
+| **Manifest** | `opencode-pack.json` + `opencode.json(c)` | `.claude-plugin/plugin.json`, local `marketplace.json`, `icon.png` | `.codex-plugin/plugin.json` and local `.agents/plugins/marketplace.json` |
 | **Agents** | `agents/<id>.md` (`@pack-role` mentions) | `agents/<kebab>.md` (`maxTurns`, `tools`, `@<plugin>:<kebab>`) | `.codex/agents/<kebab>.toml` (`developer_instructions`, `sandbox_mode`) |
-| **Commands & Skills** | `commands/<id>.md` (`$ARGUMENTS`), `skills/<id>/SKILL.md` | Commands become `skills/<cmd>/SKILL.md` (`$request`); skills copied | Agent workflows emitted as `skills/<agent>/SKILL.md` wrappers |
-| **MCP & LSP** | `mcp.servers`, `lsp` in `opencode.json` | `.mcp.json` (`mcp__<server>__*` grants) and `.lsp.json` | `.mcp.json` (`mcpServers` when enabled) |
+| **Commands & Skills** | `commands/<id>.md` (`$ARGUMENTS`), `skills/<id>/SKILL.md` | Commands become `skills/<cmd>/SKILL.md` (`$request`); skills copied | Agent workflows emitted as `.agents/skills/<agent>/SKILL.md` wrappers |
+| **MCP & LSP** | `mcp.servers`, `lsp` in `opencode.json` | `.mcp.json` (`mcp__<server>__*` grants) and `.lsp.json` | `.codex/config.toml` for the project and `.mcp.json` for plugin installs |
 | **Plugins & Custom Tools** | `plugins/*/index.ts`, `tools/<pack>/**` | Documented in generated `README.md` with prompt fallback notes; tool names adapted (`todowrite` → `TodoWrite`, Task → `Agent`) | Prompt runtime notes document CLI/git fallbacks; tool names adapted (`update_plan`, `@subagent`) |
 
-Granular OpenCode permission globs (per-command `shell` patterns, path-scoped `edit` rules, `ask` states) cannot be enforced by plugin frontmatter; bridges fail closed on required server-wide MCP denies and surface granular lossiness as structured warnings in the generated `README.md`.
+Run Codex with `codex -C bridges/codex/<name>` using the output directory and trust the project when prompted. Ask Codex to delegate to the exported primary agent by name. The generated README gives the local marketplace commands for installing the packaged skills and MCP servers into Codex. Custom subagents load from the project's `.codex/agents/` directory.
+
+Granular OpenCode permissions such as command and path globs are reported as translation warnings. Codex applies explicit MCP tool denies across the session and rejects a required server when its deny patterns cannot be represented.
 
 ---
 

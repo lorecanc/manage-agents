@@ -10,6 +10,7 @@ import { applyPlan, changeTarget, installChange, planReconcile, readInstalled, r
 import { readLock } from "./lock.js"
 import { MAX_SCANNED_BYTES } from "./packs.js"
 import { addSource, pullSource, type SourceRegistry } from "./sources.js"
+import { loadOverrideSettings, removeConfigEntry, saveOverrideSettings, scopeOf, setConfigOverride, unsetConfigOverride } from "./userSettings.js"
 
 const BASE = {
   "tools/base/repo.js": "export const repo = 1\n",
@@ -110,6 +111,62 @@ test("user config is preserved; a JSONC file with comments is backed up with a w
   assert.deepEqual(next.plugins, ["my-npm-plugin", { package: "./plugins/guard", options: { strict: true } }])
   assert.ok(result.plan!.warnings.some(warning => /comments/.test(warning)))
   assert.match(fs.readFileSync(path.join(target, ".manage-agents", "backups", result.backupId!, "files", "opencode.jsonc"), "utf8"), /\/\/ mine/)
+})
+
+test("config overrides patch the contribution: a matching user server is 'kept', stays theirs, no --adopt", async (t) => {
+  const { env, target, install, registry, options } = setup(t)
+  fs.writeFileSync(path.join(target, "opencode.json"), JSON.stringify({ mcp: { servers: { db: { type: "local", command: ["my-db-mcp", "--port", "1"] } } } }))
+
+  // Without the override the user's server blocks the install of the pack's `db` entry.
+  assert.equal((await install(["flow"])).status, "failed")
+
+  const settings = loadOverrideSettings(env)
+  setConfigOverride(scopeOf(settings, target), "base", "mcp.servers", "db", { command: ["my-db-mcp", "--port", "1"] })
+  saveOverrideSettings(settings, env)
+
+  const result = await install(["flow"])
+  assert.equal(result.status, "applied", JSON.stringify(result.plan?.conflicts))
+  assert.deepEqual(config(target).mcp.servers.db, { type: "local", command: ["my-db-mcp", "--port", "1"] })
+  assert.equal(readInstalled(target).config.base?.objects?.["mcp.servers"]?.db, undefined, "a kept entry stays the user's")
+
+  assert.equal((await changeTarget(target, "reconcile", registry, reconcileChange, options)).status, "unchanged")
+
+  // Dropping the override exposes the divergence again, as an unmanaged collision.
+  const next = loadOverrideSettings(env)
+  assert.equal(unsetConfigOverride(scopeOf(next, target), "base", "mcp.servers", "db", []), true)
+  saveOverrideSettings(next, env)
+  const blocked = await changeTarget(target, "reconcile", registry, reconcileChange, options)
+  assert.equal(blocked.status, "failed")
+  assert.match(blocked.plan!.conflicts[0], /mcp\.servers "db".*rerun with --adopt/)
+
+  const adopted = await changeTarget(target, "reconcile", registry, reconcileChange, { ...options, adopt: true })
+  assert.equal(adopted.status, "applied")
+  assert.deepEqual(config(target).mcp.servers.db, { type: "local", command: ["db-mcp"] })
+})
+
+test("config overrides can remove an entry (null), toggle servers and merge nested fields", async (t) => {
+  const { env, target, install, registry, options } = setup(t)
+  const settings = loadOverrideSettings(env)
+  setConfigOverride(scopeOf(settings, target), "base", "mcp.servers", "db", { disabled: true, environment: { DOCKER_HOST: "tcp://db" } })
+  saveOverrideSettings(settings, env)
+
+  assert.equal((await install(["flow"])).status, "applied")
+  assert.deepEqual(config(target).mcp.servers.db, { type: "local", command: ["db-mcp"], disabled: true, environment: { DOCKER_HOST: "tcp://db" } })
+
+  const enabling = loadOverrideSettings(env)
+  // A null field removes `disabled` from the contributed entry (the `models unpin` semantics); the merge keeps the rest.
+  setConfigOverride(scopeOf(enabling, target), "base", "mcp.servers", "db", { disabled: null })
+  saveOverrideSettings(enabling, env)
+  assert.equal((await changeTarget(target, "reconcile", registry, reconcileChange, options)).status, "applied")
+  assert.deepEqual(config(target).mcp.servers.db, { type: "local", command: ["db-mcp"], environment: { DOCKER_HOST: "tcp://db" } })
+
+  const removing = loadOverrideSettings(env)
+  assert.equal(unsetConfigOverride(scopeOf(removing, target), "base", "mcp.servers", "db", []), true)
+  removeConfigEntry(scopeOf(removing, target), "base", "mcp.servers", "db")
+  saveOverrideSettings(removing, env)
+  const removed = await changeTarget(target, "reconcile", registry, reconcileChange, options)
+  assert.equal(removed.status, "applied")
+  assert.equal(config(target).mcp, undefined, "the pack contributes no server any more and the section it created goes too")
 })
 
 test("unmanaged collisions block before any write; --adopt backs up, restore puts it back", async (t) => {

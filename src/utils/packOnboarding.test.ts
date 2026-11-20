@@ -178,7 +178,7 @@ test("mixed application repository: auto-selects packs/<name>/ without touching 
     fs.mkdirSync(outsidePack, { recursive: true })
     fs.writeFileSync(path.join(outsidePack, MANIFEST_FILE), '{"contract":"1.1","name":"evil","version":"0.1.0","description":"x"}')
     fs.symlinkSync(outsidePack, path.join(appRepo, "packs", "evil"))
-    assert.equal(resolveEditablePackDir(appRepo, "evil"), path.join(fs.realpathSync(appRepo), "packs", "webapp-agents"))
+    assert.equal(resolveEditablePackDir(appRepo, "evil"), null)
   }
 })
 
@@ -205,7 +205,7 @@ test("mixed-repo onboarding moves .opencode AGENTS.md into the subpack and prese
 
   const result = applyPackOnboarding(repo, { name: "webapp-agents", layout: "subpack" })
   const packDir = path.join(repo, "packs", "webapp-agents")
-  assert.equal(result.packDir, packDir)
+  assert.equal(result.packDir, fs.realpathSync(packDir), "packDir is realpath-resolved like every editable pack dir")
   assert.equal(fs.readFileSync(path.join(repo, "AGENTS.md"), "utf8"), "# Host repository instructions\n")
   assert.equal(fs.readFileSync(path.join(packDir, "AGENTS.md"), "utf8"), "# Pack instructions\n")
   assert.equal(fs.existsSync(path.join(repo, ".opencode", "AGENTS.md")), false)

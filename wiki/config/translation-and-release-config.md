@@ -27,7 +27,8 @@ Where `manage-agents` reads and writes translation settings depends on whether t
 
 | Context | Read Precedence | Write Path | Bridge Output Directory |
 |---------|-----------------|------------|-------------------------|
-| Local workspace or local source | `--config <path>` (CLI) or `<workspace>/bridges/translation-config.json` | `--config <path>` (CLI) or `<workspace>/bridges/translation-config.json` | `--output <dir>` or `<workspace>/bridges/<claude-code\|codex>/<pluginName>` |
+| Local multi-pack workspace or local multi-pack source | `--config <path>` (CLI) or `<workspace>/bridges/translation-config.json` | `--config <path>` (CLI) or `<workspace>/bridges/translation-config.json` | `--output <dir>` or `<workspace>/bridges/<claude-code\|codex>/<pluginName>` |
+| Standalone local pack | Local bridge settings keyed by the hash of its canonical directory, or explicit CLI `--config` | `$XDG_CONFIG_HOME/manage-agents/translations/local/<hash>/translation.json` | `$XDG_CACHE_HOME/manage-agents/bridges/local/<hash>/<target>/<pluginName>` or explicit CLI `--output` |
 | Registered Git source (TUI) | 1. `$XDG_CONFIG_HOME/manage-agents/translations/<source>/translation.json`<br>2. `<workspace>/.agent-manager/translation.json` (legacy read fallback) | `$XDG_CONFIG_HOME/manage-agents/translations/<source>/translation.json` | `$XDG_CACHE_HOME/manage-agents/bridges/<source>/<claude-code\|codex>/<pluginName>` |
 
 When `XDG_CONFIG_HOME` or `XDG_CACHE_HOME` is unset, `engineConfigDir()` and `engineCacheDir()` fall back to `~/.config/manage-agents` and `~/.cache/manage-agents`, respectively (see [User Settings, Target State & Environment Variables](./user-and-target-files.md)).
@@ -46,9 +47,9 @@ Path safety and migration rules enforced by `loadTranslationConfig()` and `saveT
 |-------|------|----------|---------|-------------|
 | `version` | `2` | Yes | `2` | Schema version literal. Must be `2`. |
 | `target` | `"claude" \| "codex"` | Yes | `"claude"` | Default bridge target used when `--target` is omitted on the CLI. |
-| `pluginName` | `string` | Yes | `"decent-pipeline"` | Generated plugin or layer name (sanitized for filesystem output). |
-| `prefix` | `string` | Yes | `"pipeline-"` | Prefix stripped from agent filenames (after `.md` removal) to compute normalized role/agent names. Also used by `manage-agents bridge` to infer `--pack` (`prefix.replace(/-$/, "")`) when `--pack` is omitted. |
-| `sourceDir` | `string` | Yes | `"general"` | Legacy pre-pack agent directory. Validated as a workspace-relative path (`isWorkspaceRelativePath`), ignored by pack bridges. |
+| `pluginName` | `string` | Yes | `"translated-agents"` | Generated plugin or layer name (sanitized for filesystem output). |
+| `prefix` | `string` | Yes | `""` | Prefix stripped from agent filenames (after `.md` removal) to compute normalized role/agent names. Also used by `manage-agents bridge` to infer `--pack` (`prefix.replace(/-$/, "")`) when `--pack` is omitted. |
+| `sourceDir` | `string` | Yes | `"."` | Legacy pre-pack agent directory. Validated as a workspace-relative path (`isWorkspaceRelativePath`), ignored by pack bridges. |
 | `inference` | `boolean` | No | `true` | Enables automatic tier inference (`buildInferenceIndex`) from sibling agents' source models when an agent's role is absent from `roles`. |
 | `defaultTier` | `string` | Yes | `"execution"` | Fallback tier key when no override, `modelMap` entry, explicit `roles` mapping, or unambiguous inferred tier applies. Must exist in `tiers`. |
 | `tiers` | `Record<string, TranslationTier>` | Yes | `planning`, `execution`, `light` | Named cross-target model tiers merged deeply with `DEFAULT_TIERS`. Must contain at least one tier. |
@@ -107,9 +108,9 @@ When an agent's normalized role is not present in `roles` and `inference !== fal
 |-------|------|---------|-----------------------|
 | `overrides` | `Record<string, ModelTarget>` | `{}` | Per-agent `{ model, reasoningEffort? }` overrides keyed by normalized agent name. CLI `--codex-map source=target[:effort]` parses missing effort as `"max"`. |
 | `modelMap` | `Record<string, string>` | `{}` | Maps normalized source models (`provider/model`, bare `model`, or `"*"` catch-all) to non-empty Codex model names. |
-| `emitSkills` | `boolean` | `true` | Include translated skills in the generated Codex plugin. |
+| `emitSkills` | `boolean` | `true` | Generate translated skills in `.agents/skills/` for the Codex project and plugin. |
 | `emitReadme` | `boolean` | `true` | Generate a `README.md` inside the Codex output directory. |
-| `emitMcp` | `boolean` | `undefined` (enabled) | Treated as enabled unless explicitly set to `false` (`config.codex.emitMcp !== false`); writes `.mcp.json` and links `mcpServers` in the Codex manifest when MCP servers are present. |
+| `emitMcp` | `boolean` | `undefined` (enabled) | Writes `.codex/config.toml` for the Codex project and `.mcp.json` for the plugin when MCP servers are present. |
 
 #### Model Resolution Precedence and Author Override
 
@@ -121,7 +122,7 @@ For each bridged agent, `resolveModelTarget(agent, index, config, target)` evalu
 4. **`inferred`**: Unambiguous tier from `buildInferenceIndex()` when `config.inference !== false`
 5. **`default`**: `config.tiers[config.defaultTier][target]` (or the first key in `config.tiers` if `defaultTier` were missing prior to validation)
 
-Generated plugin manifests and READMEs also stamp an author name resolved by `authorName()`: `"Lorenzo Cancellara"` by default (`DEFAULT_AUTHOR_NAME`), overridable via the `AGENT_AUTHOR_NAME` environment variable if it matches `/^[\p{L}\p{N} '’.\-]{1,100}$/u`.
+Generated plugin manifests and READMEs also stamp an author name resolved by `authorName()`: `"manage-agents"` by default (`DEFAULT_AUTHOR_NAME`), overridable via the `AGENT_AUTHOR_NAME` environment variable if it matches `/^[\p{L}\p{N} '’.\-]{1,100}$/u`.
 
 ### Annotated Example (`bridges/translation-config.json`)
 

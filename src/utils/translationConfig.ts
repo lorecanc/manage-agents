@@ -72,9 +72,9 @@ const DEFAULT_ROLES: Record<string, string> = {
 export const DEFAULT_TRANSLATION_CONFIG: TranslationConfig = {
   version: 2,
   target: "claude",
-  pluginName: "decent-pipeline",
-  prefix: "pipeline-",
-  sourceDir: "general",
+  pluginName: "translated-agents",
+  prefix: "",
+  sourceDir: ".",
   inference: true,
   defaultTier: "execution",
   tiers: DEFAULT_TIERS,
@@ -92,7 +92,7 @@ export const DEFAULT_TRANSLATION_CONFIG: TranslationConfig = {
 }
 
 /** Default author name stamped into generated plugin manifests and READMEs. */
-export const DEFAULT_AUTHOR_NAME = "Lorenzo Cancellara"
+export const DEFAULT_AUTHOR_NAME = "manage-agents"
 
 const AUTHOR_NAME_PATTERN = /^[\p{L}\p{N} '’.\-]{1,100}$/u
 
@@ -143,7 +143,9 @@ export function normalizeAgentName(filename: string, prefix: string): string {
 }
 
 export function resolveRole(agent: AgentInfo, config: TranslationConfig): string {
-  return normalizeAgentName(agent.filename, config.prefix)
+  if (!agent.id) return normalizeAgentName(agent.filename, config.prefix)
+  const id = agent.id
+  return (config.prefix && id.startsWith(config.prefix) ? id.slice(config.prefix.length) : id).toLowerCase()
 }
 
 export interface InferenceIndex {
@@ -180,8 +182,8 @@ export function resolveModelTarget(
   config: TranslationConfig,
   target: TranslationTarget
 ): { role: string; tier: string; model: ModelTarget; source: "override" | "model-map" | "role" | "inferred" | "default"; inferredFrom?: string } {
-  const name = normalizeAgentName(agent.filename, config.prefix)
   const role = resolveRole(agent, config)
+  const name = role
   const overrides = config[target].overrides
   const override = Object.prototype.hasOwnProperty.call(overrides, name) ? overrides[name] : undefined
   const fallback = Object.prototype.hasOwnProperty.call(config.tiers, config.defaultTier)

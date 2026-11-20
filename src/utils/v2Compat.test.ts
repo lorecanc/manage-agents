@@ -363,7 +363,6 @@ test("isKnownPermissionKey accepts the built-in V1/V2 tool vocabulary", () => {
     "mcp-resource", "artifact", "file-diff",
     "opencode_session_rename", "opencode_session_move",
     "opencode_worktree_create", "opencode_worktree_list", "opencode_worktree_remove",
-    "dev_env",
   ]) {
     assert.equal(isKnownPermissionKey(key), true, `${key} is part of the known vocabulary`)
   }
@@ -380,6 +379,7 @@ test("isKnownPermissionKey rejects concrete MCP server tool keys", () => {
     "codebase-memory-mcp_delete_project",
     "chrome-devtools_click",
     "some_future_mcp_tool",
+    "dev_env",
   ]) {
     assert.equal(isKnownPermissionKey(key), false, `${key} must be treated as an MCP server tool`)
   }

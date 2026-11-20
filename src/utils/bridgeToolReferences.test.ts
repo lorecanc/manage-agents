@@ -21,13 +21,15 @@ const ORCHESTRATOR_BODY = [
   "Read untracked files with `read`. The word question and task in prose stay unchanged."
 ].join("\n")
 
+const customTools = new Set(["pipeline_state", "dev_env", "dev_verify", "pipeline_new_tool"])
+
 test("custom tool keys are recognized generically, MCP keys are not", () => {
-  for (const key of ["pipeline_state", "dev_env", "pipeline_new_tool"]) assert.equal(isOpenCodeCustomToolKey(key), true, key)
-  for (const key of ["cwe-search_*", "codebase-memory-mcp_*", "todowrite", "external_directory"]) assert.equal(isOpenCodeCustomToolKey(key), false, key)
+  for (const key of ["pipeline_state", "dev_env", "pipeline_new_tool"]) assert.equal(isOpenCodeCustomToolKey(key, customTools), true, key)
+  for (const key of ["cwe-search_*", "codebase-memory-mcp_*", "todowrite", "external_directory"]) assert.equal(isOpenCodeCustomToolKey(key, customTools), false, key)
 })
 
 test("Claude rewrite maps OpenCode tool names and inserts one note after the H1", () => {
-  const result = adaptToolReferences(ORCHESTRATOR_BODY, "claude", { permission: { pipeline_state: "allow", dev_verify: "allow", pipeline_commit: "deny" } })
+  const result = adaptToolReferences(ORCHESTRATOR_BODY, "claude", { permission: { pipeline_state: "allow", dev_verify: "allow", pipeline_commit: "deny" } }, { customTools })
   assert.deepEqual(result.unavailable, ["dev_verify", "pipeline_state"])
   assert.match(result.body, /^# Orchestrator\n\n> \*\*Runtime note \(OpenCode bridge\)\.\*\* This prompt was written for OpenCode and runs here in Claude Code\./)
   assert.match(result.body, /## Progress tracking \(TodoWrite\)/)
@@ -62,6 +64,8 @@ test("bash allowlists are collected per decision and documented as not enforced"
 
 test("Claude bridge output carries the runtime note, translated names, and allowlist README section", () => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "claude-bridge-tools-"))
+  fs.mkdirSync(path.join(workspace, "tools", "extra"), { recursive: true })
+  for (const name of ["dev_env", "pipeline_state"]) fs.writeFileSync(path.join(workspace, "tools", "extra", `${name}.js`), "export default {}")
   const output = path.join(workspace, "export", "bridges", "claude-code", "decent-pipeline")
   const orchestrator = agent("pipeline-orchestrator.md", { mode: "primary", permission: { pipeline_state: "allow", dev_env: "allow", todowrite: "allow", question: "allow" } }, ORCHESTRATOR_BODY)
   const executor = agent("pipeline-executor.md", { mode: "subagent", permission: { edit: "allow", bash: { "*": "deny", "git status*": "allow" } } }, "Implement the plan.")

@@ -5,7 +5,7 @@ import path from "node:path"
 import { atomicWriteRestrictedFile } from "./agents.js"
 import { movePathWithRetry, removePathWithRetry } from "./fsWindows.js"
 import { extractHttpsHost, inspectGhAuth, parseGitHubShorthand, type GhRunner } from "./github.js"
-import { DISCOVERY_DEPTH, MANIFEST_FILE, PACK_NAME_RE, readPackManifest, SKIPPED_DIRS, type PackManifest } from "./packs.js"
+import { discoverPackDirs, PACK_NAME_RE, readPackManifest, type PackManifest } from "./packs.js"
 import { derivePackSlug, validateVirtualPack } from "./virtualPacks.js"
 import { cleanGitEnvironment } from "./repositoryTransaction.js"
 
@@ -42,7 +42,7 @@ export interface GitOptions {
 
 const GIT_URL_RE = /^(?:https:\/\/[^\s#]+|ssh:\/\/[^\s#]+|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[^\s#-][^\s#]*)$/
 export const GIT_REF_RE = /^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]+$/
-export { DISCOVERY_DEPTH, SKIPPED_DIRS }
+export { DISCOVERY_DEPTH, SKIPPED_DIRS } from "./packs.js"
 
 export function engineConfigDir(env: NodeJS.ProcessEnv = process.env): string {
   return path.join(env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "manage-agents")
@@ -151,7 +151,7 @@ export type SourceSpecResult =
   | { ok: false; error: string }
 
 /** Single source of truth for spec parsing; `externalRef` is the ref supplied through addSource settings. */
-function resolveSpec(raw: string, options: GitOptions, externalRef?: string): SourceSpecResult {
+function resolveSpec(raw: string, options: GitOptions, externalRef?: string, env: NodeJS.ProcessEnv = process.env): SourceSpecResult {
   let spec = raw.trim()
   let ref = externalRef
   const shorthand = parseGitHubShorthand(spec)
@@ -175,7 +175,7 @@ function resolveSpec(raw: string, options: GitOptions, externalRef?: string): So
   if (/^[a-z][a-z0-9+.-]*:/i.test(spec) && !path.win32.isAbsolute(spec)) {
     return { ok: false, error: `unsupported source URL "${redactUrlCredentials(raw)}": use https:, ssh:, git@host:path or owner/repo` }
   }
-  const dir = path.resolve(spec)
+  const dir = expandUserPath(spec, env)
   if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return { ok: false, error: `${dir} is not a directory` }
   if (ref !== undefined) return { ok: false, error: "--ref applies only to git sources" }
   return { ok: true, kind: "local", path: fs.realpathSync(dir), spec }
@@ -183,7 +183,7 @@ function resolveSpec(raw: string, options: GitOptions, externalRef?: string): So
 
 /** Resolves a directory, git URL or GitHub `[github:]owner/repo[#ref]` spec; read-only and registry-independent. */
 export function resolveSourceSpec(raw: string, env: NodeJS.ProcessEnv = process.env, options: GitOptions = {}): SourceSpecResult {
-  return resolveSpec(raw, options)
+  return resolveSpec(raw, options, undefined, env)
 }
 
 /** Safe on every keystroke: same outcome as resolveSourceSpec, with no writes and no registry mutation. */
@@ -403,20 +403,12 @@ export function discoverPacks(source: Source, env: NodeJS.ProcessEnv = process.e
     problems.push(source.kind === "git" ? `source "${source.name}" has not been pulled yet: run \`manage-agents source pull ${source.name}\`` : `source "${source.name}": ${root} does not exist`)
     return { candidates, problems }
   }
-  const visit = (dir: string, depth: number) => {
-    if (fs.existsSync(path.join(dir, MANIFEST_FILE))) {
-      const { manifest, issues } = readPackManifest(dir, { sourceKind: source.kind })
-      const relativeDir = path.relative(root, dir).split(path.sep).join("/") || "."
-      if (manifest) candidates.push({ source: source.name, sourceKind: source.kind, trusted: source.trusted, dir, relativeDir, manifest })
-      else problems.push(`${source.name}:${relativeDir}: ${issues.filter(issue => issue.level === "error").map(issue => issue.message).join("; ")}`)
-      return
-    }
-    if (depth >= DISCOVERY_DEPTH) return
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
-      if (entry.isDirectory() && !SKIPPED_DIRS.has(entry.name)) visit(path.join(dir, entry.name), depth + 1)
-    }
+  for (const dir of discoverPackDirs(root)) {
+    const { manifest, issues } = readPackManifest(dir, { sourceKind: source.kind })
+    const relativeDir = path.relative(root, dir).split(path.sep).join("/") || "."
+    if (manifest) candidates.push({ source: source.name, sourceKind: source.kind, trusted: source.trusted, dir, relativeDir, manifest })
+    else problems.push(`${source.name}:${relativeDir}: ${issues.filter(issue => issue.level === "error").map(issue => issue.message).join("; ")}`)
   }
-  visit(root, 0)
   if (!candidates.length && !problems.length) {
     const virtualName = source.kind === "git" ? derivePackSlug(source.name) : derivePackSlug(path.basename(path.resolve(root)))
     const virtualValidation = validateVirtualPack(root, { name: virtualName, sourceKind: source.kind })
