@@ -213,6 +213,7 @@ The Catalog tree (`activeItems` in `src/App.tsx:1410-1448`) groups discovered ag
 ### Live Search & Multi-Agent Batch Selection
 
 - **Live Filter (`/`)**: Pressing `/` or clicking the search bar enters `isSearching` mode, filtering agents by case-insensitive substring match on `agent.filename` and automatically expanding every pack folder with matching agents. Clicking `[× Clear]` or pressing `Esc` resets the filter.
+- **Pack installation**. Click a pack checkbox or press `Space` on its row. `Ctrl+A` toggles all packs matching the filter. The footer shows the total selected across filters. `Esc` clears the pack selection from the list, and `E` previews installation with dependencies.
 - **Batch Marking**:
   - `Space` (or clicking `[ ]` on an agent row): Toggles selection for the focused agent (`selectedAgentPaths`).
   - `A`: Toggles selection for **all agents** in the focused item's pack category (`select-category`).
@@ -235,7 +236,7 @@ The Catalog tree (`activeItems` in `src/App.tsx:1410-1448`) groups discovered ag
 | `N` | Scaffold Pack Resource | Opens [`PackDoctorModal`](../modules/pack-onboarding-and-doctor.md) (`scaffold` tab) on writable local packs to create a new `agent`, `skill`, or slash `command`. |
 | `D` | Pack Doctor | Inspects local pack contract compliance, applies auto-fixes (`F`), refreshes the authoring kit (`A`), or bumps semver (`1` patch, `2` minor, `3` major). |
 | `I` | Onboard Virtual Pack | Launches Contract 1.1 onboarding wizard (`PackOnboardingModal`) on virtual packs. |
-| `E` | Install Pack | Runs [dry-run install preview](../concepts/pack-lifecycle-and-target-safety.md) (`install-confirm`) with unified diff and executable-surface confirmation before applying to the OpenCode target. |
+| `E` | Install Packs | Previews a single change for all selected packs, or the focused pack when there is no selection. The [dry run](../concepts/pack-lifecycle-and-target-safety.md) includes the diff and any required executable-surface confirmation. |
 | `B` / `Shift+B` | Bridge Pack | Opens `BridgeModal` to generate a [Claude Code plugin or OpenAI Codex translation layer](../modules/bridges.md) (`B` / `Shift+B`). |
 
 ---

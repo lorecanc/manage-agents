@@ -52,7 +52,7 @@ graph LR
 `findAgentFiles(workspaceRoot, sourceDir?, options?)` locates agent `.md` files without ever following symbolic links:
 
 1. With no explicit `sourceDir`, discovery starts at the workspace root and visits outermost pack manifests up to four levels deep. The pack name comes from the manifest.
-2. Each pack contributes Markdown from its `agents/`, `agent/`, `mode/`, and `modes/` directories. Legacy modes default to primary. The Catalog also lists packs with zero agents.
+2. Each pack contributes Markdown from its `agents/`, `agent/`, `mode/`, and `modes/` directories. Legacy modes default to primary. The Catalog lists packs that contribute agents.
 3. Manifest-free workspaces use the virtual-pack scanner. Both discovery paths skip symbolic links.
 4. **Category assignment**: Each `AgentInfo.category` resolves to the enclosing pack name via `packNameOf(filePath, workspaceRoot)` (nearest `opencode-pack.json`), falling back to `computeCategories(filenames)`, which picks the longest hyphen-delimited prefix shared by two or more agent filenames (or `"general"`).
 

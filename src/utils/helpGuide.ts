@@ -162,7 +162,9 @@ function buildGroupsForTab(
         {
           title: "Selection & Inspector",
           items: [
-            { id: "cat-mark", keyLabel: "Space", title: "Mark or unmark focused agent for batch edits", scope: "Batch", actionId: "select-toggle", disabled: noAgents },
+            { id: "cat-mark", keyLabel: "Space", title: "Select focused pack or mark focused agent", scope: "Selection", actionId: "select-toggle", disabled: noAgents },
+            { id: "cat-select-all", keyLabel: "Ctrl+A", title: "Select or deselect all matching packs for installation", scope: "Pack", actionId: "select-all-packs", disabled: noPacks },
+            { id: "cat-install", keyLabel: "E", title: "Preview installation of selected packs or the focused pack", scope: "Target", actionId: "pack-install", disabled: noPacks },
             { id: "cat-mark-pack", keyLabel: "A", title: "Mark or unmark all agents in focused pack", scope: "Batch", actionId: "select-category", disabled: noAgents },
             { id: "cat-mark-model", keyLabel: "S", title: "Mark agents sharing the same model in pack", scope: "Batch", actionId: "select-same-model", disabled: noAgents },
             { id: "cat-filter", keyLabel: "/", title: "Filter by agent or pack name", scope: "Filter", actionId: "catalog-search", disabled: noPacks },

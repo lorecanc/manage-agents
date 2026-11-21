@@ -238,7 +238,7 @@ interface ActiveItem {
 }
 
 interface InstallPreview {
-  pack: string
+  packs: string[]
   target: string
   lines: string[]
   confirmations: string[]
@@ -386,6 +386,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   const [repairGroupKey, setRepairGroupKey] = useState<string | null>(null)
   const [repairMappings, setRepairMappings] = useState<Record<string, string>>({})
   const [selectedAgentPaths, setSelectedAgentPaths] = useState<Set<string>>(new Set())
+  const [selectedPackNames, setSelectedPackNames] = useState<Set<string>>(new Set())
 
   // View Settings
   // Every folder starts closed: the TUI opens on a compact list of categories.
@@ -984,6 +985,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     setAgents(loadedAgents)
     setTranslationConfig(loadedConfig)
     setSelectedAgentPaths(new Set())
+    setSelectedPackNames(new Set())
     setExpandedCategories(new Set())
     setFocusedIndex(0)
     setScrollOffset(0)
@@ -1151,12 +1153,12 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     }
   }
 
-  // Installs a pack of this workspace or active registered source into the OpenCode config.
-  const installRequest = (pack: string) => {
+  // Resolve all requested packs through the same source.
+  const installRequests = (packs: readonly string[]) => {
     const registry = loadSources()
     if (activeDataSource?.kind === "source") {
       const source = findSource(registry, activeDataSource.source.name)
-      return { registry, added: false, request: `${source.name}/${pack}`, sourceName: source.name }
+      return { registry, added: false, requests: packs.map(pack => `${source.name}/${pack}`), sourceName: source.name }
     }
     const root = fs.realpathSync(workspaceRoot)
     let source = registry.sources.find(candidate => candidate.kind === "local" && candidate.path === root)
@@ -1164,23 +1166,25 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     if (!source) {
       source = addSource(registry, deriveSourceName(root, registry), root)
     }
-    return { registry, added, request: `${source.name}/${pack}`, sourceName: source.name }
+    return { registry, added, requests: packs.map(pack => `${source.name}/${pack}`), sourceName: source.name }
   }
 
-  const previewInstall = (pack: string) => {
-    if (!packDir(workspaceRoot, pack)) {
-      setLayoutStatus(`${pack} is not a pack of this workspace.`)
+  const previewInstall = (packs: string[]) => {
+    if (packs.length === 0) return
+    const missing = packs.find(pack => !packDir(workspaceRoot, pack))
+    if (missing) {
+      setLayoutStatus(`${missing} is not a pack of this workspace.`)
       return
     }
     const reqId = ++installPreviewReqIdRef.current
     const target = realpathThroughExistingAncestor(path.resolve(defaultTarget()))
     void (async () => {
       try {
-        const { registry, added, request, sourceName } = installRequest(pack)
-        const result = await changeTarget(target, "install", registry, installChange(registry, [request]), { dryRun: true })
+        const { registry, added, requests, sourceName } = installRequests(packs)
+        const result = await changeTarget(target, "install", registry, installChange(registry, requests), { dryRun: true })
         if (installPreviewReqIdRef.current !== reqId) return
         setInstallPreview({
-          pack, target,
+          packs, target,
           lines: [...(added ? [`This workspace will be registered as source "${sourceName}".`, ""] : []), ...describeChangeResult(target, result)],
           confirmations: result.confirmations,
           blocked: result.status === "failed",
@@ -1199,16 +1203,17 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   const applyInstall = (preview: InstallPreview) => {
     if (installInFlightRef.current) return
     installInFlightRef.current = true
+    const packLabel = preview.packs.length === 1 ? preview.packs[0] : `${preview.packs.length} packs`
     const fail = (error: any) => {
       setActionResultTitle("Install Failed")
       setActionResultLines([`An error occurred:`, `  ${terminalSafeText(error?.message || error)}`])
-      pushToast(`✗ Install failed for ${preview.pack}`)
+      pushToast(`✗ Install failed for ${packLabel}`)
     }
     setIsAsyncBusy(true)
     void (async () => {
-      let prepared: ReturnType<typeof installRequest>
+      let prepared: ReturnType<typeof installRequests>
       try {
-        prepared = installRequest(preview.pack)
+        prepared = installRequests(preview.packs)
       } catch (error) {
         fail(error)
         setIsAsyncBusy(false)
@@ -1216,13 +1221,13 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         setViewMode("action-result")
         return
       }
-      const { registry, added, request, sourceName } = prepared
+      const { registry, added, requests, sourceName } = prepared
       let succeeded = false
       try {
         // Saved first, so an applied lock never names a source the registry lacks; dropped again if nothing was installed.
         if (added) saveSources(registry)
         // The user approved the preview: install it only if the packs and the confirmations are still the same.
-        const compute = installChange(registry, [request])
+        const compute = installChange(registry, requests)
         const result = await changeTarget(preview.target, "install", registry, current => {
           const change = compute(current)
           return change.problems.length || serializeLock(change.lock) === preview.lockText
@@ -1234,7 +1239,10 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         refreshSourcesView(true)
         setActionResultTitle(succeeded ? "Install Complete" : "Install Failed")
         setActionResultLines(describeChangeResult(preview.target, result))
-        pushToast(succeeded ? `✓ Installed pack ${preview.pack}` : `✗ Install failed for ${preview.pack}`)
+        if (succeeded) {
+          setSelectedPackNames(prev => new Set([...prev].filter(pack => !preview.packs.includes(pack))))
+        }
+        pushToast(succeeded ? `✓ Installed ${packLabel}` : `✗ Install failed for ${packLabel}`)
       } catch (error) {
         fail(error)
       }
@@ -1511,9 +1519,11 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   }, [colorTreeItems.length])
 
   const catalogPacks = useMemo(
-    () => [...new Set([...(agents.packNames ?? []), ...agents.map(agent => agent.category)])].sort(comparePackCategories),
+    () => [...new Set(agents.map(agent => agent.category))].sort(comparePackCategories),
     [agents],
   )
+  const selectedPacks = catalogPacks.filter(pack => selectedPackNames.has(pack))
+  const hasEditablePacks = catalogPacks.length > 0 || Boolean(agents.packNames?.length)
 
   // Filter and build active list items in real-time
   const activeItems = useMemo<ActiveItem[]>(() => {
@@ -2296,7 +2306,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   }
 
   const jumpToCatalogAgent = (agentPath: string) => {
-    const jump = computeCatalogJumpState(agents, expandedCategories, agentPath, scrollOffset, maxVisibleItems, comparePackCategories, catalogPacks)
+    const jump = computeCatalogJumpState(agents, expandedCategories, agentPath, scrollOffset, maxVisibleItems, comparePackCategories)
     if (!jump) return
     pendingJumpIndexRef.current = jump.foundIndex
     setWorkspaceTab("catalog")
@@ -2512,6 +2522,19 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     })
   }
 
+  const togglePackSelection = (packs: string[]) => {
+    if (packs.length === 0) return
+    setSelectedPackNames(prev => {
+      const next = new Set(prev)
+      const allSelected = packs.every(pack => prev.has(pack))
+      for (const pack of packs) {
+        if (allSelected) next.delete(pack)
+        else next.add(pack)
+      }
+      return next
+    })
+  }
+
   const openCommandPalette = () => {
     setPaletteQuery("")
     setPaletteFocusIndex(0)
@@ -2657,7 +2680,11 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       case "select-toggle": {
         const item = activeItems[focusedIndex]
         if (item?.type === "file" && item.agent) toggleSelectionAtPath(item.agent.currentPath)
-        else pushToast("⚠ Focus an agent file to mark or unmark it")
+        else if (item?.type === "folder") togglePackSelection([item.category])
+        break
+      }
+      case "select-all-packs": {
+        togglePackSelection(activeItems.filter(item => item.type === "folder").map(item => item.category))
         break
       }
       case "select-category": {
@@ -2721,7 +2748,8 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         const pack = workspaceTab === "flows"
           ? flowsNav.rows[flowsFocusIndex]?.pack
           : activeItems[focusedIndex]?.category
-        if (pack) previewInstall(pack)
+        const packs = workspaceTab === "catalog" && selectedPacks.length > 0 ? selectedPacks : pack ? [pack] : []
+        previewInstall(packs)
         break
       }
       case "pack-init":
@@ -2923,15 +2951,15 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       { id: "agent-rename", label: "Rename Agent File & References", category: "Agent", shortcut: "R", keywords: ["refactor", "filename"], disabled: agents.length === 0 || isReadOnlyGitSource },
       { id: "repair-models", label: "Batch-Repair Invalid / Missing Models", category: "Pack", shortcut: "V", keywords: ["fix", "broken"], disabled: invalidModelGroups.length === 0 },
       { id: "pack-flows", label: "Configure Conditional IF/OR Pack Flows", category: "Pack", shortcut: "M", keywords: ["rules", "triggers", "routing"], disabled: agents.length === 0 },
-      { id: "pack-install", label: "Preview & Install Pack into OpenCode", category: "Target & Bridges", shortcut: "E", keywords: ["deploy", "update", "lock"], disabled: catalogPacks.length === 0 },
+      { id: "pack-install", label: "Preview & Install Packs into OpenCode", category: "Target & Bridges", shortcut: "E", keywords: ["deploy", "update", "lock"], disabled: catalogPacks.length === 0 },
       { id: "target-reconcile", label: "Reconcile Installed OpenCode Target Now", category: "Target & Bridges", shortcut: "R", keywords: ["sync", "drift", "opencode.json"] },
       { id: "engine-self-update", label: "Check / Apply manage-agents Engine Release Update", category: "Target & Bridges", shortcut: "Shift+U", keywords: ["self-update", "version", "upgrade", "github", "release"] },
       { id: "source-pull", label: "Pull Git Source & Refresh GitHub Repos", category: "Target & Bridges", shortcut: "P", keywords: ["fetch", "git", "sync"] },
       { id: "bridge-claude", label: "Generate Claude Code Plugin Bridge", category: "Target & Bridges", shortcut: "B", keywords: ["anthropic", "marketplace"], disabled: agents.length === 0 },
       { id: "bridge-codex", label: "Generate OpenAI Codex Bridge", category: "Target & Bridges", shortcut: "Shift+B", keywords: ["codex", "toml"], disabled: agents.length === 0 },
       { id: "pack-init", label: isReadOnlyGitSource ? "Clone & Onboard Virtual Git Repo into Pack" : "Onboard Virtual Folder into OpenCode Pack (1.1)", category: "Pack", shortcut: "I", keywords: ["virtual", "manifest", "onboard", "clone"], disabled: !isWorkspaceVirtualPack },
-      { id: "pack-doctor", label: "Open Pack Doctor & Auto-Fix Contract Issues", category: "Pack", shortcut: "D", keywords: ["validate", "doctor", "fix", "semver", "bump", "kit"], disabled: isWorkspaceVirtualPack || isReadOnlyGitSource || catalogPacks.length === 0 },
-      { id: "pack-scaffold", label: "Create New Pack Agent, Skill or Slash Command", category: "Pack", shortcut: "N", keywords: ["new", "scaffold", "add", "agent", "skill", "command"], disabled: isWorkspaceVirtualPack || isReadOnlyGitSource || catalogPacks.length === 0 },
+      { id: "pack-doctor", label: "Open Pack Doctor & Auto-Fix Contract Issues", category: "Pack", shortcut: "D", keywords: ["validate", "doctor", "fix", "semver", "bump", "kit"], disabled: isWorkspaceVirtualPack || isReadOnlyGitSource || !hasEditablePacks },
+      { id: "pack-scaffold", label: "Create New Pack Agent, Skill or Slash Command", category: "Pack", shortcut: "N", keywords: ["new", "scaffold", "add", "agent", "skill", "command"], disabled: isWorkspaceVirtualPack || isReadOnlyGitSource || !hasEditablePacks },
       { id: "layout-adjust", label: "Adjust List / Inspector Split Width", category: "View & Motion", shortcut: "Shift+L", keywords: ["resize", "columns"] },
       { id: "toggle-motion", label: reducedMotionState ? "Enable Smooth 60fps Micro-Animations" : "Enable Reduced Motion Mode", category: "View & Motion", shortcut: "Ctrl+E", keywords: ["animation", "motion", "fps"] },
       { id: "help", label: "Open Keyboard & Mouse Guide", category: "View & Motion", shortcut: "?", keywords: ["shortcuts", "cheatsheet"] },
@@ -2946,7 +2974,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       })
     }
     return base
-  }, [agents, catalogPacks, isReadOnlyGitSource, invalidModelGroups.length, isWorkspaceVirtualPack, reducedMotionState, modelCatalog, layout.showInspector])
+  }, [agents, catalogPacks, hasEditablePacks, isReadOnlyGitSource, invalidModelGroups.length, isWorkspaceVirtualPack, reducedMotionState, modelCatalog, layout.showInspector])
 
   const filteredPaletteCommands = useMemo(
     () => filterPaletteCommands(paletteCommands, paletteQuery),
@@ -3455,6 +3483,8 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         if (layout.showInspector) setActivePane("inspector")
       } else if (key === "escape" && effectivePane === "inspector") {
         setActivePane("list")
+      } else if (key === "escape" && selectedPacks.length > 0) {
+        setSelectedPackNames(new Set())
       } else if (rawChar === "?") {
         openHelpGuide("catalog")
       } else if (key === "o") {
@@ -3564,8 +3594,9 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
           }
         }
       } else if (key === "space") {
-        const item = activeItems[focusedIndex]
-        if (item?.type === "file" && item.agent) toggleSelectionAtPath(item.agent.currentPath)
+        executeActionById("select-toggle")
+      } else if (key === "a" && e.ctrl) {
+        executeActionById("select-all-packs")
       } else if (key === "a") {
         executeActionById("select-category")
       } else if (key === "s") {
@@ -3589,8 +3620,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       } else if (key === "b" && e.shift) {
         openBridgeModalAction("codex")
       } else if (key === "e") {
-        const focused = activeItems[focusedIndex]
-        if (focused) previewInstall(focused.category)
+        executeActionById("pack-install")
       } else if (key === "c") {
         executeActionById("agent-color")
       } else if (key === "r") {
@@ -4799,7 +4829,6 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   const contextualChips = buildContextualShortcuts({
     workspaceTab,
     itemType: currentItem?.type ?? null,
-    packAgentCount: categoryAgentCounts.get(activeFocusedPack) ?? 0,
     selectedCount: selectedAgentPaths.size,
     isVirtualPack: activeFocusedIsVirtual || isWorkspaceVirtualPack,
     isReadOnlyGitSource,
@@ -5141,8 +5170,16 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                     [× Clear]
                   </text>
                 ) : (
-                  <text wrapMode="none" style={{ textColor: THEME.fgMuted }}>
-                    {selectedAgentPaths.size > 0 ? `${selectedAgentPaths.size} marked` : "◀/▶ fold"}
+                  <text
+                    wrapMode="none"
+                    style={{ textColor: THEME.fgMuted }}
+                    onMouseDown={(_self, event) => {
+                      event.stopPropagation()
+                      setActivePane("list")
+                      executeActionById("select-all-packs")
+                    }}
+                  >
+                    {catalogPacks.length > 0 ? "[Ctrl+A] All packs" : ""}
                   </text>
                 )}
               </box>
@@ -5171,7 +5208,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                         ? "No data source connected. Press [O] or click Sources above."
                         : searchQuery
                           ? `No packs or agents match "${terminalSafeText(searchQuery)}".`
-                          : "No OpenCode packs or agents found. Press O to choose another source."}
+                          : "No packs with agents found. Press O to choose another source."}
                     </text>
                   </box>
                 ) : (
@@ -5202,6 +5239,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                       const rightMeta = statusParts.join(" · ")
                       const isExpanded = searchQuery.trim() !== "" || expandedCategories.has(item.id)
                       const catCount = categoryAgentCounts.get(item.category) ?? 0
+                      const isSelected = selectedPackNames.has(item.category)
 
                       return (
                         <box
@@ -5209,7 +5247,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                           width="100%"
                           height={1}
                           flexDirection="row"
-                          backgroundColor={isFocused ? THEME.bgRowFocus : "transparent"}
+                          backgroundColor={isFocused ? THEME.bgRowFocus : isSelected ? THEME.bgRowSelected : "transparent"}
                           onMouseDown={(_self, event) => {
                             event.stopPropagation()
                             setActivePane("list")
@@ -5222,9 +5260,24 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                             })
                           }}
                         >
-                          <text width={columnWidth(0)} wrapMode="none" overflow="hidden" style={{ textColor: isFocused ? "#ffffff" : THEME.accentAmber }} b>
-                            {isFocused ? `▎ ${isExpanded ? "▾" : "▸"}` : `  ${isExpanded ? "▾" : "▸"}`}
-                          </text>
+                          <box width={columnWidth(0)} height={1} flexDirection="row" overflow="hidden">
+                            <text width={1} style={{ textColor: THEME.fgPrimary }}>{isFocused ? "▎" : " "}</text>
+                            <text
+                              width={3}
+                              wrapMode="none"
+                              style={{ textColor: isSelected ? THEME.accentGreen : THEME.fgMuted }}
+                              b={isSelected}
+                              onMouseDown={(_self, event) => {
+                                event.stopPropagation()
+                                setActivePane("list")
+                                setFocusedIndex(globalIndex)
+                                togglePackSelection([item.category])
+                              }}
+                            >
+                              {isSelected ? "[X]" : "[ ]"}
+                            </text>
+                            <text width={1} style={{ textColor: THEME.accentAmber }}>{isExpanded ? "▾" : "▸"}</text>
+                          </box>
                           {gutter(`tree-${item.id}-1`)}
                           <text width={columnWidth(1)} wrapMode="none" overflow="hidden" style={{ textColor: isFocused ? "#ffffff" : THEME.accentAmber }} b>
                             {middleEllipsis(`📦 ${terminalSafeText(item.category)} (${catCount})`, columnWidth(1))}
@@ -5348,17 +5401,20 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
               flexDirection="row"
               overflow="hidden"
             >
-              <text width={footerFirstWidth} wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: THEME.fgMuted }}>
+              <text width={footerFirstWidth} wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: selectedPacks.length > 0 ? THEME.accentGreen : THEME.fgMuted }}>
                 {middleEllipsis(
-                  activeItems.length > 0
-                    ? `Row ${focusedIndex + 1}/${activeItems.length}${selectedAgentPaths.size > 0 ? ` · ${selectedAgentPaths.size} marked` : ""}`
-                    : "Empty",
+                  [
+                    selectedPacks.length > 0 ? `${selectedPacks.length} pack${selectedPacks.length === 1 ? "" : "s"} selected` : activeItems.length ? `Row ${focusedIndex + 1}/${activeItems.length}` : "Empty",
+                    selectedAgentPaths.size > 0 ? `${selectedAgentPaths.size} agents marked` : "",
+                  ].filter(Boolean).join(" · "),
                   footerFirstWidth,
                 )}
               </text>
               <text width={footerSecondWidth} wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: invalidModelGroups.length > 0 ? THEME.accentAmber : THEME.fgMuted }}>
                 {middleEllipsis(
-                  invalidModelGroups.length > 0
+                  selectedPacks.length > 0
+                    ? "[E] Install · [Esc] Clear"
+                    : invalidModelGroups.length > 0
                     ? `⚠ ${invalidModelGroups.length} invalid model group(s) [V]`
                     : "Click [ ] to mark · Click twice to edit",
                   footerSecondWidth,
@@ -5943,7 +5999,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                             u
                             onMouseDown={(_self, event) => {
                               event.stopPropagation()
-                              previewInstall(currentItem.category)
+                              executeActionById("pack-install")
                             }}
                           >
                             [E] Install
@@ -7144,6 +7200,8 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
 
       {/* Modal - Install a pack into OpenCode with Native Diff Preview */}
       {viewMode === "install-confirm" && installPreview && (() => {
+        const packNames = installPreview.packs.map(pack => `'${terminalSafeText(pack)}'`).join(", ")
+        const packLabel = installPreview.packs.length === 1 ? terminalSafeText(installPreview.packs[0]) : `${installPreview.packs.length} packs`
         const addedLines = installPreview.lines.filter(l => /^\s*\b(write|add|install|update)\b/i.test(l))
         const removedLines = installPreview.lines.filter(l => /^\s*\b(remove|delete|prune)\b/i.test(l))
         const hasDiffItems = addedLines.length > 0 || removedLines.length > 0
@@ -7157,7 +7215,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
             borderStyle="rounded"
             borderColor={installPreview.blocked ? THEME.borderDanger : THEME.borderSuccess}
             backgroundColor={THEME.bgElevated}
-            title={` Install ${installPreview.pack} `}
+            title={` Install ${packLabel} `}
             titleColor={installPreview.blocked ? THEME.accentRed : THEME.accentGreen}
             padding={1}
             flexDirection="column"
@@ -7165,7 +7223,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
           >
             <box flexDirection="column" flexGrow={1} overflow="hidden">
               <text style={{ textColor: THEME.fgPrimary }} b>
-                {`Install '${installPreview.pack}' and its dependencies into ${installPreview.target.replace(os.homedir(), "~")}`}
+                {`Install ${packNames} with dependencies into ${installPreview.target.replace(os.homedir(), "~")}`}
               </text>
               <scrollbox scrollY={true} flexGrow={1} marginTop={1} overflow="hidden">
                 <box flexDirection="column">
@@ -7191,7 +7249,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                         showLineNumbers={true}
                         syntaxStyle={getMarkdownSyntaxStyle()}
                         diff={buildPreviewUnifiedDiff(
-                          `${installPreview.pack}-target-plan`,
+                          `${packLabel}-target-plan`,
                           removedLines.length ? removedLines : ["(no removals)"],
                           addedLines.length ? addedLines : ["(no additions)"],
                         )}

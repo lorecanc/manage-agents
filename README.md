@@ -165,7 +165,9 @@ Switch workspaces anytime with `Tab` / `Shift+Tab`, clickable top-bar pills, or 
 | `[` / `]` | Focus left list pane or right Inspector pane | Catalog |
 | `1` – `6` | Switch Inspector tabs (`Info`, `Prompt`, `Name`, `Sec`, `Graph`, `Res`) | Catalog |
 | `/` | Live-filter Catalog agents (`Enter` keeps filter, `Esc` clears) or focus Source input | Catalog / Sources |
-| `Space` / `A` / `S` | Mark focused agent / all agents in pack / agents sharing focused model in pack | Batch |
+| `Space` | Select the focused pack for installation or mark the focused agent for batch edits | Catalog |
+| `Ctrl+A` | Select or deselect all packs matching the current Catalog filter | Catalog |
+| `A` / `S` | Mark all agents in the pack or agents sharing the focused model in that pack | Batch |
 | `M` | Assign LLM model (on agent/batch) or open **Conditional `IF / OR` Flows** (on pack) | Catalog / Flows |
 | `T` | Tune `steps`, Thinking/Effort `variant`, `mode` (`primary`/`subagent`/`all`), `hidden` | Agent / Batch |
 | `P` / `C` / `Shift+T` | Apply safety permission preset / pick badge color / assign bridge translation tier | Agent / Batch |
@@ -174,7 +176,7 @@ Switch workspaces anytime with `Tab` / `Shift+Tab`, clickable top-bar pills, or 
 | `I` | Onboard virtual `.md` folder (or clone & onboard remote Git source) to Contract `1.1` | Virtual Pack |
 | `D` / `N` | Open **Pack Doctor** (`F` fix, `A` authoring kit, `1/2/3` semver bump) / scaffold resource | Local Pack |
 | `R` / `Shift+F` | Rename agent & update references / fix `"*": "deny"` permission order (Tab 4) | Local Pack |
-| `E` | Dry-run preview and install/update focused pack into OpenCode (`Y` confirms) | Catalog / Flows |
+| `E` | Preview the selected Catalog packs, or the focused pack when there is no selection. `Y` confirms installation into OpenCode. | Catalog / Flows |
 | `B` / `Shift+B` | Open **Claude Code** (`B`) or **Codex** (`Shift+B`) bridge modal with tier preview | Catalog / Flows |
 | `P` / `G` / `T` / `X` | Pull Git source / `gh` web login / toggle source trust / remove source | Sources |
 | `R` / `Ctrl+R` | Reconcile installed OpenCode target now / refresh sources & target drift | Sources |

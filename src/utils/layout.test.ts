@@ -7,6 +7,7 @@ import React from "react"
 import { createTestRenderer } from "@opentui/core/testing"
 import { createRoot } from "@opentui/react"
 import { tempDir, writePack } from "../../test/helpers.js"
+import { readDesired } from "./installer.js"
 import { loadSources } from "./sources.js"
 import { App } from "../App.js"
 import { chunkPillsByWidth } from "../ui/ParameterTuningModal.js"
@@ -856,7 +857,7 @@ test("PackFlowsModal MCP toggle writes the target-scope config override and refl
 })
 
 
-test("Sources opens a mixed-layout catalog and installs a command-only pack by manifest name", async t => {
+test("Catalog selects agent packs and installs their hidden dependencies in one preview", async t => {
   const tmp = tempDir(t, "ma-catalog-ui-")
   const previousConfig = process.env.XDG_CONFIG_HOME
   const previousCache = process.env.XDG_CACHE_HOME
@@ -871,7 +872,10 @@ test("Sources opens a mixed-layout catalog and installs a command-only pack by m
   const catalog = path.join(tmp, "notebook")
   const command = "---\ndescription: Index a volume\n---\nIndex $ARGUMENTS.\n"
   writePack(path.join(catalog, "library", "volumes"), { "commands/index.md": command }, { name: "archive" })
-  writePack(path.join(catalog, "packs", "team"), { "agents/editor.md": "---\ndescription: Editor\nmode: primary\n---\nEdit.\n" }, { name: "editors" })
+  const editor = "---\ndescription: Editor\nmode: primary\n---\nEdit.\n"
+  const writer = "---\ndescription: Writer\nmode: primary\n---\nWrite.\n"
+  writePack(path.join(catalog, "packs", "team"), { "agents/editor.md": editor }, { name: "editors", requires: { archive: "^1.0.0" } })
+  writePack(path.join(catalog, "packs", "writers"), { "agents/writer.md": writer }, { name: "writers" })
   const ui = await createTestRenderer({ width: 130, height: 36 })
   t.after(() => ui.renderer.destroy())
   createRoot(ui.renderer).render(React.createElement(App, { reducedMotion: true, initialModelCatalog: { status: "verified", models: [] } }))
@@ -883,8 +887,8 @@ test("Sources opens a mixed-layout catalog and installs a command-only pack by m
     }
     assert.fail(`Missing ${label} in frame:\n${ui.captureCharFrame()}`)
   }
-  const press = async (name: string) => {
-    ui.renderer.keyInput.emit("keypress", { name, sequence: name === "return" ? "\r" : name.length === 1 ? name : "", ctrl: false, meta: false, shift: false } as any)
+  const press = async (name: string, ctrl = false) => {
+    ui.renderer.keyInput.emit("keypress", { name, sequence: name === "return" ? "\r" : name.length === 1 ? name : "", ctrl, meta: false, shift: false } as any)
     await new Promise(resolve => setTimeout(resolve, 20))
     await ui.renderOnce()
   }
@@ -894,21 +898,47 @@ test("Sources opens a mixed-layout catalog and installs a command-only pack by m
   await ui.mockInput.pasteBracketedText(catalog)
   await waitFor("notebook")
   await press("return")
-  await waitFor("archive (0)")
+  await waitFor("Catalog (2 packs · 2 agents)")
   assert.equal(loadSources().active, "notebook")
   assert.ok(ui.captureCharFrame().includes("editors (1)"))
-  await press("d")
-  await waitFor("Pack Doctor & Authoring · archive@1.0.0")
-  assert.ok(ui.captureCharFrame().includes("archive"))
+  assert.ok(!ui.captureCharFrame().includes("archive (0)"))
+
+  await press("space")
+  await waitFor("1 pack selected")
+  assert.match(ui.captureCharFrame(), /\[X\].*editors \(1\)/)
+  assert.match(ui.captureCharFrame(), /\[ \].*writers \(1\)/)
   await press("escape")
-  await press("e")
-  await waitFor("Install 'archive'")
-  const installed = path.join(process.env.XDG_CONFIG_HOME, "opencode", "commands", "index.md")
+  assert.doesNotMatch(ui.captureCharFrame(), /\[X\].*(editors|writers) \(1\)/)
+
+  await press("/")
+  await ui.mockInput.pasteBracketedText("writer")
+  await waitFor("/writer")
+  await press("return")
+  await press("a", true)
+  await waitFor("1 pack selected")
+  assert.match(ui.captureCharFrame(), /\[X\].*writers \(1\)/)
+  await press("a", true)
+  assert.doesNotMatch(ui.captureCharFrame(), /\[X\].*writers \(1\)/)
+  await press("/")
   await press("escape")
-  assert.equal(fs.existsSync(installed), false)
+  await waitFor("editors (1)")
+
+  await press("a", true)
+  await waitFor("2 packs selected")
+  assert.match(ui.captureCharFrame(), /\[X\].*editors \(1\)/)
+  assert.match(ui.captureCharFrame(), /\[X\].*writers \(1\)/)
   await press("e")
-  await waitFor("Install 'archive'")
+  await waitFor("Install 'editors', 'writers'")
+  const installed = path.join(process.env.XDG_CONFIG_HOME, "opencode")
+  await press("escape")
+  assert.equal(fs.existsSync(path.join(installed, "commands", "index.md")), false)
+  await waitFor("2 packs selected")
+  await press("e")
+  await waitFor("Install 'editors', 'writers'")
   await press("y")
   await waitFor("Install Complete")
-  assert.equal(fs.readFileSync(installed, "utf8"), command)
+  assert.match(fs.readFileSync(path.join(installed, "agents", "editor.md"), "utf8"), /Edit\./)
+  assert.match(fs.readFileSync(path.join(installed, "agents", "writer.md"), "utf8"), /Write\./)
+  assert.match(fs.readFileSync(path.join(installed, "commands", "index.md"), "utf8"), /Index \$ARGUMENTS\./)
+  assert.deepEqual(readDesired(installed).roots, ["notebook/editors", "notebook/writers"])
 })

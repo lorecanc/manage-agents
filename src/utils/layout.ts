@@ -145,14 +145,13 @@ export function computeCatalogJumpState<T extends { currentPath: string; categor
   currentScrollOffset: number,
   maxVisibleItems: number,
   compareCategories: (a: string, b: string) => number,
-  packNames: readonly string[] = [],
 ): { foundIndex: number; scrollOffset: number; expandedCategories: Set<string>; totalItems: number } | null {
   const targetAgent = agents.find(agent => agent.currentPath === agentPath)
   if (!targetAgent) return null
 
   const expandedCategories = new Set(previouslyExpanded)
   expandedCategories.add(targetAgent.category)
-  const categories = Array.from(new Set([...packNames, ...agents.map(agent => agent.category)])).sort(compareCategories)
+  const categories = [...new Set(agents.map(agent => agent.category))].sort(compareCategories)
   let foundIndex = -1
   let totalItems = 0
 

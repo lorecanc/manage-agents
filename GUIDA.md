@@ -277,7 +277,8 @@ manage-agents --source agents
 manage-agents --workspace ~/dev/agents
 ```
 
-Ogni pack ha una cartella. Con `o` apri la finestra «Data Sources» per autenticarti con `gh` (`G`), sfogliare i tuoi
+Il Catalogo mostra una cartella per ogni pack con agenti. Le dipendenze vengono risolte durante l’installazione.
+Con `o` apri la finestra «Data Sources» per autenticarti con `gh` (`G`), sfogliare i tuoi
 repository GitHub, digitare `owner/repo` (`A` o `/`), sincronizzare con `P` o cambiare sorgente attiva, mentre sulle
 sorgenti GitHub ogni modifica nella TUI aggiorna `overrides.json` e `routing.json` riconciliando il target senza
 alterare mai la cache git.
@@ -287,7 +288,9 @@ alterare mai la cache git.
 | `o` | apre «Data Sources» (repository GitHub, login `gh`, pull, sorgenti locali) |
 | frecce, `j`/`k` | spostano il cursore; nelle schede 3–5 dell'inspector scorrono la scheda |
 | `/` | cerca per nome file (`Enter` mantiene il filtro, `Esc` lo cancella) |
-| `Space`, `a`, `s` | selezionano l'agente, tutto il pack, gli agenti del pack con lo stesso modello |
+| `Space` | seleziona il pack per l’installazione oppure marca l’agente evidenziato |
+| `Ctrl+A` | seleziona o deseleziona tutti i pack che corrispondono al filtro |
+| `a`, `s` | marcano tutti gli agenti del pack oppure quelli con lo stesso modello |
 | `m` | modello; su qualunque cartella pack, senza selezione, i flussi condizionali `IF / OR` |
 | `i` | avvia il wizard di onboarding (su cartella virtuale locale o clonando in locale una repo GitHub) |
 | `d`, `n` | sui pack locali: Pack Doctor (auto-fix, kit repo, bump semver) e creazione guidata di agenti, skill o comandi |
@@ -296,7 +299,7 @@ alterare mai la cache git.
 | `c`, `p`, `g` | colore, preset di permessi, deleghe |
 | `u` | skill, tool e server MCP dell'agente sotto il cursore |
 | `r` | rinomina l'agente |
-| `e` | installa in OpenCode il pack sotto il cursore |
+| `e` | mostra l’anteprima per i pack selezionati o, a selezione vuota, per quello sotto il cursore |
 | `b`, `Shift-B` | bridge Claude Code, bridge Codex |
 | `1`-`6` | schede dell'inspector: Info, Prompt, Name, Sec, Graph, Res |
 | `F` | corregge l'ordine dei permessi (scheda 4) |
