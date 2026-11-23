@@ -121,6 +121,35 @@ test("role targets can be overridden without changing source agents", () => {
   assert.ok(!fs.existsSync(path.join(output, ".agents")))
 })
 
+test("Codex inherit in a tier, mapping or override leaves model and effort to the caller", (t) => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "codex-bridge-inherit-"))
+  t.after(() => fs.rmSync(workspace, { recursive: true, force: true }))
+  const inherited = { model: "inherit", reasoningEffort: "high" }
+  const config: TranslationConfig = {
+    ...DEFAULT_TRANSLATION_CONFIG,
+    tiers: { ...DEFAULT_TRANSLATION_CONFIG.tiers,
+      planning: { ...DEFAULT_TRANSLATION_CONFIG.tiers.planning, codex: inherited } },
+    codex: { ...DEFAULT_TRANSLATION_CONFIG.codex,
+      overrides: { reviewer: inherited }, modelMap: { "source/light": "inherit" } }
+  }
+  const agents = [
+    agent("planner.md", "", { mode: "primary" }, ""),
+    agent("research.md", "source/light", {}, ""),
+    agent("reviewer.md", "", {}, ""),
+  ]
+  const output = path.join(workspace, "generated")
+  const result = bridgeToCodex(agents, "test", "", output, workspace, config)
+  assert.deepEqual(result.preview.map(({ source, model }) => [source, model]), [
+    ["role", "inherit"], ["model-map", "inherit"], ["override", "inherit"],
+  ])
+  for (const translated of result.plugin.agents) {
+    assert.equal(translated.modelReasoningEffort, undefined)
+    const toml = fs.readFileSync(path.join(output, ".codex/agents", translated.filename), "utf8")
+    assert.doesNotMatch(toml, /^model(?:_reasoning_effort)?\s*=/m)
+  }
+  assert.equal(fs.readFileSync(path.join(output, ".codex/config.toml"), "utf8"), "[agents]\nmax_depth = 2\n")
+})
+
 test("codex.modelMap maps the source model into the emitted TOML without a reasoning effort", () => {
   const config: TranslationConfig = {
     ...DEFAULT_TRANSLATION_CONFIG,
@@ -470,7 +499,7 @@ test("Codex bridge never treats pipeline tool or built-in permission keys as MCP
   } }, "Tools are prefixed: `cwe-search_get_cwe_weakness`.")
   bridgeToCodex([auditor], "decent-pipeline", "pipeline-", output, workspace)
   const mcp = JSON.parse(fs.readFileSync(path.join(output, ".mcp.json"), "utf8")).mcpServers
-  assert.deepEqual(Object.keys(mcp), ["cwe-search"])
+  assert.deepEqual(Object.keys(mcp).filter(name => mcp[name].enabled !== false), ["cwe-search"])
 })
 
 test("Codex bridge never treats known tool permission keys as MCP servers", () => {
@@ -488,7 +517,5 @@ test("Codex bridge never treats known tool permission keys as MCP servers", () =
   bridgeToCodex([executor], "decent-pipeline", "pipeline-", output, workspace)
 
   const mcpPath = path.join(output, ".mcp.json")
-  assert.equal(fs.existsSync(mcpPath), false, `known tool keys must not require an MCP server; got ${fs.existsSync(mcpPath) ? fs.readFileSync(mcpPath, "utf8") : ""}`)
-  const manifest = JSON.parse(fs.readFileSync(path.join(output, ".codex-plugin", "plugin.json"), "utf8"))
-  assert.equal(manifest.mcpServers, undefined)
+  assert.equal(JSON.parse(fs.readFileSync(mcpPath, "utf8")).mcpServers.opencode.enabled, false)
 })

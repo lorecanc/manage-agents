@@ -1,6 +1,7 @@
 import fs from "node:fs"
 import path from "node:path"
-import type { AgentInfo } from "./agents.js"
+import YAML from "yaml"
+import { extractFrontmatter, type AgentInfo } from "./agents.js"
 import { buildInferenceIndex, DEFAULT_TRANSLATION_CONFIG, resolveModelTarget, authorName, unusedModelMapKeys } from "./translationConfig.js"
 import type { TranslationConfig } from "./translationConfig.js"
 import { assertInsideRealWorkspace, realpathThroughExistingAncestor } from "./pathValidation.js"
@@ -145,11 +146,11 @@ function sourceAliases(agent: AgentInfo, prefix: string): string[] {
   return [...new Set(aliases.filter(Boolean))]
 }
 
-function buildAgentAliasMap(agents: AgentInfo[], prefix: string): Map<string, string> {
+function buildAgentAliasMap(agents: AgentInfo[], prefix: string, namespace: string): Map<string, string> {
   const aliases = new Map<string, string>()
   const generated = new Set<string>()
   for (const agent of agents) {
-    const name = normalizeCodexAgentName(agent.filename, prefix)
+    const name = namespace + normalizeCodexAgentName(agent.filename, prefix)
     if (generated.has(name)) throw new Error(`Multiple agents map to the Codex name '${name}'. Rename one before generating the bridge.`)
     generated.add(name)
     for (const alias of sourceAliases(agent, prefix)) {
@@ -223,7 +224,7 @@ export function convertCodexAgent(
   customTools: ReadonlySet<string> = new Set(),
   serverNames: string[] = []
 ): CodexAgent {
-  const name = normalizeCodexAgentName(agent.filename, prefix)
+  const name = aliases.get(agent.filename.replace(/\.md$/i, "")) ?? normalizeCodexAgentName(agent.filename, prefix)
   const target = resolvedTargets.get(agent.filename)?.model ?? resolveCodexModel(agent, agents, config)
   const delegated = translateAllowedSubagents(agent, aliases, warnings, prefix)
   const referenced = rewriteReferences(agent.body.trim(), aliases, agent.filename, warnings, prefix)
@@ -254,17 +255,19 @@ export function renderCodexAgentToml(agent: CodexAgent): string {
     `name = ${tomlString(agent.name)}`,
     `description = ${tomlString(agent.description)}`,
     `developer_instructions = ${tomlString(agent.developerInstructions)}`,
-    `model = ${tomlString(agent.model)}`,
-    ...(agent.modelReasoningEffort ? [`model_reasoning_effort = ${tomlString(agent.modelReasoningEffort)}`] : []),
+    ...(agent.model === "inherit" ? [] : [
+      `model = ${tomlString(agent.model)}`,
+      ...(agent.modelReasoningEffort ? [`model_reasoning_effort = ${tomlString(agent.modelReasoningEffort)}`] : [])
+    ]),
     `sandbox_mode = ${tomlString(agent.sandboxMode)}`,
     ""
   ].join("\n")
 }
 
-export function renderCodexSkill(agent: CodexAgent): string {
+export function renderCodexSkill(agent: CodexAgent, name = agent.name): string {
   return [
     "---",
-    `name: ${agent.name}`,
+    `name: ${name}`,
     `description: ${JSON.stringify(agent.description)}`,
     "---",
     "",
@@ -274,6 +277,47 @@ export function renderCodexSkill(agent: CodexAgent): string {
 }
 
 const PROJECT_SKILLS_DIR = ".agents/skills"
+/** The CLI supplies the validated, merged install tree. Refuse links even for direct writer calls. */
+function collectCodexAssets(
+  root: string,
+  section: "skills" | "resources",
+  assets: Map<string, string | { source: string }>,
+  skills: Set<string>,
+  reserved: Set<string>,
+): void {
+  const base = path.join(root, section)
+  const stat = fs.lstatSync(base, { throwIfNoEntry: false })
+  if (!stat) return
+  if (!stat.isDirectory()) throw new Error(`Expected a directory at ${base}`)
+  const target = section === "skills" ? PROJECT_SKILLS_DIR : section
+  function walk(relative: string): void {
+    for (const entry of fs.readdirSync(path.join(base, relative), { withFileTypes: true })) {
+      const rel = path.posix.join(relative, entry.name)
+      const source = path.join(base, rel)
+      if (entry.isDirectory()) {
+        walk(rel)
+        continue
+      }
+      if (!entry.isFile()) throw new Error(`Refusing non-regular bridge asset: ${source}`)
+      const dest = `${target}/${rel}`
+      assets.set(dest, { source })
+      if (section !== "skills" || entry.name !== "SKILL.md") continue
+      const original = fs.readFileSync(source, "utf8")
+      const { yamlText, body } = extractFrontmatter(original)
+      const meta = yamlText ? YAML.parse(yamlText) : {}
+      const name = typeof meta?.name === "string" && meta.name.trim() ? meta.name : path.posix.basename(relative)
+      if (skills.has(name)) throw new Error(`Duplicate source skill name '${name}'`)
+      skills.add(name)
+      reserved.add(name)
+      reserved.add(relative.split("/")[0])
+      if (meta?.name !== name || !meta?.description) {
+        assets.set(dest, `---\n${YAML.stringify({ ...meta, name, description: meta?.description || name }).trimEnd()}\n---\n${body}`)
+      }
+    }
+  }
+  walk("")
+}
+
 const marketplaceName = (pluginName: string) => `${pluginName}-local`
 
 export function codexNextSteps(result: CodexBridgeResult): string[] {
@@ -332,7 +376,7 @@ function readBridgeMcpServers(workspaceRoot: string, warnings: string[]): Record
   }
 }
 
-type CodexMcpServer = Record<string, string | string[] | Record<string, string> | number>
+type CodexMcpServer = Record<string, boolean | string | string[] | Record<string, string> | number>
 type CodexMcpConfig = { mcpServers: Record<string, CodexMcpServer> }
 
 const envReference = /\{env:([A-Za-z_][A-Za-z0-9_]*)\}/
@@ -404,7 +448,6 @@ function buildCodexMcpConfig(
 
   const servers: Array<[string, CodexMcpServer]> = []
   for (const [name, server] of Object.entries(source)) {
-    if (isServerDisabled(server) && !required.has(name)) continue
     const toolDenies = [...(denied.get(name) ?? [])].sort()
     // Codex matches exact tool names. A deny pattern needs a server-wide restriction.
     if (toolDenies.some(tool => /[*?\[]/.test(tool))) {
@@ -419,7 +462,8 @@ function buildCodexMcpConfig(
       warnings.push(`[mcp] omitted server '${name}' with no URL or command`)
       continue
     }
-    if (isServerDisabled(server)) warnings.push(`[mcp] disabled server '${name}' was emitted because translated agents require it`)
+    if (isServerDisabled(server) && !required.has(name)) translated.enabled = false
+    else if (isServerDisabled(server)) warnings.push(`[mcp] disabled server '${name}' was emitted because translated agents require it`)
     if (toolDenies.length) {
       translated.disabled_tools = toolDenies
       warnings.push(`[mcp] tool denies for '${name}' apply to the entire Codex session`)
@@ -437,7 +481,7 @@ function renderProjectConfig(config: CodexMcpConfig | null, nestedDelegation: bo
     `[mcp_servers.${tomlString(name)}]`,
     ...Object.entries(server).map(([key, value]) => {
       const rendered = typeof value === "string" ? tomlString(value)
-        : typeof value === "number" ? String(value)
+        : (typeof value === "number" || typeof value === "boolean") ? String(value)
         : Array.isArray(value) ? `[${value.map(tomlString).join(", ")}]`
         : `{ ${Object.entries(value).map(([entry, text]) => `${tomlString(entry)} = ${tomlString(text)}`).join(", ")} }`
       return `${key} = ${rendered}`
@@ -473,6 +517,7 @@ function renderCodexMcpSetup(config: CodexMcpConfig | null): string[] {
       ...(typeof value.bearer_token_env_var === "string" ? [value.bearer_token_env_var] : [])
     ])
     if (envKeys.size > 0) setup += `, with ${[...envKeys].map(markdownCode).join(", ")} exported before launch`
+    if (value.enabled === false) setup = `disabled by default. To connect, enable this server in the project configuration and ${setup}`
     lines.push(`- ${markdownCode(name)} needs this setup. ${setup[0].toUpperCase() + setup.slice(1)}.`)
   }
   lines.push("", "Verify the resulting connections from Codex before invoking MCP-dependent agents.", "")
@@ -496,9 +541,9 @@ function renderReadme(plugin: CodexPlugin, warnings: string[], mcpConfig: CodexM
     "From this directory, run \`codex\` and trust the project to load its local configuration, or open this directory in the Codex app.",
     plugin.orchestratorName ? `Ask Codex to delegate the task to the ${markdownCode(plugin.orchestratorName)} subagent.` : "",
     "",
-    "- `.codex/agents/` contains project-scoped subagent definitions.",
+    plugin.agents.length ? "- `.codex/agents/` contains project-scoped subagent definitions." : "",
     mcpConfig ? "- `.codex/config.toml` configures MCP for the project. Run `codex mcp list` here to inspect it." : "",
-    plugin.skills.length > 0 ? "- `.agents/skills/` contains translated agent prompts available as skills in this project." : "",
+    plugin.skills.length > 0 ? "- `.agents/skills/` contains the pack skills, their supporting files and any translated agent prompts." : "",
     ...(plugin.skills.length > 0 || mcpConfig ? [
       "",
       "## Install the plugin separately",
@@ -510,7 +555,7 @@ function renderReadme(plugin: CodexPlugin, warnings: string[], mcpConfig: CodexM
       `codex plugin add ${plugin.pluginName}@${marketplaceName(plugin.pluginName)}`,
       "\`\`\`",
       "",
-      "Custom subagents are project-scoped. To use them in another project, copy the relevant TOML files from `.codex/agents/` into that project's `.codex/agents/`.",
+      plugin.agents.length ? "Custom subagents are project-scoped. To use them in another project, copy the relevant TOML files from `.codex/agents/` into that project's `.codex/agents/`." : "",
     ] : []),
     "",
     "OpenCode tool names in prompts are translated where Codex has an equivalent (`todowrite` → `update_plan`). Prompts that rely on custom tools shipped by the pack start with a runtime note saying they are unavailable here and that the documented fallbacks apply.",
@@ -541,14 +586,16 @@ export function writeCodexPlugin(
   outputDir: string,
   workspaceRoot: string,
   config: TranslationConfig = DEFAULT_TRANSLATION_CONFIG,
-  resolvedTargets?: ReadonlyMap<string, ResolvedModelTarget>
+  resolvedTargets?: ReadonlyMap<string, ResolvedModelTarget>,
+  namespace = ""
 ): CodexBridgeResult {
-  if (!Array.isArray(agents) || agents.length === 0) {
+  if (!Array.isArray(agents)) {
     throw new Error(`Cannot generate Codex bridge "${pluginName}": no agents provided.`)
   }
   if (typeof workspaceRoot !== "string" || !workspaceRoot) {
     throw new Error("writeCodexPlugin requires a workspaceRoot")
   }
+  if (namespace && !/^[a-z0-9][a-z0-9-]*-$/.test(namespace)) throw new Error("Invalid Codex agent namespace")
   config = { ...config, prefix }
   const effectiveConfig = { ...config, prefix }
   const targets = resolvedTargets ?? resolveTargets(agents, effectiveConfig)
@@ -561,16 +608,36 @@ export function writeCodexPlugin(
   const mcpSource = config.codex.emitMcp === false ? {} : readBridgeMcpServers(workspaceRoot, warnings)
   const serverNames = Object.keys(mcpSource).sort((a, b) => b.length - a.length)
   const mcpConfig = buildCodexMcpConfig(mcpSource, agents, customTools, serverNames, warnings)
-  const activeServers = serverNames.filter(name => Object.hasOwn(mcpConfig?.mcpServers ?? {}, name))
-  const aliases = buildAgentAliasMap(agents, prefix)
+  const activeServers = serverNames.filter(name => {
+    const server = mcpConfig?.mcpServers[name]
+    return server && server.enabled !== false
+  })
+  const aliases = buildAgentAliasMap(agents, prefix, namespace)
   const translatedAgents = agents.map(agent => convertCodexAgent(agent, prefix, aliases, effectiveConfig, warnings, agents, targets, customTools, activeServers))
   const emitSkills = config.codex.emitSkills !== false
+  const artifacts = new Map<string, { source: string } | string>()
+  const skillNames = new Set<string>()
+  const reservedNames = new Set<string>()
+  if (emitSkills) collectCodexAssets(workspaceRoot, "skills", artifacts, skillNames, reservedNames)
+  collectCodexAssets(workspaceRoot, "resources", artifacts, skillNames, reservedNames)
+  if (!agents.length && !skillNames.size && !mcpConfig) {
+    throw new Error(`Cannot generate Codex bridge "${pluginName}": no agents, skills or MCP servers to export.`)
+  }
+  const agentNames = new Set(translatedAgents.map(agent => agent.name))
+  for (const agent of emitSkills ? translatedAgents : []) {
+    let name = agent.name
+    while (reservedNames.has(name) || (name !== agent.name && agentNames.has(name))) name += "-agent"
+    if (name !== agent.name) warnings.push(`[skills] exported the ${agent.name} agent prompt as ${name} to preserve the source skill`)
+    reservedNames.add(name)
+    skillNames.add(name)
+    artifacts.set(`${PROJECT_SKILLS_DIR}/${name}/SKILL.md`, renderCodexSkill(agent, name))
+  }
   const primary = agents.find(agent => agent.frontmatter.mode === "primary")
   const plugin: CodexPlugin = {
     pluginName: normalizedPluginName,
     agents: translatedAgents,
-    skills: emitSkills ? translatedAgents.map(agent => agent.name) : [],
-    orchestratorName: primary ? normalizeCodexAgentName(primary.filename, prefix) : translatedAgents.find(agent => agent.name === "orchestrator")?.name ?? null,
+    skills: [...skillNames],
+    orchestratorName: primary ? translatedAgents[agents.indexOf(primary)].name : translatedAgents.find(agent => agent.name === "orchestrator")?.name ?? null,
   }
 
   const preview = agents.map(agent => {
@@ -580,16 +647,13 @@ export function writeCodexPlugin(
   })
   const pluginDir = realpathThroughExistingAncestor(path.resolve(outputDir))
   assertInsideRealWorkspace(workspaceRoot, pluginDir, outputDir)
-  const artifacts = new Map<string, string>([
-    [".codex-plugin/plugin.json", renderManifest(plugin, emitSkills, mcpConfig !== null)]
-  ])
-  if (emitSkills || mcpConfig) artifacts.set(".agents/plugins/marketplace.json", renderMarketplace(plugin))
+  artifacts.set(".codex-plugin/plugin.json", renderManifest(plugin, skillNames.size > 0, mcpConfig !== null))
+  if (skillNames.size || mcpConfig) artifacts.set(".agents/plugins/marketplace.json", renderMarketplace(plugin))
   if (mcpConfig) artifacts.set(".mcp.json", `${JSON.stringify(mcpConfig, null, 2)}\n`)
   const projectConfig = renderProjectConfig(mcpConfig, plugin.orchestratorName !== null && translatedAgents.length > 1)
   if (projectConfig) artifacts.set(".codex/config.toml", projectConfig)
   for (const agent of translatedAgents) {
     artifacts.set(`.codex/agents/${agent.filename}`, renderCodexAgentToml(agent))
-    if (emitSkills) artifacts.set(`${PROJECT_SKILLS_DIR}/${agent.name}/SKILL.md`, renderCodexSkill(agent))
   }
 
   if (config.codex.emitReadme !== false) {
@@ -602,11 +666,15 @@ export function writeCodexPlugin(
   const files: string[] = []
   for (const [relative, contents] of artifacts) {
     const file = path.join(pluginDir, relative)
-    assertInsideRealWorkspace(workspaceRoot, realpathThroughExistingAncestor(file), file)
-    if (fs.lstatSync(file, { throwIfNoEntry: false })?.isSymbolicLink()) throw new Error(`Codex bridge file must not be a symlink: ${file}`)
+    const resolvedFile = realpathThroughExistingAncestor(file)
+    assertInsideRealWorkspace(workspaceRoot, resolvedFile, file)
+    if (resolvedFile !== file || fs.lstatSync(file, { throwIfNoEntry: false })?.isSymbolicLink()) {
+      throw new Error(`Codex bridge file must not pass through a symlink: ${file}`)
+    }
     fs.mkdirSync(path.dirname(file), { recursive: true })
     assertInsideRealWorkspace(workspaceRoot, fs.realpathSync(path.dirname(file)), file)
-    fs.writeFileSync(file, contents)
+    if (typeof contents === "string") fs.writeFileSync(file, contents)
+    else fs.copyFileSync(contents.source, file)
     files.push(file)
   }
   return { pluginDir, files, warnings, plugin, preview }
@@ -626,8 +694,5 @@ export function bridgeToCodex(
   workspaceRoot: string,
   config: TranslationConfig = DEFAULT_TRANSLATION_CONFIG
 ): CodexBridgeResult {
-  if (!Array.isArray(agents) || agents.length === 0) {
-    throw new Error(`Cannot generate Codex bridge "${pluginNameInput}": no agents provided.`)
-  }
   return writeCodexPlugin(agents, pluginNameInput, prefix, outputDir, workspaceRoot, config)
 }

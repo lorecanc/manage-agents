@@ -146,6 +146,21 @@ La parte gestita di `opencode.json` viene rigenerata dai pack. Le tue chiavi res
 (per esempio `mcp.servers` o `experimental`) vengono rimosse, mentre una sezione vuota scritta da te resta dov'è. Un
 `opencode.jsonc` con commenti viene riscritto come JSON semplice, e l'originale finisce nel backup.
 
+### Installare nel profilo personale Codex
+
+```bash
+manage-agents install --codex pipeline flow artcraft --dry-run
+manage-agents install --codex pipeline flow artcraft
+```
+
+Puoi eseguire il comando da qualsiasi directory con le sorgenti registrate, oppure indicare un catalogo con
+`--workspace <dir>`. Il manager risolve le dipendenze, genera i plugin e li registra tramite la CLI `codex`.
+Installa i ruoli con il prefisso del pack nella directory `agents/` del profilo Codex, per esempio
+`pipeline-orchestrator` e `flow-build`. Apri una nuova sessione Codex per usarli.
+I server MCP opzionali conservano lo stato disabilitato. Ripeti il comando per aggiornare i pack dalla versione
+disponibile nelle sorgenti. Il manager segnala i ruoli locali modificati prima di sostituirli.
+In uno script usa `--yes` per accettare la superficie eseguibile indicata dal dry run.
+
 ### Controllare lo stato
 
 ```bash
@@ -386,7 +401,9 @@ modelli, impostazioni Claude. Le opzioni principali:
 **Modelli.** Una chiave corrisponde al modello dell'agente come ID completo in minuscolo oppure come ID dopo l'ultima
 `/`. L'ordine di risoluzione è: override per agente, poi `modelMap` (ID completo, ID senza provider, `"*"`), poi il tier
 del ruolo, poi l'inferenza, infine `defaultTier`. Per Claude la destinazione dev'essere `fable`, `sonnet`, `opus`,
-`haiku`, `inherit` o un ID completo `claude-*`. Per Codex basta un ID non vuoto.
+`haiku`, `inherit` o un ID completo `claude-*`. Per Codex usa un ID modello oppure `inherit`.
+Con `inherit` il bridge omette modello e sforzo di ragionamento dal TOML del subagente.
+Codex usa così i valori del chiamante, salvo impostazioni esplicite alla delega o default personali per i subagenti.
 
 **Opzioni che restano.** Le mappature e i flag Claude passati da riga di comando (`--no-validate`, `--no-register`,
 `--marketplace-name`) vengono salvati nella configurazione e riusati dalle esecuzioni successive. Non esiste un flag
@@ -398,6 +415,13 @@ per riattivare validazione o registrazione: rimetti a `true` `claude.autoValidat
 Poi, salvo disattivazione, esegue `claude plugin validate --strict` e registra il plugin in Claude Code, a livello
 utente e una sola volta. Se `claude` non è nel `PATH`, i due passaggi vengono saltati con un avviso. A ogni esecuzione
 il bridge cancella i file generati che non produce più.
+
+**Pack di skill e server MCP.** Dalla radice del catalogo, `manage-agents bridge --pack <pack> --target codex --name <nome>`
+genera anche pack senza agenti. Il layer include le skill del pack e delle dipendenze in `.agents/skills/`, con i
+relativi script e riferimenti. Le risorse conservano il percorso `resources/<pack>/`. Se il nome di una skill
+coincide con quello di un agente, la skill originale conserva il nome e il prompt tradotto usa il suffisso `-agent`.
+I server opzionali sono dichiarati con `enabled = false` nel progetto e con `"enabled": false` nel plugin.
+I server richiesti esplicitamente dagli agenti continuano a seguire la regola di attivazione del bridge.
 
 **Progetto Codex.** Avvia `codex -C <directory-di-output>` e autorizza il progetto quando Codex lo richiede, oppure
 apri la cartella nell’app Codex. La cartella contiene i subagent in `.codex/agents/`, le skill in `.agents/skills/` e

@@ -190,7 +190,7 @@ export function resolveModelTarget(
     ? config.defaultTier
     : Object.keys(config.tiers)[0]
   const roleTier = Object.prototype.hasOwnProperty.call(config.roles, role) ? config.roles[role] : undefined
-  if (override) return { role, tier: roleTier || fallback, model: override, source: "override" }
+  if (override) return { role, tier: roleTier || fallback, model: effectiveModel(override, target), source: "override" }
   const sourceModel = agent.frontmatter?.model || agent.model
   if (sourceModel) {
     const { full, bare } = normalizeSourceModel(sourceModel)
@@ -218,7 +218,12 @@ export function resolveModelTarget(
   tier ||= fallback
   const tierConfig = Object.prototype.hasOwnProperty.call(config.tiers, tier) ? config.tiers[tier] : undefined
   const model = tierConfig?.[target] || { model: "" }
-  return { role, tier, model, source, ...(inferredFrom ? { inferredFrom } : {}) }
+  return { role, tier, model: effectiveModel(model, target), source, ...(inferredFrom ? { inferredFrom } : {}) }
+}
+
+/** An inherited Codex model also takes its reasoning effort from the calling context. */
+function effectiveModel(model: ModelTarget, target: TranslationTarget): ModelTarget {
+  return target === "codex" && model.model === "inherit" ? { model: "inherit" } : model
 }
 
 /** Model-map keys that no agent's source model (full or provider-bare form) would ever hit. */

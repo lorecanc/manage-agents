@@ -751,7 +751,7 @@ function listEntries(
 }
 
 /** OpenCode companions present in the bridged workspace, found by its native layout. */
-function scanOpenCodeCompanions(workspaceRoot: string): OpenCodeCompanions {
+export function scanOpenCodeCompanions(workspaceRoot: string): OpenCodeCompanions {
   return {
     plugins: listEntries(workspaceRoot, "plugins", entry => entry.isDirectory()),
     tools: toolModulePaths(workspaceRoot),
@@ -1347,7 +1347,7 @@ export function bridgeToClaudeCode(
   workspaceRoot: string,
   config: TranslationConfig = DEFAULT_TRANSLATION_CONFIG
 ): BridgeResult {
-  if (!Array.isArray(agents) || agents.length === 0) {
+  if (!Array.isArray(agents)) {
     throw new Error(`Cannot generate Claude Code bridge "${pluginName}": no agents provided.`)
   }
   // Claude plugin manifests use the same lower-kebab naming convention as
@@ -1361,6 +1361,13 @@ export function bridgeToClaudeCode(
   const explicitlyRequiredMcpServers = new Set(agents.flatMap(agent => permissionMcpServers(agent.frontmatter, customTools)))
   const serverScopedDenies = serverScopedDeniedServers(agents.map(agent => agent.frontmatter), customTools)
   const mcpConfig = buildClaudeMcpConfig(workspaceRoot, explicitlyRequiredMcpServers, serverScopedDenies).config
+  // Skills-only packs bridge to a skills-only Claude Code plugin; fail only
+  // when nothing at all would be exported (mirrors the Codex bridge).
+  const emitsSkills = config.claude.emitSkills !== false && companions.skills.length > 0
+  const emitsCommands = config.claude.emitCommands !== false && companions.commands.length > 0
+  if (agents.length === 0 && !emitsSkills && !emitsCommands) {
+    throw new Error(`Cannot generate Claude Code bridge "${pluginName}": no agents, skills or commands to export.`)
+  }
   const availableMcpServers = mcpConfig && typeof mcpConfig.mcpServers === "object"
     ? new Set<string>(Object.keys(mcpConfig.mcpServers))
     : new Set<string>()

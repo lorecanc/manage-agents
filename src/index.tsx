@@ -263,6 +263,12 @@ async function runTranslationWizard(
   return next
 }
 
+/** A catalog's configured plugin name belongs to its configured pack. */
+function bridgePluginNameForPack(config: TranslationConfig, pack: string): string {
+  if (pack && config.prefix && config.prefix.replace(/-$/, "") !== pack) return pack
+  return config.pluginName || DEFAULT_TRANSLATION_CONFIG.pluginName
+}
+
 const BRIDGE_CHECK_HELP = `
 Usage: manage-agents bridge check [options]
 
@@ -299,9 +305,10 @@ async function runBridgeCheck(workspaceRoot: string) {
   const storageKey = standaloneBridgeKey(workspaceRoot)
   const loc = storageKey ? sourceTranslationConfigLocation(storageKey, workspaceRoot) : undefined
   const config = loadTranslationConfig(workspaceRoot, loc?.readPath, { persistMigration: false })
+  const prefix = pack ? `${pack}-` : config.prefix
   pack = pack || (config.prefix || "").replace(/-$/, "") || manifestName(workspaceRoot) || ""
   if (!pack) throw new Error(`Cannot tell which pack the bridges translate: set 'prefix' in ${path.relative(workspaceRoot, translationConfigPath(workspaceRoot))} or pass --pack`)
-  const pluginName = sanitizeFilename(config.pluginName || DEFAULT_TRANSLATION_CONFIG.pluginName)
+  const pluginName = sanitizeFilename(bridgePluginNameForPack(config, pack))
   const checks = [
     { target: "claude" as const, folder: "claude-code" },
     { target: "codex" as const, folder: "codex" }
@@ -314,7 +321,7 @@ async function runBridgeCheck(workspaceRoot: string) {
   let drifted = false
   for (const check of checks) {
     const label = `${check.folder}/${pluginName}`
-    const result = checkPackBridge({ workspaceRoot, pack, target: check.target, config: { ...config, prefix: config.prefix || `${pack}-` }, committedDir: check.committedDir })
+    const result = checkPackBridge({ workspaceRoot, pack, target: check.target, config: { ...config, pluginName, prefix: prefix || `${pack}-` }, committedDir: check.committedDir })
     if (result.clean) {
       console.log(`Bridge ${label} (pack ${pack}): current.`)
       continue
@@ -445,7 +452,7 @@ automation flags are persisted the same way.
       ...(marketplaceName ? { marketplaceName } : {})
     }
   }
-  pluginName = pluginName || config.pluginName || DEFAULT_TRANSLATION_CONFIG.pluginName
+  pluginName = pluginName || bridgePluginNameForPack(config, pack)
   prefix = prefix || (pack ? `${pack}-` : config.prefix)
   if (!pack) pack = prefix.replace(/-$/, "") || manifestName(workspaceRoot) || ""
   if (!prefix) prefix = `${pack}-`
@@ -469,7 +476,7 @@ automation flags are persisted the same way.
   const trust = registeredSource && resolvedTrust.sourceName === registeredSource.name
     ? { trusted: registeredSource.trusted, sourceName: registeredSource.name }
     : resolvedTrust
-  const reasons = bridgeConfirmationsNeeded(workspaceRoot, pack, trust.trusted, trust.sourceName)
+  const reasons = bridgeConfirmationsNeeded(workspaceRoot, pack, trust.trusted, trust.sourceName, process.env, target)
   if (reasons.length && !await confirmInTerminal(reasons, assumeYes)) {
     process.exitCode = 1
     return
@@ -1087,6 +1094,8 @@ function runResolveCLI() {
 const TARGET_USAGE = `Usage: manage-agents <command> [--target <opencode-config-dir>]
   install <[source/]pack[@range]>... [--adopt] [--yes] [--dry-run] [--json]
                      add root packs; packs already installed keep their locked version
+  install --codex <[source/]pack[@range]>... [--yes] [--dry-run] [--json]
+                     install skills, MCP servers and namespaced personal roles into Codex
   uninstall <pack>... [--dry-run] [--json]
                      remove root packs; dependencies still required stay
   update [<pack>...] [--adopt] [--yes] [--dry-run] [--json]
@@ -1679,6 +1688,28 @@ async function run() {
   if (command === "source") return runSourceCLI()
   if (command === "resolve") return runResolveCLI()
   if (command === "models" || command === "override") return runSettingsCLI(command)
+  if (command === "install" && process.argv.slice(3).includes("--codex")) {
+    const args = process.argv.slice(3)
+    if (args.includes("--help") || args.includes("-h")) return console.log(TARGET_USAGE)
+    const parsed = parseCliArgs(args, [], ["--codex", "--dry-run", "--yes", "--json"])
+    if (typeof parsed === "string") return cliError(parsed)
+    const json = parsed.flags.has("--json")
+    try {
+      const { installCodexPacks } = await import("./utils/codexInstall.js")
+      const dryRun = parsed.flags.has("--dry-run")
+      const result = await installCodexPacks(parsed.positional, { dryRun, source: explicitSource, workspace: explicitWorkspace,
+        confirm: reasons => confirmInTerminal(reasons, parsed.flags.has("--yes"), json) })
+      if (json) printJson(result)
+      else {
+        for (const p of result.packs) console.log(`${dryRun ? "Would install" : "Installed"} ${terminalSafeText(p.pack)} in Codex (${p.skills} skills, ${p.roles} personal roles).`)
+        if (dryRun) for (const message of result.confirmations) console.log(`needs confirmation: ${terminalSafeText(message)}`)
+      }
+    } catch (error) {
+      if (json) { printJson({ error: (error as Error).message }); process.exitCode = 1 }
+      else cliError((error as Error).message, 1)
+    }
+    return
+  }
   if (command === "install" || command === "uninstall" || command === "update" || command === "reconcile" || command === "status" || command === "restore") return runTargetCLI(command)
   if (command && !command.startsWith("-") && !WORKSPACE_COMMANDS[command]) return cliError(`unknown command ${terminalSafeText(command)}; run manage-agents --help`)
 

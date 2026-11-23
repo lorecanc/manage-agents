@@ -315,15 +315,17 @@ if (isDirectEntrypoint()) {
     const installCommand = process.versions.bun
       ? (existsSync(join(scriptDir, "bun.lock")) ? "bun install --frozen-lockfile --ignore-scripts" : "bun install --ignore-scripts")
       : (existsSync(join(scriptDir, "package-lock.json")) ? "npm ci --ignore-scripts --no-audit --no-fund" : "npm install --ignore-scripts --no-audit --no-fund")
-    const installResult = spawnSync(installCommand, { cwd: scriptDir, shell: true, stdio: "inherit", windowsHide: true })
+    const installResult = spawnSync(installCommand, { cwd: scriptDir, shell: true, stdio: ["inherit", 2, 2], windowsHide: true })
     if (installResult.status !== 0) process.exit(installResult.status ?? 1)
   }
 
   // A published package ships dist/ without src/: rebuild only from a checkout.
   if (needsBuild) {
-    const result = spawnSync(process.versions.bun ? "bun run build" : "npm run build", { cwd: scriptDir, shell: true, stdio: "inherit", windowsHide: true })
+    const result = spawnSync(process.versions.bun ? "bun run build" : "npm run build", { cwd: scriptDir, shell: true, stdio: ["inherit", 2, 2], windowsHide: true })
     if (result.status !== 0) process.exit(result.status ?? 1)
   }
 
+  // npm and user-local bin links can invoke this launcher under an extensionless name.
+  process.argv[1] = fileURLToPath(import.meta.url)
   await import(pathToFileURL(distPath).href)
 }

@@ -4,6 +4,7 @@ import os from "node:os"
 import path from "node:path"
 import test, { type TestContext } from "node:test"
 import { bridgeConfirmationsNeeded, bridgePack, prepareBridgeWorkspace, resolveBridgeWorkspaceTrust } from "./bridgeWorkspace.js"
+import { bridgeToClaudeCode } from "./bridge.js"
 import { defaultTarget } from "./lock.js"
 import { realpathThroughExistingAncestor } from "./pathValidation.js"
 import { saveConfigOverride } from "./sourceCustomization.js"
@@ -72,6 +73,70 @@ function listFiles(root: string): string[] {
 }
 
 const config: TranslationConfig = { ...DEFAULT_TRANSLATION_CONFIG, claude: { ...DEFAULT_TRANSLATION_CONFIG.claude, autoValidate: false, autoRegister: false } }
+
+test("Codex bridges native skills without agents, including dependency files and optional MCP servers", t => {
+  const root = writeCatalog(t, {
+    "packs/docs/opencode-pack.json": manifest("docs", { lib: "^1.0.0" }),
+    "packs/docs/skills/write/SKILL.md": "---\nname: write\ndescription: Write documents\n---\n",
+    "packs/lib/opencode-pack.json": manifest("lib"),
+    "packs/lib/skills/format/SKILL.md": "---\ndescription: Format a document\n---\n",
+    "packs/lib/skills/format/scripts/run.sh": "#!/bin/sh\nexit 0\n",
+    "packs/lib/resources/lib/asset.bin": "",
+    "packs/docs/opencode.json": JSON.stringify({ mcp: { servers: { optional: { type: "local", command: ["doc-cli", "mcp"], disabled: true } } } }),
+  })
+  const binary = Buffer.from([0, 255, 42])
+  fs.writeFileSync(path.join(root, "packs/lib/resources/lib/asset.bin"), binary)
+  fs.chmodSync(path.join(root, "packs/lib/skills/format/scripts/run.sh"), 0o755)
+  const outputDir = path.join(root, "bridges/codex/docs")
+  const run = () => bridgePack({ workspaceRoot: root, pack: "docs", target: "codex", outputDir, config, pluginName: "docs", prefix: "docs-" })
+  const result = run()
+  assert.deepEqual(result.plugin.skills.sort(), ["format", "write"])
+  assert.deepEqual(result.plugin.agents, [])
+  const skillDir = path.join(outputDir, ".agents/skills")
+  assert.match(fs.readFileSync(path.join(skillDir, "format/SKILL.md"), "utf8"), /name: format/)
+  assert.equal(fs.readFileSync(path.join(skillDir, "write/SKILL.md"), "utf8"), fs.readFileSync(path.join(root, "packs/docs/skills/write/SKILL.md"), "utf8"))
+  assert.deepEqual(fs.readFileSync(path.join(outputDir, "resources/lib/asset.bin")), binary)
+  if (process.platform !== "win32") assert.ok(fs.statSync(path.join(skillDir, "format/scripts/run.sh")).mode & 0o100)
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(outputDir, ".mcp.json"), "utf8")).mcpServers.optional,
+    { command: "doc-cli", args: ["mcp"], enabled: false })
+  assert.match(fs.readFileSync(path.join(outputDir, ".codex/config.toml"), "utf8"), /^enabled = false$/m)
+  fs.mkdirSync(path.join(root, "packs/docs/agents"))
+  fs.writeFileSync(path.join(root, "packs/docs/agents/docs-write.md"), agent("Prompt for writing"))
+  assert.deepEqual(run().plugin.skills.sort(), ["format", "write", "write-agent"])
+  assert.match(fs.readFileSync(path.join(skillDir, "write-agent/SKILL.md"), "utf8"), /name: write-agent/)
+  if (process.platform !== "win32") {
+    fs.chmodSync(path.join(root, "packs/lib/skills/format/scripts/run.sh"), 0o644)
+    run()
+    assert.equal(fs.statSync(path.join(skillDir, "format/scripts/run.sh")).mode & 0o111, 0)
+  }
+  fs.unlinkSync(path.join(root, "packs/lib/skills/format/scripts/run.sh"))
+  run()
+  assert.equal(fs.existsSync(path.join(skillDir, "format/scripts/run.sh")), false)
+})
+
+test("Claude bridges native skills without agents, while a pack with nothing exportable still fails", t => {
+  const root = writeCatalog(t, {
+    "packs/showcase/opencode-pack.json": manifest("showcase"),
+    "packs/showcase/skills/deck/SKILL.md": "---\nname: deck\ndescription: Build decks\n---\n\nBuild decks.\n"
+  })
+  const outputDir = path.join(root, "bridges/claude-code/showcase")
+  const run = () => bridgePack({ workspaceRoot: root, pack: "showcase", target: "claude", outputDir, config, pluginName: "showcase", prefix: "showcase-" })
+  const result = run()
+  assert.equal(result.orchestratorName, null)
+  assert.deepEqual(result.preview, [])
+  assert.deepEqual(fs.readdirSync(path.join(outputDir, "agents")), [])
+  // The generated plugin skill drops the redundant `name` key: the directory is the skill name.
+  assert.equal(
+    fs.readFileSync(path.join(outputDir, "skills/deck/SKILL.md"), "utf8"),
+    fs.readFileSync(path.join(root, "packs/showcase/skills/deck/SKILL.md"), "utf8").replace("name: deck\n", ""))
+  assert.ok(fs.existsSync(path.join(outputDir, ".claude-plugin/plugin.json")))
+  assert.ok(fs.existsSync(path.join(outputDir, ".claude-plugin/marketplace.json")))
+  assert.deepEqual(result.files.sort(), listFiles(outputDir))
+  assert.throws(() => fs.statSync(path.join(outputDir, ".mcp.json")), /ENOENT/)
+  fs.rmSync(path.join(root, "packs/showcase/skills"), { recursive: true })
+  assert.throws(run, /Pack 'showcase' has no agents to bridge/)
+  assert.throws(() => bridgeToClaudeCode([], "empty", "empty-", path.join(root, "bridges/claude-code/empty"), root, config), /no agents, skills or commands to export/)
+})
 
 test("prepareBridgeWorkspace merges the pack closure into one installable tree", (t) => {
   const catalog = writeCatalog(t)

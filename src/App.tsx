@@ -609,10 +609,15 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   const [resourceScrollIndex, setResourceScrollIndex] = useState(0)
 
   const allAgentFilenames = useMemo(() => agents.map(a => a.filename), [agents])
-  const bridgeablePacks = useMemo(
-    () => workspaceRoot ? collectBridgeablePacks(agents, pack => Boolean(packDir(workspaceRoot, pack))) : [],
+  const codexBridgePacks = useMemo(
+    () => workspaceRoot ? collectBridgeablePacks(agents, pack => Boolean(packDir(workspaceRoot, pack)),
+      agents.packNames?.filter(pack => {
+        const dir = packDir(workspaceRoot, pack)
+        return dir && ["skills", "opencode.json", "opencode.jsonc"].some(file => fs.existsSync(path.join(dir, file)))
+      })) : [],
     [agents, workspaceRoot],
   )
+  const bridgeablePacks = bridgeTarget === "codex" ? codexBridgePacks : codexBridgePacks.filter(pack => pack.count > 0)
   const filteredBridgePacks = useMemo(
     () => filterBridgePacks(bridgeablePacks, bridgePackQuery),
     [bridgeablePacks, bridgePackQuery],
@@ -1397,6 +1402,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         pack,
         trusted,
         activeDataSource.kind === "source" ? activeDataSource.source.name : undefined,
+        process.env, bridgeTarget,
       )
       if (reasons.length > 0 && !confirmedUntrusted) {
         setBridgeConfirmReasons(reasons)
@@ -2384,8 +2390,9 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   }
 
   const openBridgeModalAction = (target: "claude" | "codex") => {
-    if (agents.length > 0 && activeDataSource) {
-      if (bridgeablePacks.length === 0) {
+    if (activeDataSource) {
+      const candidates = target === "codex" ? codexBridgePacks : codexBridgePacks.filter(pack => pack.count > 0)
+      if (candidates.length === 0) {
         setActionResultTitle("No Pack to Bridge")
         setActionResultLines(["No valid pack was found in the active workspace."])
         setViewMode("action-result")
@@ -2408,7 +2415,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         packExpanded: false,
         tierCount: Object.keys(nextTiers).length,
       })
-      const initialPack = resolveInitialBridgePack(bridgeablePacks, focusedPack, initialLayout.packViewportRows)
+      const initialPack = resolveInitialBridgePack(candidates, focusedPack, initialLayout.packViewportRows)
       bridgeModelTargetDirtyRef.current = false
       setBridgeConfirmReasons([])
       setBridgeTarget(target)
@@ -2956,7 +2963,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       { id: "engine-self-update", label: "Check / Apply manage-agents Engine Release Update", category: "Target & Bridges", shortcut: "Shift+U", keywords: ["self-update", "version", "upgrade", "github", "release"] },
       { id: "source-pull", label: "Pull Git Source & Refresh GitHub Repos", category: "Target & Bridges", shortcut: "P", keywords: ["fetch", "git", "sync"] },
       { id: "bridge-claude", label: "Generate Claude Code Plugin Bridge", category: "Target & Bridges", shortcut: "B", keywords: ["anthropic", "marketplace"], disabled: agents.length === 0 },
-      { id: "bridge-codex", label: "Generate OpenAI Codex Bridge", category: "Target & Bridges", shortcut: "Shift+B", keywords: ["codex", "toml"], disabled: agents.length === 0 },
+      { id: "bridge-codex", label: "Generate OpenAI Codex Bridge", category: "Target & Bridges", shortcut: "Shift+B", keywords: ["codex", "toml"], disabled: codexBridgePacks.length === 0 },
       { id: "pack-init", label: isReadOnlyGitSource ? "Clone & Onboard Virtual Git Repo into Pack" : "Onboard Virtual Folder into OpenCode Pack (1.1)", category: "Pack", shortcut: "I", keywords: ["virtual", "manifest", "onboard", "clone"], disabled: !isWorkspaceVirtualPack },
       { id: "pack-doctor", label: "Open Pack Doctor & Auto-Fix Contract Issues", category: "Pack", shortcut: "D", keywords: ["validate", "doctor", "fix", "semver", "bump", "kit"], disabled: isWorkspaceVirtualPack || isReadOnlyGitSource || !hasEditablePacks },
       { id: "pack-scaffold", label: "Create New Pack Agent, Skill or Slash Command", category: "Pack", shortcut: "N", keywords: ["new", "scaffold", "add", "agent", "skill", "command"], disabled: isWorkspaceVirtualPack || isReadOnlyGitSource || !hasEditablePacks },
@@ -2974,7 +2981,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       })
     }
     return base
-  }, [agents, catalogPacks, hasEditablePacks, isReadOnlyGitSource, invalidModelGroups.length, isWorkspaceVirtualPack, reducedMotionState, modelCatalog, layout.showInspector])
+  }, [agents, catalogPacks, codexBridgePacks, hasEditablePacks, isReadOnlyGitSource, invalidModelGroups.length, isWorkspaceVirtualPack, reducedMotionState, modelCatalog, layout.showInspector])
 
   const filteredPaletteCommands = useMemo(
     () => filterPaletteCommands(paletteCommands, paletteQuery),

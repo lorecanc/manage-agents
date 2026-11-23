@@ -55,8 +55,9 @@ export function comparePackCategories(a: string, b: string): number {
 export function collectBridgeablePacks(
   agents: ReadonlyArray<{ category: string }>,
   isPackValid: (pack: string) => boolean,
+  additionalPacks: readonly string[] = [],
 ): BridgePackOption[] {
-  const counts = new Map<string, number>()
+  const counts = new Map<string, number>(additionalPacks.map(pack => [pack, 0]))
   for (const agent of agents) {
     if (!agent.category) continue
     counts.set(agent.category, (counts.get(agent.category) ?? 0) + 1)

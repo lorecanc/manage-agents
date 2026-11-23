@@ -2,14 +2,14 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { parseAgentFile, type AgentInfo } from "./agents.js"
-import { bridgeToClaudeCode, type BridgeResult } from "./bridge.js"
+import { bridgeToClaudeCode, scanOpenCodeCompanions, type BridgeResult } from "./bridge.js"
 import { packDir, packsDir, resolvePackClosure } from "./catalog.js"
 import { bridgeToCodex, type CodexBridgeResult } from "./codexBridge.js"
-import { discoverPackDirs, hasErrors, installableFiles, MANIFEST_FILE, MAX_SCANNED_BYTES, parseJsonc, validatePack } from "./packs.js"
+import { discoverPackDirs, hasErrors, installableFiles, MANIFEST_FILE, MAX_SCANNED_BYTES, SCRIPT_RE, parseJsonc, validatePack } from "./packs.js"
 import { validateVirtualPack } from "./virtualPacks.js"
 import { defaultTarget } from "./lock.js"
 import { isPathInsideWorkspace, realpathThroughExistingAncestor } from "./pathValidation.js"
-import { describeExecutable } from "./resolver.js"
+import { describeExecutable, type ResolvedPack } from "./resolver.js"
 import { loadSources, sourceRoot } from "./sources.js"
 import { effectiveOverrides, loadOverrideSettings, patchedConfigSections } from "./userSettings.js"
 import type { TranslationConfig } from "./translationConfig.js"
@@ -72,8 +72,10 @@ const bridgeSettingsTarget = (env: NodeJS.ProcessEnv) => realpathThroughExisting
  * entries it contributes after a reconcile: the layers are the "default" scope plus the default OpenCode target's scope,
  * which is where `override config-set` and the TUI write by default.
  */
-export function prepareBridgeWorkspace(workspaceRoot: string, pack: string, env: NodeJS.ProcessEnv = process.env): BridgeWorkspace {
-  const closure = resolvePackClosure(workspaceRoot, pack)
+export function prepareBridgeWorkspace(workspaceRoot: string, pack: string, env: NodeJS.ProcessEnv = process.env, targetFormat?: BridgeTarget,
+  resolved?: readonly ResolvedPack[]): BridgeWorkspace {
+  const closure = resolved?.map(item => ({ name: item.name, source: item.dir, validation: item.validation })) ??
+    resolvePackClosure(workspaceRoot, pack).map(name => ({ name, source: requirePackDir(workspaceRoot, name), validation: undefined }))
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "manage-agents-bridge-"))
   const cleanup = () => fs.rmSync(root, { recursive: true, force: true })
   try {
@@ -84,15 +86,13 @@ export function prepareBridgeWorkspace(workspaceRoot: string, pack: string, env:
     const owners = new Map<string, string>()
     const executable: Array<{ pack: string; items: string[] }> = []
     let agentFiles: string[] = []
-    for (const name of closure) {
-      const source = requirePackDir(workspaceRoot, name)
-      const validation = fs.existsSync(path.join(source, MANIFEST_FILE)) ? validatePack(source) : validateVirtualPack(source, { name })
+    for (const { name, source, validation: selected } of closure) {
+      const validation = selected ?? (fs.existsSync(path.join(source, MANIFEST_FILE)) ? validatePack(source) : validateVirtualPack(source, { name }))
       if (hasErrors(validation)) {
         const errors = validation.issues.filter(issue => issue.level === "error")
         throw new Error(`Pack '${name}' is invalid: ${errors.map(issue => `${issue.path ? `${issue.path}: ` : ""}${issue.message}`).join("; ")}`)
       }
       const executableItems = describeExecutable(validation)
-      if (executableItems.length > 0) executable.push({ pack: name, items: executableItems })
       const files = installableFiles(validation)
         .filter(file => file.includes("/") && !file.split("/").some(segment => SKIPPED_SEGMENTS.has(segment)))
       for (const file of files) {
@@ -104,7 +104,11 @@ export function prepareBridgeWorkspace(workspaceRoot: string, pack: string, env:
         const virtual = validation.virtualFiles?.[file]
         if (virtual?.content) fs.writeFileSync(target, virtual.content)
         else fs.copyFileSync(path.join(source, virtual?.sourceRel ?? file), target)
+        if (targetFormat === "codex" && file.startsWith("resources/") && (SCRIPT_RE.test(file) || (fs.statSync(target).mode & 0o111) !== 0)) {
+          executableItems.push(`resource script ${file}`)
+        }
       }
+      if (executableItems.length > 0) executable.push({ pack: name, items: executableItems })
       const config = validation.virtualFiles ? {} : readPackConfig(source)
       const sections = patchedConfigSections(config, effectiveOverrides(overrideSettings, settingsTarget, name).config, name)
       const patchedServers = sections["mcp.servers"] ?? {}
@@ -131,8 +135,8 @@ export function prepareBridgeWorkspace(workspaceRoot: string, pack: string, env:
   }
 }
 
-export function inspectBridgeExecutableSurface(workspaceRoot: string, pack: string, env: NodeJS.ProcessEnv = process.env): Array<{ pack: string; items: string[] }> {
-  const workspace = prepareBridgeWorkspace(workspaceRoot, pack, env)
+export function inspectBridgeExecutableSurface(workspaceRoot: string, pack: string, env: NodeJS.ProcessEnv = process.env, target?: BridgeTarget): Array<{ pack: string; items: string[] }> {
+  const workspace = prepareBridgeWorkspace(workspaceRoot, pack, env, target)
   try {
     return workspace.executable
   } finally {
@@ -140,9 +144,9 @@ export function inspectBridgeExecutableSurface(workspaceRoot: string, pack: stri
   }
 }
 
-export function bridgeConfirmationsNeeded(workspaceRoot: string, pack: string, trusted: boolean, sourceLabel?: string, env: NodeJS.ProcessEnv = process.env): string[] {
+export function bridgeConfirmationsNeeded(workspaceRoot: string, pack: string, trusted: boolean, sourceLabel?: string, env: NodeJS.ProcessEnv = process.env, target?: BridgeTarget): string[] {
   if (trusted) return []
-  return inspectBridgeExecutableSurface(workspaceRoot, pack, env).map(entry =>
+  return inspectBridgeExecutableSurface(workspaceRoot, pack, env, target).map(entry =>
     `untrusted${sourceLabel ? ` source '${sourceLabel}'` : ""} pack '${entry.pack}' contains executable content (${entry.items.join(", ")})`
   )
 }
@@ -182,12 +186,18 @@ export function withGeneratedPackBridge<T>(
 ): T {
   const { pack, target, outputDir, config, pluginName, prefix, env } = options
   const workspaceRoot = path.resolve(options.workspaceRoot)
-  const workspace = prepareBridgeWorkspace(workspaceRoot, pack, env)
+  const workspace = prepareBridgeWorkspace(workspaceRoot, pack, env, target)
   try {
     if (options.trusted === false && !options.allowUntrustedExecutable && workspace.executable.length > 0) {
       throw new Error(`Refusing to bridge untrusted pack '${pack}' with executable content without confirmation (--yes): ${workspace.executable.map(entry => `${entry.pack} (${entry.items.join(", ")})`).join("; ")}`)
     }
-    if (workspace.agents.length === 0) throw new Error(`Pack '${pack}' has no agents to bridge`)
+    if (target === "claude" && workspace.agents.length === 0) {
+      // Skills-only packs still bridge to Claude Code when companion skills or commands exist.
+      const companions = scanOpenCodeCompanions(workspace.root)
+      const emitsSkills = config.claude.emitSkills !== false && companions.skills.length > 0
+      const emitsCommands = config.claude.emitCommands !== false && companions.commands.length > 0
+      if (!emitsSkills && !emitsCommands) throw new Error(`Pack '${pack}' has no agents to bridge`)
+    }
     const resolvedOutput = path.resolve(outputDir)
     const relative = isPathInsideWorkspace(workspaceRoot, resolvedOutput) ? path.relative(workspaceRoot, resolvedOutput) : path.basename(resolvedOutput)
     const generatedDir = path.join(workspace.root, relative)
@@ -234,7 +244,8 @@ function mirrorTree(source: string, target: string): void {
     const from = path.join(source, entry.name)
     const to = path.join(target, entry.name)
     if (entry.isDirectory()) mirrorTree(from, to)
-    else if (!fs.existsSync(to) || !fs.readFileSync(to).equals(fs.readFileSync(from))) fs.copyFileSync(from, to)
+    else if (!fs.existsSync(to) || (fs.statSync(to).mode & 0o111) !== (fs.statSync(from).mode & 0o111) ||
+             !fs.readFileSync(to).equals(fs.readFileSync(from))) fs.copyFileSync(from, to)
   }
 }
 

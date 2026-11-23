@@ -94,6 +94,7 @@ manage-agents source login                              # optional: authenticate
 manage-agents source add lorecanc/agents --pull         # GitHub owner/repo[#ref], git URL, or local directory
 manage-agents pack list                                 # list available packs (including virtual .md folders)
 manage-agents install flow pipeline                     # transactional install into ~/.config/opencode
+manage-agents install --codex pipeline flow artcraft    # personal Codex plugins, MCP servers and namespaced agent roles
 manage-agents status                                    # prints "In sync." when target matches lock.json
 manage-agents update                                    # pull Git sources and upgrade within SemVer ranges
 ```
