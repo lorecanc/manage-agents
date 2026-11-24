@@ -152,9 +152,9 @@ export function MaintenanceModal({
   const clampedScroll = Math.min(Math.max(0, lines.length - viewportRows), Math.max(0, scrollOffset))
   const visible = lines.slice(clampedScroll, clampedScroll + viewportRows)
   const tabs: Array<{ key: MaintenanceTab; label: string; color: string }> = [
-    { key: "validate", label: "1 Validate Packs", color: THEME.accentCyan },
-    { key: "lint", label: "2 Lint & Fix-Names", color: THEME.accentAmber },
-    { key: "audit", label: "3 Security Audit", color: THEME.accentRed },
+    { key: "validate", label: "1. Validate Packs", color: THEME.accentCyan },
+    { key: "lint", label: "2. Lint & Fix-Names", color: THEME.accentAmber },
+    { key: "audit", label: "3. Security Audit", color: THEME.accentRed },
   ]
 
   return (

@@ -179,9 +179,9 @@ export function TargetBridgesWorkspace({
     : " Inspector & Actions · ⇧→ "
 
   const subTabs: Array<{ key: TargetSubTab; label: string; short: string; color: string }> = [
-    { key: "installed", label: `1 Installed (${installedCount})`, short: `1 Inst (${installedCount})`, color: THEME.accentGreen },
-    { key: "bridges", label: `2 Bridges (${bridgesCount})`, short: `2 Brdg (${bridgesCount})`, color: THEME.accentPurple },
-    { key: "backups", label: `3 Backups (${backupsCount})`, short: `3 Bkp (${backupsCount})`, color: THEME.accentAmber },
+    { key: "installed", label: `1. Installed (${installedCount})`, short: `1. Inst (${installedCount})`, color: THEME.accentGreen },
+    { key: "bridges", label: `2. Bridges (${bridgesCount})`, short: `2. Brdg (${bridgesCount})`, color: THEME.accentPurple },
+    { key: "backups", label: `3. Backups (${backupsCount})`, short: `3. Bkp (${backupsCount})`, color: THEME.accentAmber },
   ]
 
   // Responsive column widths for the left table

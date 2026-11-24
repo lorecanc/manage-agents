@@ -553,11 +553,11 @@ test("Browser topbar tabs, Shift+Left/Right panel switching across workspaces, a
     await press(wide.renderer, wide.renderOnce, "escape")
     assert.equal(wide.captureCharFrame().includes("● Catalog (1 packs · 4 assets)"), true)
 
-    // 3. Expand pack, focus flow-build, press 5 (Graph tab in sidebar), Shift+Right into sidebar, Down to @flow-eye, Enter jumps to flow-eye!
+    // 3. Expand pack, focus flow-build, Shift+Right into sidebar, press 5 (Graph tab in sidebar), Down to @flow-eye, Enter jumps to flow-eye!
     await press(wide.renderer, wide.renderOnce, "return", "\r")
     await press(wide.renderer, wide.renderOnce, "down") // flow-build
-    await press(wide.renderer, wide.renderOnce, "5", "5")
     await press(wide.renderer, wide.renderOnce, "right", "", { shift: true })
+    await press(wide.renderer, wide.renderOnce, "5", "5")
     await press(wide.renderer, wide.renderOnce, "down") // @flow-eye
     assert.equal(wide.captureCharFrame().includes("▎ ├─▶ @flow-eye [Enter: Jump]"), true)
     await press(wide.renderer, wide.renderOnce, "return", "\r")
@@ -985,10 +985,19 @@ test("Tab cycles topbar workspaces while Shift+Tab / backtab cycles right Inspec
     if (ui.captureCharFrame().includes("demo (1)")) break
   }
 
+  // Number keys 1-8 switch Catalog asset-type filter when in list pane, using distinct icons and keeping unopened packs closed
+  assert.equal(ui.captureCharFrame().includes("1. All"), true)
+  assert.equal(ui.captureCharFrame().includes("📦 demo (1)"), true)
+  await emit("2")
+  assert.equal(ui.captureCharFrame().includes("🤖 demo (1)"), true)
+  assert.equal(ui.captureCharFrame().includes("demo-worker.md"), false)
+  await emit("1")
+  assert.equal(ui.captureCharFrame().includes("📦 demo (1)"), true)
+
   // Expand pack and focus agent
   await emit("return")
   await emit("down")
-  assert.equal(ui.captureCharFrame().includes("1 Info"), true)
+  assert.equal(ui.captureCharFrame().includes("1. Info"), true)
 
   // Shift+Tab cycles Inspector tab from Info -> Prompt (shows prompt body)
   await emit("tab", { shift: true })

@@ -53,10 +53,12 @@ import {
 import { packDir, readManifest } from "./utils/catalog.js"
 import {
   ASSET_TYPE_FILTERS,
+  assetFilterIcon,
   buildCatalogIndex,
   buildCatalogTreeItems,
   formatBridgeBadges,
   formatPackAssetBadges,
+  packCountForFilter,
   type AssetTypeFilter,
   type CatalogTreeItem,
 } from "./utils/catalogIndex.js"
@@ -4209,21 +4211,18 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         executeActionById("agent-resources")
       } else if (key === "t") {
         openTuningModalAction()
-      } else if (key === "1") {
-        setInspectorTab("overview")
-      } else if (key === "2") {
-        setInspectorTab("prompt")
-      } else if (key === "3") {
-        setInspectorTab("naming")
-      } else if (key === "4") {
-        setInspectorTab("security")
-        setGraphScrollOffset(0)
-      } else if (key === "5") {
-        setInspectorTab("delegations")
-        setGraphScrollOffset(0)
-      } else if (key === "6") {
-        setInspectorTab("resources")
-        setResourceScrollIndex(0)
+      } else if (/^[1-8]$/.test(key)) {
+        if (effectivePane === "inspector" && currentItem?.type === "file" && currentItem.agent && /^[1-6]$/.test(key)) {
+          if (key === "1") setInspectorTab("overview")
+          else if (key === "2") setInspectorTab("prompt")
+          else if (key === "3") setInspectorTab("naming")
+          else if (key === "4") { setInspectorTab("security"); setGraphScrollOffset(0) }
+          else if (key === "5") { setInspectorTab("delegations"); setGraphScrollOffset(0) }
+          else if (key === "6") { setInspectorTab("resources"); setResourceScrollIndex(0) }
+        } else {
+          const matchedFilter = ASSET_TYPE_FILTERS.find(f => f.shortcut === key)
+          if (matchedFilter) setAssetFilter(matchedFilter.key)
+        }
       } else if (key === "pageup" && inspectorTab === "prompt" && currentItem?.agent) {
         const page = Math.max(1, wsViewports.promptRows - 1)
         setPromptScrollOffset(offset => Math.max(0, offset - page))
@@ -5875,7 +5874,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                 )}
               </box>
 
-              {/* Asset-Type Filter Pills ([F] cycles) */}
+              {/* Asset-Type Filter Pills (1–8 / [F] cycles) */}
               <box
                 width="100%"
                 height={2}
@@ -5884,11 +5883,12 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                 borderColor={THEME.borderSubtle}
                 flexDirection="row"
                 alignItems="center"
-                gap={1}
+                gap={listContentWidth >= 72 ? 1 : 0}
                 overflow="hidden"
               >
                 {ASSET_TYPE_FILTERS.map(f => {
                   const active = assetFilter === f.key
+                  const pillName = `${f.shortcut}. ${listContentWidth >= 94 ? f.label : f.shortLabel}`
                   return (
                     <text
                       key={f.key}
@@ -5903,7 +5903,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                         setAssetFilter(f.key)
                       }}
                     >
-                      {active ? ` ● ${listContentWidth >= 60 ? f.label : f.shortLabel} ` : ` ${listContentWidth >= 60 ? f.label : f.shortLabel} `}
+                      {active ? ` ● ${pillName} ` : ` ${pillName} `}
                     </text>
                   )
                 })}
@@ -6005,7 +6005,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                           </box>
                           {gutter(`tree-${item.id}-1`)}
                           <text width={columnWidth(1)} wrapMode="none" overflow="hidden" style={{ textColor: isFocused ? "#ffffff" : THEME.accentAmber }} b>
-                            {middleEllipsis(`📦 ${terminalSafeText(item.category)} (${item.pack.counts.total})`, columnWidth(1))}
+                            {middleEllipsis(`${assetFilterIcon(assetFilter)} ${terminalSafeText(item.category)} (${packCountForFilter(item.pack.counts, assetFilter)})`, columnWidth(1))}
                           </text>
                           {gutter(`tree-${item.id}-2`)}
                           <text
@@ -6029,7 +6029,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                     }
 
                     if (item.type === "section") {
-                      const isSecExpanded = searchQuery.trim() !== "" || assetFilter !== "all" || expandedSections.has(item.id)
+                      const isSecExpanded = searchQuery.trim() !== "" || expandedSections.has(item.id)
                       return (
                         <box
                           key={`section-${item.id}`}
@@ -6124,20 +6124,11 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                           else setFocusedIndex(globalIndex)
                         }}
                       >
-                        <text
+                        <box
                           width={columnWidth(0)}
-                          wrapMode="none"
+                          height={1}
+                          flexDirection="row"
                           overflow="hidden"
-                          style={{
-                            textColor: isSelected
-                              ? THEME.accentGreen
-                              : hasWarn
-                                ? THEME.accentAmber
-                                : isFocused
-                                  ? "#ffffff"
-                                  : THEME.fgMuted,
-                          }}
-                          b={isSelected}
                           onMouseDown={(_self, event) => {
                             event.stopPropagation()
                             setActivePane("list")
@@ -6145,12 +6136,31 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                             toggleSelectionAtPath(ag.currentPath)
                           }}
                         >
-                          {`${isSelected ? "[X]" : "[ ]"}${hasWarn ? " ⚠" : ""}`}
-                        </text>
+                          <text width={1} wrapMode="none" style={{ textColor: THEME.fgPrimary }}>
+                            {isFocused ? "▎" : " "}
+                          </text>
+                          <text width={1} wrapMode="none">{" "}</text>
+                          <text
+                            width={3}
+                            wrapMode="none"
+                            style={{
+                              textColor: isSelected
+                                ? THEME.accentGreen
+                                : hasWarn
+                                  ? THEME.accentAmber
+                                  : isFocused
+                                    ? "#ffffff"
+                                    : THEME.fgMuted,
+                            }}
+                            b={isSelected}
+                          >
+                            {isSelected ? "[X]" : "[ ]"}
+                          </text>
+                        </box>
                         {gutter(`tree-${item.id}-1`)}
                         <box width={columnWidth(1)} height={1} flexDirection="row" overflow="hidden">
                           <text height={1} flexShrink={0} wrapMode="none" style={{ textColor: dotHex }} b>
-                            {" ● "}
+                            {"  ● "}
                           </text>
                           <text
                             height={1}
@@ -6159,7 +6169,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                             style={{ textColor: isFocused ? "#ffffff" : THEME.fgPrimary }}
                             b={isFocused}
                           >
-                            {middleEllipsis(`${terminalSafeText(shortName)}${isOverridden ? " ✎" : ""}`, Math.max(4, columnWidth(1) - 3))}
+                            {middleEllipsis(`${terminalSafeText(shortName)}${isOverridden ? " ✎" : ""}${hasWarn ? " ⚠" : ""}`, Math.max(4, columnWidth(1) - 4))}
                           </text>
                         </box>
                         {gutter(`tree-${item.id}-2`)}
@@ -6304,12 +6314,12 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                   >
                     {(
                       [
-                        ["overview", "1 Info", THEME.accentCyan],
-                        ["prompt", "2 Prompt", THEME.accentBlue],
-                        ["naming", "3 Name", THEME.accentAmber],
-                        ["security", "4 Sec", THEME.accentRed],
-                        ["delegations", "5 Graph", THEME.accentGreen],
-                        ["resources", "6 Res", THEME.accentPurple],
+                        ["overview", "1. Info", THEME.accentCyan],
+                        ["prompt", "2. Prompt", THEME.accentBlue],
+                        ["naming", "3. Name", THEME.accentAmber],
+                        ["security", "4. Sec", THEME.accentRed],
+                        ["delegations", "5. Graph", THEME.accentGreen],
+                        ["resources", "6. Res", THEME.accentPurple],
                       ] as const
                     ).map(([tKey, tLabel, tColor], idx) => {
                       const active = inspectorTab === tKey
@@ -6330,7 +6340,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                             }}
                           >
                             <text wrapMode="none" style={{ textColor: active ? tColor : THEME.fgSecondary }} b={active}>
-                              {panelWidths.inspector >= 46 ? tLabel : tLabel.replace(/^\d\s/, "")}
+                              {panelWidths.inspector >= 46 ? tLabel : tLabel.replace(/^\d\.\s/, "")}
                             </text>
                           </box>
                         </React.Fragment>

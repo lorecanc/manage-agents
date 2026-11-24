@@ -21,16 +21,33 @@ const MAX_PREVIEW_READ_BYTES = 256 * 1024
 export type CatalogAssetKind = "agent" | "skill" | "command" | "tool" | "plugin" | "theme" | "mcp"
 export type AssetTypeFilter = "all" | CatalogAssetKind
 
-export const ASSET_TYPE_FILTERS: readonly { key: AssetTypeFilter; label: string; shortLabel: string; shortcut: string }[] = [
-  { key: "all", label: "All", shortLabel: "All", shortcut: "1" },
-  { key: "agent", label: "Agents", shortLabel: "Ag", shortcut: "2" },
-  { key: "skill", label: "Skills", shortLabel: "Sk", shortcut: "3" },
-  { key: "command", label: "Commands", shortLabel: "Cm", shortcut: "4" },
-  { key: "tool", label: "Tools", shortLabel: "Tl", shortcut: "5" },
-  { key: "plugin", label: "Plugins", shortLabel: "Pl", shortcut: "6" },
-  { key: "theme", label: "Themes", shortLabel: "Th", shortcut: "7" },
-  { key: "mcp", label: "MCP", shortLabel: "Mcp", shortcut: "8" },
+export const ASSET_TYPE_FILTERS: readonly { key: AssetTypeFilter; label: string; shortLabel: string; shortcut: string; icon: string }[] = [
+  { key: "all", label: "All", shortLabel: "All", shortcut: "1", icon: "📦" },
+  { key: "agent", label: "Agents", shortLabel: "Ag", shortcut: "2", icon: "🤖" },
+  { key: "skill", label: "Skills", shortLabel: "Sk", shortcut: "3", icon: "📄" },
+  { key: "command", label: "Commands", shortLabel: "Cm", shortcut: "4", icon: "💻" },
+  { key: "tool", label: "Tools", shortLabel: "Tl", shortcut: "5", icon: "🔧" },
+  { key: "plugin", label: "Plugins", shortLabel: "Pl", shortcut: "6", icon: "🧩" },
+  { key: "theme", label: "Themes", shortLabel: "Th", shortcut: "7", icon: "🎨" },
+  { key: "mcp", label: "MCP", shortLabel: "Mcp", shortcut: "8", icon: "🔌" },
 ]
+
+export function assetFilterIcon(filter: AssetTypeFilter): string {
+  return ASSET_TYPE_FILTERS.find(f => f.key === filter)?.icon ?? "📦"
+}
+
+export function packCountForFilter(counts: PackAssetCounts, filter: AssetTypeFilter): number {
+  switch (filter) {
+    case "all": return counts.total
+    case "agent": return counts.agents
+    case "skill": return counts.skills
+    case "command": return counts.commands
+    case "tool": return counts.tools
+    case "plugin": return counts.plugins
+    case "theme": return counts.themes
+    case "mcp": return counts.mcp
+  }
+}
 
 export const ASSET_SECTION_ORDER: readonly CatalogAssetKind[] = [
   "agent",
@@ -572,7 +589,8 @@ export function sectionKey(packName: string, kind: CatalogAssetKind): string {
 
 /**
  * Builds the flat navigable Catalog tree: Pack -> Asset Type Section -> Asset Item.
- * When a search query or specific asset filter is active, matching packs & sections auto-expand.
+ * When a search query is active, matching packs & sections auto-expand.
+ * When filtering by a specific asset type without a search query, unopened packs stay collapsed.
  */
 export function buildCatalogTreeItems(
   index: CatalogIndex,
@@ -580,7 +598,7 @@ export function buildCatalogTreeItems(
 ): CatalogTreeItem[] {
   const query = options.searchQuery.trim().toLowerCase()
   const filter = options.assetFilter
-  const autoExpand = query !== "" || filter !== "all"
+  const autoExpand = query !== ""
   const items: CatalogTreeItem[] = []
 
   for (const pack of index.packs) {
@@ -636,13 +654,13 @@ export function buildCatalogTreeItems(
 
     if (!isPackExpanded) continue
 
-    const omitSoleAgentSection = matchingSections.length === 1 && matchingSections[0]!.kind === "agent"
+    const omitSection = filter !== "all" || (matchingSections.length === 1 && matchingSections[0]!.kind === "agent")
 
     for (const sec of matchingSections) {
       const count = sec.agents ? sec.agents.length : (sec.assets?.length ?? 0)
       const secId = sectionKey(pack.name, sec.kind)
-      const isSectionExpanded = omitSoleAgentSection || autoExpand || options.expandedSections.has(secId)
-      if (!omitSoleAgentSection) {
+      const isSectionExpanded = omitSection || autoExpand || options.expandedSections.has(secId)
+      if (!omitSection) {
         items.push({
           type: "section",
           id: secId,
@@ -662,7 +680,7 @@ export function buildCatalogTreeItems(
             id: agent.currentPath,
             category: pack.name,
             agent,
-            label: omitSoleAgentSection ? `  ${agent.filename}` : `    ${agent.filename}`,
+            label: omitSection ? `  ${agent.filename}` : `    ${agent.filename}`,
           })
         }
       } else if (sec.assets) {
@@ -673,7 +691,7 @@ export function buildCatalogTreeItems(
             category: pack.name,
             assetKind: asset.kind,
             asset,
-            label: `    ${asset.name}`,
+            label: omitSection ? `  ${asset.name}` : `    ${asset.name}`,
           })
         }
       }

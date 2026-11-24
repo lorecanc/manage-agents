@@ -148,7 +148,7 @@ test("buildCatalogTreeItems builds Pack -> Section -> Asset hierarchy and suppor
     // Tool section was not expanded so its asset child should remain hidden
     assert.ok(!expanded.some(item => item.type === "asset" && item.assetKind === "tool"))
 
-    // Filtering by skill shows only packs with skills and auto-expands them
+    // Filtering by skill shows only packs with skills and keeps unopened packs collapsed
     const skillsFiltered = buildCatalogTreeItems(index, {
       searchQuery: "",
       assetFilter: "skill",
@@ -157,7 +157,18 @@ test("buildCatalogTreeItems builds Pack -> Section -> Asset hierarchy and suppor
     })
     const folderNames = skillsFiltered.filter(i => i.type === "folder").map(i => i.category)
     assert.deepEqual(folderNames, ["mixed-kit", "skills-only"])
-    assert.ok(skillsFiltered.some(i => i.type === "asset" && i.asset.name === "api-docs"))
+    assert.ok(skillsFiltered.every(i => i.type === "folder"))
+
+    // Opening one pack while filtered by skill reveals its skills directly without opening other packs
+    const skillsOneExpanded = buildCatalogTreeItems(index, {
+      searchQuery: "",
+      assetFilter: "skill",
+      expandedCategories: new Set(["skills-only"]),
+      expandedSections: new Set(),
+    })
+    assert.ok(skillsOneExpanded.some(i => i.type === "asset" && i.asset.name === "api-docs"))
+    assert.ok(!skillsOneExpanded.some(i => i.type === "asset" && i.asset.name === "code-style"))
+    assert.ok(!skillsOneExpanded.some(i => i.type === "section"))
 
     // Searching by command description finds cmds-only and auto-expands it
     const searchFiltered = buildCatalogTreeItems(index, {
