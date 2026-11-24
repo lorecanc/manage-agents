@@ -19,6 +19,7 @@ export const CODEX_EFFORT_PRESETS = ["low", "medium", "high", "xhigh", "max"] as
 export interface BridgePackOption {
   pack: string
   count: number
+  assetSummary?: string
 }
 
 export interface BridgePackSelectionState {

@@ -47,7 +47,7 @@ import {
 export type OnboardingLayout = "auto" | "root" | "subpack"
 export type EffectiveOnboardingLayout = "root" | "subpack"
 export type SemverReleaseKind = "patch" | "minor" | "major"
-export type ScaffoldResourceKind = "agent" | "skill" | "command"
+export type ScaffoldResourceKind = "agent" | "skill" | "command" | "tool" | "plugin" | "mcp"
 
 const APP_PROJECT_MARKERS = new Set([
   "package.json",
@@ -1207,17 +1207,55 @@ export interface ScaffoldResourceResult {
   validation: PackValidation
 }
 
-/** Scaffolds a contract-compliant OpenCode V2 agent, skill, or slash command inside `packDir`. */
+/** Scaffolds a contract-compliant OpenCode V2 resource inside `packDir`. */
 export function scaffoldPackResource(packDir: string, spec: ScaffoldResourceSpec): ScaffoldResourceResult {
   const realPack = fs.realpathSync(path.resolve(packDir))
   if (!fs.lstatSync(path.join(realPack, MANIFEST_FILE), { throwIfNoEntry: false })?.isFile()) {
     throw new Error(`${realPack} does not contain ${MANIFEST_FILE}; onboard the pack first`)
   }
-  const cleanId = spec.id.trim().replace(/\.md$/i, "").replace(/^\/+|\/+$/g, "")
+  const cleanId = spec.id.trim().replace(/\.(md|mjs|js|ts)$/i, "").replace(/^\/+|\/+$/g, "")
   if (!cleanId || !RESOURCE_ID_RE.test(cleanId) || cleanId.includes("..")) {
     throw new Error(`Invalid ${spec.kind} ID "${spec.id}": use letters, digits, hyphens and optional "/" namespaces`)
   }
   const desc = spec.description?.trim() || `${spec.kind[0].toUpperCase()}${spec.kind.slice(1)} ${cleanId}`
+
+  if (spec.kind === "mcp") {
+    if (cleanId.includes("/")) {
+      throw new Error(`Invalid mcp server ID "${spec.id}": server names cannot contain "/"`)
+    }
+    const configRel = fs.lstatSync(path.join(realPack, "opencode.jsonc"), { throwIfNoEntry: false })?.isFile()
+      ? "opencode.jsonc"
+      : "opencode.json"
+    const configFull = ensureSafeDirWithin(realPack, configRel)
+    let configObj: Record<string, any> = {}
+    if (fs.lstatSync(configFull, { throwIfNoEntry: false })?.isFile()) {
+      const parsed = parseJsonc(fs.readFileSync(configFull, "utf8"))
+      if (!isPlain(parsed)) throw new Error(`${configRel} must contain a JSON object`)
+      configObj = parsed
+    }
+    const existingMcp = isPlain(configObj.mcp) ? configObj.mcp : {}
+    const servers = isPlain(existingMcp.servers) ? existingMcp.servers : existingMcp
+    if (cleanId in servers) {
+      throw new Error(`Refusing to overwrite existing MCP server "${cleanId}" in ${configRel}`)
+    }
+    const nextServers = {
+      ...servers,
+      [cleanId]: {
+        type: "local",
+        command: ["npx", "-y", `${cleanId}-mcp`],
+        enabled: true,
+      },
+    }
+    const nextConfig = {
+      ...configObj,
+      mcp: isPlain(existingMcp.servers) || Object.keys(existingMcp).length === 0
+        ? { ...existingMcp, servers: nextServers }
+        : nextServers,
+    }
+    atomicWriteRestrictedFile(configFull, Buffer.from(`${JSON.stringify(nextConfig, null, 2)}\n`, "utf8"), 0o644)
+    const validation = validatePack(realPack)
+    return { kind: spec.kind, id: cleanId, relativePath: configRel, fullPath: configFull, validation }
+  }
 
   let relativePath: string
   let content: string
@@ -1236,6 +1274,17 @@ export function scaffoldPackResource(packDir: string, spec: ScaffoldResourceSpec
     relativePath = `skills/${cleanId}/SKILL.md`
     const leafName = path.posix.basename(cleanId)
     content = `---\n${YAML.stringify({ name: leafName, description: desc }).trimEnd()}\n---\n\n# ${leafName}\n\nDescribe when to load this skill and the step-by-step workflow to follow.\n`
+  } else if (spec.kind === "tool") {
+    const packName = manifestName(realPack) ?? path.basename(realPack)
+    const namespaced = cleanId.startsWith(`${packName}/`) || cleanId.startsWith(`_${packName}_`)
+      ? cleanId
+      : `${packName}/${cleanId}`
+    relativePath = `tools/${namespaced}.mjs`
+    content = `// ${desc}\nexport default async function run(input = {}) {\n  return { ok: true, tool: ${JSON.stringify(namespaced)}, input }\n}\n`
+  } else if (spec.kind === "plugin") {
+    const leafName = path.posix.basename(cleanId)
+    relativePath = `plugins/${leafName}/index.mjs`
+    content = `// ${desc}\nexport default async function plugin() {\n  return {\n    name: ${JSON.stringify(leafName)},\n  }\n}\n`
   } else {
     relativePath = `commands/${cleanId}.md`
     content = `---\n${YAML.stringify({ description: desc }).trimEnd()}\n---\n\nExecute the **${cleanId}** workflow for:\n\n$ARGUMENTS\n`
