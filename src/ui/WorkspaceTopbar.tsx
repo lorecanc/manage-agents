@@ -27,11 +27,12 @@ interface TopbarTabSpec {
 }
 
 export function getTopbarTabs(termWidth: number): TopbarTabSpec[] {
-  const wide = termWidth >= 118
+  const wide = termWidth >= 122
   return [
     { key: "catalog", label: "Catalog", accent: THEME.accentBlue },
+    { key: "target", label: wide ? "Target & Bridges" : "Target", accent: THEME.accentPurple },
     { key: "flows", label: wide ? "Flows & Graph" : "Flows", accent: THEME.accentCyan },
-    { key: "sources", label: wide ? "Sources & Target" : "Sources", accent: THEME.accentGreen },
+    { key: "sources", label: "Sources", accent: THEME.accentGreen },
   ]
 }
 

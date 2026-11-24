@@ -312,7 +312,7 @@ export function BridgeModal({
     if (previewItems.length === 0) {
       return (
         <text height={1} wrapMode="none" style={{ textColor: THEME.fgMuted }}>
-          {"  No agents in selected pack."}
+          {"  No agents in selected pack (non-agent assets: skills/commands/MCP will be bridged)."}
         </text>
       )
     }
@@ -391,7 +391,7 @@ export function BridgeModal({
           (no matching packs)
         </text>
       ) : (
-        visiblePacks.map(({ pack, count }, index) => {
+        visiblePacks.map(({ pack, count, assetSummary }, index) => {
           const globalIndex = packScrollOffset + index
           const isCurrentChoice = globalIndex === packIndex
           return (
@@ -407,7 +407,7 @@ export function BridgeModal({
               }}
             >
               <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: isCurrentChoice ? THEME.accentAmber : THEME.fgSecondary }} b={isCurrentChoice}>
-                {`${isCurrentChoice ? "▎ " : "  "}${middleEllipsis(terminalSafeText(pack), 26)}  (${count} agents)${pack === suggestedPack ? " · current" : ""}`}
+                {`${isCurrentChoice ? "▎ " : "  "}${middleEllipsis(terminalSafeText(pack), 26)}  (${count > 0 ? `${count} agents` : (assetSummary ?? "non-agent pack")})${pack === suggestedPack ? " · current" : ""}`}
               </text>
             </box>
           )
@@ -520,7 +520,7 @@ export function BridgeModal({
                     ) : (
                       <text width={Math.max(10, leftColWidth - 20)} height={1} wrapMode="none" overflow="hidden" style={{ textColor: selectedPack ? THEME.fgPrimary : THEME.accentRed }} b={Boolean(selectedPack)}>
                         {selectedPack
-                          ? `${terminalSafeText(selectedPack)}${selectedPackInfo ? `  (${selectedPackInfo.count} agents)` : ""}${selectedPack === suggestedPack ? " · current" : ""}`
+                          ? `${terminalSafeText(selectedPack)}${selectedPackInfo ? `  (${selectedPackInfo.count > 0 ? `${selectedPackInfo.count} agents` : (selectedPackInfo.assetSummary ?? "non-agent pack")})` : ""}${selectedPack === suggestedPack ? " · current" : ""}`
                           : "(no pack selected)"}
                       </text>
                     )}
@@ -704,7 +704,7 @@ export function BridgeModal({
                 ) : (
                   <text width={Math.max(10, layout.innerWidth - 16)} height={1} wrapMode="none" overflow="hidden" style={{ textColor: selectedPack ? THEME.fgPrimary : THEME.accentRed }} b={Boolean(selectedPack)}>
                     {selectedPack
-                      ? `${terminalSafeText(selectedPack)}${selectedPackInfo ? `  (${selectedPackInfo.count} agents)` : ""}${selectedPack === suggestedPack ? " · current" : ""}`
+                      ? `${terminalSafeText(selectedPack)}${selectedPackInfo ? `  (${selectedPackInfo.count > 0 ? `${selectedPackInfo.count} agents` : (selectedPackInfo.assetSummary ?? "non-agent pack")})` : ""}${selectedPack === suggestedPack ? " · current" : ""}`
                       : "(no pack selected)"}
                   </text>
                 )}

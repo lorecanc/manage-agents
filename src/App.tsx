@@ -51,6 +51,35 @@ import {
   type UnifiedFlowItem,
 } from "./utils/archetypes.js"
 import { packDir, readManifest } from "./utils/catalog.js"
+import {
+  ASSET_TYPE_FILTERS,
+  buildCatalogIndex,
+  buildCatalogTreeItems,
+  formatBridgeBadges,
+  formatPackAssetBadges,
+  type AssetTypeFilter,
+  type CatalogTreeItem,
+} from "./utils/catalogIndex.js"
+import { checkPackBridge } from "./utils/bridgeCheck.js"
+import {
+  executeCodexInstall,
+  listTargetBackups,
+  previewCodexInstall,
+  runRestoreBackup,
+  runTargetLifecycleOperation,
+  type TargetBackupSummary,
+  type TargetLifecycleOp,
+} from "./utils/targetActions.js"
+import {
+  applyFixNames,
+  previewFixNames,
+  runWorkspaceAudit,
+  runWorkspaceLint,
+  runWorkspaceValidate,
+  type FixNamePlanItem,
+  type WorkspaceLintReport,
+  type WorkspaceValidationReport,
+} from "./utils/workspaceMaintenance.js"
 import { changeTarget, installChange, reconcileChange, targetStatus, type TargetStatus } from "./utils/installer.js"
 import { realpathThroughExistingAncestor } from "./utils/pathValidation.js"
 import { effectiveOverrides, loadOverrideSettings, patchedConfigSections } from "./utils/userSettings.js"
@@ -174,6 +203,9 @@ import { ToastOverlay } from "./ui/ToastOverlay.js"
 import { buildFlowsInspectorItems, buildFlowsNavRows, FlowsWorkspace } from "./ui/FlowsWorkspace.js"
 import { calculateTargetInstalledPackRows, SourcesTargetWorkspace, type SourceWorkspaceRow } from "./ui/SourcesTargetWorkspace.js"
 import { WorkspaceTopbar } from "./ui/WorkspaceTopbar.js"
+import { PackInspector, AssetItemInspector } from "./ui/AssetInspector.js"
+import { buildTargetRowsForTab, TargetBridgesWorkspace, type TargetSubTab } from "./ui/TargetBridgesWorkspace.js"
+import { MaintenanceModal, type MaintenanceAuditSummary, type MaintenanceTab } from "./ui/MaintenanceModal.js"
 import {
   calculatePackFlowsModalLayout,
   formatTriggerLabel,
@@ -228,16 +260,14 @@ type ViewMode =
   | "pack-init"
   | "pack-doctor"
   | "self-update"
+  | "maintenance"
+  | "codex-install-confirm"
 
-interface ActiveItem {
-  type: "file" | "folder"
-  id: string // filePath for file, category name for folder
-  label: string
-  category: string
-  agent?: AgentInfo
-}
+type ActiveItem = CatalogTreeItem
 
 interface InstallPreview {
+  operation: TargetLifecycleOp
+  adopt?: boolean
   packs: string[]
   target: string
   lines: string[]
@@ -607,17 +637,47 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   const [graphScrollOffset, setGraphScrollOffset] = useState(0)
   const [catalogDelFocus, setCatalogDelFocus] = useState(0)
   const [resourceScrollIndex, setResourceScrollIndex] = useState(0)
+  const [assetFilter, setAssetFilter] = useState<AssetTypeFilter>("all")
+  const [expandedSections, setExpandedSections] = useState<Set<string>>(() => new Set())
+  const [catalogRefreshSeq, setCatalogRefreshSeq] = useState(0)
+  const [hasLoadedWorkspace, setHasLoadedWorkspace] = useState(false)
+  const [targetBackups, setTargetBackups] = useState<TargetBackupSummary[]>([])
+  const [targetSubTab, setTargetSubTab] = useState<TargetSubTab>("installed")
+  const [targetFocusIndex, setTargetFocusIndex] = useState(0)
+  const [targetScrollOffset, setTargetScrollOffset] = useState(0)
+  const [targetInspectorScroll, setTargetInspectorScroll] = useState(0)
+  const [maintenanceTab, setMaintenanceTab] = useState<MaintenanceTab>("validate")
+  const [maintenanceScrollOffset, setMaintenanceScrollOffset] = useState(0)
+  const [maintenanceValidation, setMaintenanceValidation] = useState<WorkspaceValidationReport | null>(null)
+  const [maintenanceLint, setMaintenanceLint] = useState<WorkspaceLintReport | null>(null)
+  const [maintenanceFixPlan, setMaintenanceFixPlan] = useState<FixNamePlanItem[]>([])
+  const [maintenanceAudit, setMaintenanceAudit] = useState<MaintenanceAuditSummary | null>(null)
+  const [codexInstallPreview, setCodexInstallPreview] = useState<{
+    packName: string
+    lines: string[]
+    confirmations: string[]
+  } | null>(null)
 
   const allAgentFilenames = useMemo(() => agents.map(a => a.filename), [agents])
-  const codexBridgePacks = useMemo(
-    () => workspaceRoot ? collectBridgeablePacks(agents, pack => Boolean(packDir(workspaceRoot, pack)),
-      agents.packNames?.filter(pack => {
-        const dir = packDir(workspaceRoot, pack)
-        return dir && ["skills", "opencode.json", "opencode.jsonc"].some(file => fs.existsSync(path.join(dir, file)))
-      })) : [],
-    [agents, workspaceRoot],
+  const catalogIndex = useMemo(
+    () => buildCatalogIndex(hasLoadedWorkspace && activeDataSource ? (workspaceRoot || null) : null, agents),
+    [hasLoadedWorkspace, activeDataSource, workspaceRoot, agents, catalogRefreshSeq],
   )
-  const bridgeablePacks = bridgeTarget === "codex" ? codexBridgePacks : codexBridgePacks.filter(pack => pack.count > 0)
+  const claudeBridgePacks = useMemo(
+    () =>
+      catalogIndex.packs
+        .filter(pack => pack.bridgeCompat.claude)
+        .map(pack => ({ pack: pack.name, count: pack.counts.agents, assetSummary: formatPackAssetBadges(pack.counts) })),
+    [catalogIndex],
+  )
+  const codexBridgePacks = useMemo(
+    () =>
+      catalogIndex.packs
+        .filter(pack => pack.bridgeCompat.codex)
+        .map(pack => ({ pack: pack.name, count: pack.counts.agents, assetSummary: formatPackAssetBadges(pack.counts) })),
+    [catalogIndex],
+  )
+  const bridgeablePacks = bridgeTarget === "codex" ? codexBridgePacks : claudeBridgePacks
   const filteredBridgePacks = useMemo(
     () => filterBridgePacks(bridgeablePacks, bridgePackQuery),
     [bridgeablePacks, bridgePackQuery],
@@ -630,8 +690,10 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       const target = realpathThroughExistingAncestor(path.resolve(defaultTarget()))
       const registry = loadSources()
       setTargetStatusInfo(targetStatus(target, registry))
+      setTargetBackups(listTargetBackups(target))
     } catch {
       setTargetStatusInfo(null)
+      setTargetBackups([])
     }
   }
 
@@ -945,6 +1007,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     } else {
       setAgents(findAgentFiles(ds.root))
     }
+    setHasLoadedWorkspace(true)
   }
 
   const openSourcesModal = (preserveStatus = false) => {
@@ -988,6 +1051,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     setActiveRevision(next.kind === "source" ? sourceRevision(next.source) : null)
     if (next.kind === "source") setActiveSourceName(next.source.name)
     setAgents(loadedAgents)
+    setHasLoadedWorkspace(true)
     setTranslationConfig(loadedConfig)
     setSelectedAgentPaths(new Set())
     setSelectedPackNames(new Set())
@@ -1189,6 +1253,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         const result = await changeTarget(target, "install", registry, installChange(registry, requests), { dryRun: true })
         if (installPreviewReqIdRef.current !== reqId) return
         setInstallPreview({
+          operation: "install",
           packs, target,
           lines: [...(added ? [`This workspace will be registered as source "${sourceName}".`, ""] : []), ...describeChangeResult(target, result)],
           confirmations: result.confirmations,
@@ -1205,17 +1270,83 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     })()
   }
 
+  const previewTargetOp = (operation: TargetLifecycleOp, packs: string[], adopt = false) => {
+    if (operation === "install") {
+      previewInstall(packs)
+      return
+    }
+    const reqId = ++installPreviewReqIdRef.current
+    const target = realpathThroughExistingAncestor(path.resolve(defaultTarget()))
+    void (async () => {
+      try {
+        const registry = loadSources()
+        const result = await runTargetLifecycleOperation(target, operation, registry, packs, {
+          dryRun: true,
+          adopt,
+        })
+        if (installPreviewReqIdRef.current !== reqId) return
+        setInstallPreview({
+          operation,
+          adopt,
+          packs,
+          target,
+          lines: describeChangeResult(target, result),
+          confirmations: result.confirmations,
+          blocked: result.status === "failed",
+          lockText: result.change ? serializeLock(result.change.lock) : "",
+        })
+        setViewMode("install-confirm")
+      } catch (error: any) {
+        if (installPreviewReqIdRef.current !== reqId) return
+        setActionResultTitle(`${operation.toUpperCase()} Preview Failed`)
+        setActionResultLines([`An error occurred:`, `  ${terminalSafeText(error?.message || error)}`])
+        setViewMode("action-result")
+      }
+    })()
+  }
+
   const applyInstall = (preview: InstallPreview) => {
     if (installInFlightRef.current) return
     installInFlightRef.current = true
-    const packLabel = preview.packs.length === 1 ? preview.packs[0] : `${preview.packs.length} packs`
+    const op = preview.operation
+    const opTitle = op[0].toUpperCase() + op.slice(1)
+    const packLabel = preview.packs.length === 1
+      ? preview.packs[0]
+      : preview.packs.length > 1
+        ? `${preview.packs.length} packs`
+        : "target"
     const fail = (error: any) => {
-      setActionResultTitle("Install Failed")
+      setActionResultTitle(`${opTitle} Failed`)
       setActionResultLines([`An error occurred:`, `  ${terminalSafeText(error?.message || error)}`])
-      pushToast(`✗ Install failed for ${packLabel}`)
+      pushToast(`✗ ${opTitle} failed for ${packLabel}`)
     }
     setIsAsyncBusy(true)
     void (async () => {
+      if (op !== "install") {
+        try {
+          const registry = loadSources()
+          const result = await runTargetLifecycleOperation(preview.target, op, registry, preview.packs, {
+            dryRun: false,
+            adopt: preview.adopt,
+            expectedLockText: preview.lockText,
+            confirm: async reasons => isDeepStrictEqual([...reasons].sort(), [...preview.confirmations].sort()),
+          })
+          const succeeded = result.status === "applied" || result.status === "unchanged"
+          refreshTargetStatus()
+          refreshSourcesView(true)
+          setActionResultTitle(succeeded ? `${opTitle} Complete` : `${opTitle} Failed`)
+          setActionResultLines(describeChangeResult(preview.target, result))
+          pushToast(succeeded ? `✓ ${opTitle} complete (${packLabel})` : `✗ ${opTitle} failed (${packLabel})`)
+        } catch (error) {
+          fail(error)
+        } finally {
+          setIsAsyncBusy(false)
+          installInFlightRef.current = false
+          setViewMode("action-result")
+          renderer.requestRender()
+        }
+        return
+      }
       let prepared: ReturnType<typeof installRequests>
       try {
         prepared = installRequests(preview.packs)
@@ -1266,6 +1397,190 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       installInFlightRef.current = false
       setViewMode("action-result")
     })()
+  }
+
+  const runTargetRestoreAction = (backupId: string) => {
+    setIsAsyncBusy(true)
+    void (async () => {
+      try {
+        const target = realpathThroughExistingAncestor(path.resolve(defaultTarget()))
+        const restored = await runRestoreBackup(target, backupId)
+        refreshTargetStatus()
+        setActionResultTitle(`Backup Restored (${terminalSafeText(backupId)})`)
+        setActionResultLines([
+          `Restored ${restored.files.length} file(s) and ${restored.config.length} config entry/entries.`,
+          ...restored.files.slice(0, 12).map(f => `  • ${terminalSafeText(f)}`),
+        ])
+        setViewMode("action-result")
+        pushToast(`✓ Restored backup ${backupId}`)
+      } catch (error: any) {
+        setActionResultTitle("Restore Failed")
+        setActionResultLines([terminalSafeText(error?.message || error)])
+        setViewMode("action-result")
+        pushToast(`✗ Restore failed`)
+      } finally {
+        setIsAsyncBusy(false)
+        renderer.requestRender()
+      }
+    })()
+  }
+
+  const runBridgeCheckAction = (packName: string) => {
+    if (!workspaceRoot || !packName) {
+      pushToast("⚠ Focus a pack first to run bridge check")
+      return
+    }
+    const pack = catalogIndex.byName.get(packName)
+    const config = translationConfig ?? DEFAULT_TRANSLATION_CONFIG
+    const lines: string[] = [
+      `Pack: ${terminalSafeText(packName)}  ${pack ? formatPackAssetBadges(pack.counts) : ""}`,
+      `OpenCode v2: ✓ Ready`,
+      `Claude Code: ${pack?.bridgeCompat.claude ? "✓" : "–"} ${pack?.bridgeCompat.claudeReason ?? ""}`,
+      `OpenAI Codex: ${pack?.bridgeCompat.codex ? "✓" : "–"} ${pack?.bridgeCompat.codexReason ?? ""}`,
+      "",
+    ]
+
+    const targets: Array<"claude" | "codex"> = []
+    if (pack?.bridgeCompat.claude) targets.push("claude")
+    if (pack?.bridgeCompat.codex) targets.push("codex")
+
+    if (targets.length === 0) {
+      lines.push("No Claude or Codex bridgeable assets in this pack (OpenCode v2 only).")
+    } else {
+      for (const target of targets) {
+        const label = target === "claude" ? "Claude Code" : "OpenAI Codex"
+        const bridgeKey = activeDataSource?.kind === "source"
+          ? activeDataSource.source.name
+          : standaloneBridgeKey(workspaceRoot)
+        const committedDir = sourceBridgeOutputDir(bridgeKey, target, config.pluginName || packName)
+        try {
+          const diff = checkPackBridge({
+            workspaceRoot,
+            pack: packName,
+            target,
+            config,
+            committedDir,
+          })
+          if (diff.clean) {
+            lines.push(`✓ ${label}: Clean (matches existing bridge output)`)
+          } else {
+            lines.push(`⚠ ${label}: ${diff.missing.length} new, ${diff.changed.length} changed, ${diff.extra.length} extra file(s)`)
+            for (const f of diff.missing.slice(0, 5)) lines.push(`    + ${terminalSafeText(f)}`)
+            for (const f of diff.changed.slice(0, 5)) lines.push(`    ~ ${terminalSafeText(f)}`)
+            for (const f of diff.extra.slice(0, 5)) lines.push(`    - ${terminalSafeText(f)}`)
+          }
+        } catch (err: any) {
+          lines.push(`✗ ${label}: ${terminalSafeText(err?.message || err)}`)
+        }
+      }
+    }
+
+    setActionResultTitle(`Bridge Check · ${terminalSafeText(packName)}`)
+    setActionResultLines(lines)
+    setViewMode("action-result")
+  }
+
+  const openCodexInstallPreviewAction = (packName: string) => {
+    if (!packName) {
+      pushToast("⚠ Focus a pack first to install into Codex")
+      return
+    }
+    setIsAsyncBusy(true)
+    void (async () => {
+      try {
+        const preview = await previewCodexInstall([packName], {
+          source: activeDataSource?.kind === "source" ? activeDataSource.source.name : undefined,
+          workspace: activeDataSource?.kind === "workspace" ? workspaceRoot : undefined,
+        })
+        const lines: string[] = [
+          `Codex Install Preview: ${terminalSafeText(packName)}`,
+          `Target profile: ${terminalSafeText(preview.profile)}`,
+          "",
+          ...(preview.packs.length > 0
+            ? preview.packs.map(p => `  • ${terminalSafeText(p.pack)}  (${p.roles} role(s), ${p.skills} skill(s)${p.plugin ? `, plugin ${terminalSafeText(p.plugin)}` : ""})`)
+            : [`  • ${terminalSafeText(packName)} (skills/MCP bundle)`]),
+        ]
+        if (preview.confirmations.length > 0) {
+          lines.push("", "Confirmations required:")
+          for (const reason of preview.confirmations) {
+            lines.push(`  ⚠ ${terminalSafeText(reason)}`)
+          }
+        }
+        setCodexInstallPreview({ packName, lines, confirmations: preview.confirmations })
+        setViewMode("codex-install-confirm")
+      } catch (error: any) {
+        setActionResultTitle("Codex Install Preview Failed")
+        setActionResultLines([terminalSafeText(error?.message || error)])
+        setViewMode("action-result")
+      } finally {
+        setIsAsyncBusy(false)
+        renderer.requestRender()
+      }
+    })()
+  }
+
+  const applyCodexInstallAction = () => {
+    if (!codexInstallPreview) return
+    const { packName, confirmations } = codexInstallPreview
+    setIsAsyncBusy(true)
+    void (async () => {
+      try {
+        await executeCodexInstall([packName], {
+          source: activeDataSource?.kind === "source" ? activeDataSource.source.name : undefined,
+          workspace: activeDataSource?.kind === "workspace" ? workspaceRoot : undefined,
+          expectedConfirmations: confirmations,
+        })
+        setCodexInstallPreview(null)
+        setActionResultTitle(`Codex Install Complete`)
+        setActionResultLines([`✓ Installed ${terminalSafeText(packName)} into Codex.`])
+        setViewMode("action-result")
+        pushToast(`✓ Installed ${packName} into Codex`)
+      } catch (error: any) {
+        setCodexInstallPreview(null)
+        setActionResultTitle("Codex Install Failed")
+        setActionResultLines([terminalSafeText(error?.message || error)])
+        setViewMode("action-result")
+        pushToast(`✗ Codex install failed`)
+      } finally {
+        setIsAsyncBusy(false)
+        renderer.requestRender()
+      }
+    })()
+  }
+
+  const refreshMaintenanceReports = () => {
+    if (!workspaceRoot) return
+    try {
+      setMaintenanceValidation(runWorkspaceValidate(workspaceRoot))
+    } catch {
+      setMaintenanceValidation(null)
+    }
+    const lint = runWorkspaceLint(agents)
+    setMaintenanceLint(lint)
+    setMaintenanceFixPlan(previewFixNames(agents))
+    setMaintenanceAudit(runWorkspaceAudit(agents))
+  }
+
+  const openMaintenanceModal = (tab: MaintenanceTab = "validate") => {
+    refreshMaintenanceReports()
+    setMaintenanceTab(tab)
+    setMaintenanceScrollOffset(0)
+    setViewMode("maintenance")
+  }
+
+  const applyMaintenanceFixNames = () => {
+    if (isReadOnlyGitSource || !workspaceRoot || maintenanceFixPlan.length === 0) return
+    try {
+      const result = applyFixNames(workspaceRoot, agents, maintenanceFixPlan)
+      refreshData()
+      setCatalogRefreshSeq(seq => seq + 1)
+      refreshMaintenanceReports()
+      pushToast(`✓ Renamed ${result.renamedCount} agent(s), updated ${result.updatedReferences} ref(s)`)
+    } catch (error: any) {
+      refreshData()
+      setCatalogRefreshSeq(seq => seq + 1)
+      pushToast(`✗ Fix-names failed: ${terminalSafeText(error?.message || error)}`)
+    }
   }
 
   const setMutationRefreshFailure = (error: unknown, warning?: TransactionWarning) => {
@@ -1525,45 +1840,39 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   }, [colorTreeItems.length])
 
   const catalogPacks = useMemo(
-    () => [...new Set(agents.map(agent => agent.category))].sort(comparePackCategories),
-    [agents],
+    () => catalogIndex.packs.map(pack => pack.name),
+    [catalogIndex],
   )
   const selectedPacks = catalogPacks.filter(pack => selectedPackNames.has(pack))
   const hasEditablePacks = catalogPacks.length > 0 || Boolean(agents.packNames?.length)
 
-  // Filter and build active list items in real-time
-  const activeItems = useMemo<ActiveItem[]>(() => {
-    const query = searchQuery.trim().toLowerCase()
-    const items: ActiveItem[] = []
-    catalogPacks.forEach(cat => {
-      const matchesPack = cat.toLowerCase().includes(query)
-      const catAgents = agents.filter(agent => agent.category === cat && (matchesPack || agentId(agent).toLowerCase().includes(query) || agent.filename.toLowerCase().includes(query)))
-      if (!matchesPack && !catAgents.length) return
+  const targetInstalledCount = Object.keys(targetStatusInfo?.lock?.packs ?? {}).length
+  const targetWorkspaceRows = useMemo(
+    () => buildTargetRowsForTab(targetSubTab, targetStatusInfo, targetBackups, catalogIndex),
+    [targetSubTab, targetStatusInfo, targetBackups, catalogIndex],
+  )
 
-      // A search opens every folder with matches, like the provider folders of the model selector.
-      const isExpanded = searchQuery.trim() !== "" || expandedCategories.has(cat)
-      items.push({
-        type: "folder",
-        id: cat,
-        label: `${isExpanded ? "▼" : "▶"} 📁 ${cat.toUpperCase()} (${catAgents.length})`,
-        category: cat
-      })
+  useEffect(() => {
+    if (targetWorkspaceRows.length === 0) {
+      if (targetFocusIndex !== 0) setTargetFocusIndex(0)
+      return
+    }
+    if (targetFocusIndex >= targetWorkspaceRows.length) {
+      setTargetFocusIndex(targetWorkspaceRows.length - 1)
+    }
+  }, [targetWorkspaceRows.length, targetFocusIndex])
 
-      if (isExpanded) {
-        catAgents.forEach((a) => {
-          items.push({
-            type: "file",
-            id: a.currentPath,
-            label: `  ${a.filename}`,
-            category: cat,
-            agent: a
-          })
-        })
-      }
-    })
-
-    return items
-  }, [agents, catalogPacks, searchQuery, expandedCategories])
+  // Filter and build active list items in real-time (Pack -> Section -> Asset)
+  const activeItems = useMemo<ActiveItem[]>(
+    () =>
+      buildCatalogTreeItems(catalogIndex, {
+        searchQuery,
+        assetFilter,
+        expandedCategories,
+        expandedSections,
+      }),
+    [catalogIndex, searchQuery, assetFilter, expandedCategories, expandedSections],
+  )
 
   const delegationItems = useMemo(
     () => delegationTargetAgent
@@ -2006,6 +2315,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         mode: scaffoldMode,
       })
       refreshData()
+      setCatalogRefreshSeq(seq => seq + 1)
       setDoctorReport(inspectPackDoctor(doctorPackDir, workspaceRoot))
       setScaffoldId("")
       setScaffoldDesc("")
@@ -2389,12 +2699,12 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     }
   }
 
-  const openBridgeModalAction = (target: "claude" | "codex") => {
+  const openBridgeModalAction = (target: "claude" | "codex", explicitPack?: string) => {
     if (activeDataSource) {
-      const candidates = target === "codex" ? codexBridgePacks : codexBridgePacks.filter(pack => pack.count > 0)
+      const candidates = target === "codex" ? codexBridgePacks : claudeBridgePacks
       if (candidates.length === 0) {
         setActionResultTitle("No Pack to Bridge")
-        setActionResultLines(["No valid pack was found in the active workspace."])
+        setActionResultLines([`No ${target === "codex" ? "Codex" : "Claude"}-compatible pack was found in the active workspace.`])
         setViewMode("action-result")
         return
       }
@@ -2408,9 +2718,12 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       const baseCfg = loadedConfig ?? DEFAULT_TRANSLATION_CONFIG
       const nextTiers = cloneBridgeTiers(baseCfg.tiers)
       const nextRoles = { ...baseCfg.roles }
-      const focusedPack = workspaceTab === "flows"
-        ? flowsNav.rows[flowsFocusIndex]?.pack
-        : activeItems[focusedIndex]?.category
+      const focusedPack = explicitPack
+        ?? (workspaceTab === "flows"
+          ? flowsNav.rows[flowsFocusIndex]?.pack
+          : workspaceTab === "target"
+            ? focusedTargetPackName() ?? undefined
+            : activeItems[focusedIndex]?.category)
       const initialLayout = calculateBridgeModalLayout(termWidth, termHeight, {
         packExpanded: false,
         tierCount: Object.keys(nextTiers).length,
@@ -2517,7 +2830,33 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         else next.add(item.id)
         return next
       })
+    } else if (item?.type === "section") {
+      setExpandedSections(prev => {
+        const next = new Set(prev)
+        if (next.has(item.id)) next.delete(item.id)
+        else next.add(item.id)
+        return next
+      })
     }
+  }
+
+  const cycleAssetFilter = () => {
+    setAssetFilter(prev => {
+      const idx = ASSET_TYPE_FILTERS.findIndex(f => f.key === prev)
+      const next = ASSET_TYPE_FILTERS[(idx + 1) % ASSET_TYPE_FILTERS.length]!
+      pushToast(`Filter: ${next.label}`)
+      return next.key
+    })
+  }
+
+  const focusedTargetPackName = (): string | null => {
+    if (workspaceTab === "target") {
+      const row = targetWorkspaceRows[targetFocusIndex]
+      if (row?.kind === "installed-pack" || row?.kind === "bridge-pack") return row.packName
+      return null
+    }
+    const item = activeItems[focusedIndex]
+    return item?.category ?? catalogPacks[0] ?? null
   }
 
   const toggleSelectionAtPath = (agentPath: string) => {
@@ -2657,6 +2996,10 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       case "ws-catalog":
         setWorkspaceTab("catalog")
         break
+      case "ws-target":
+        refreshTargetStatus()
+        setWorkspaceTab("target")
+        break
       case "ws-flows":
         setWorkspaceTab("flows")
         break
@@ -2664,7 +3007,10 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         openSourcesModal()
         break
       case "ws-next":
-        if (workspaceTab === "catalog") setWorkspaceTab("flows")
+        if (workspaceTab === "catalog") {
+          refreshTargetStatus()
+          setWorkspaceTab("target")
+        } else if (workspaceTab === "target") setWorkspaceTab("flows")
         else if (workspaceTab === "flows") openSourcesModal()
         else setWorkspaceTab("catalog")
         break
@@ -2687,7 +3033,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       case "select-toggle": {
         const item = activeItems[focusedIndex]
         if (item?.type === "file" && item.agent) toggleSelectionAtPath(item.agent.currentPath)
-        else if (item?.type === "folder") togglePackSelection([item.category])
+        else if (item?.type === "folder" || item?.type === "section" || item?.type === "asset") togglePackSelection([item.category])
         break
       }
       case "select-all-packs": {
@@ -2898,6 +3244,53 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       case "target-reconcile":
         runTargetReconcile()
         break
+      case "target-reconcile-adopt":
+        previewTargetOp("reconcile", [], true)
+        break
+      case "target-update": {
+        const row = workspaceTab === "target" ? targetWorkspaceRows[targetFocusIndex] : null
+        const packNames = row?.kind === "installed-pack" ? [row.packName] : []
+        previewTargetOp("update", packNames)
+        break
+      }
+      case "target-uninstall": {
+        const row = workspaceTab === "target" ? targetWorkspaceRows[targetFocusIndex] : null
+        if (row?.kind === "installed-pack" && row.isRoot) {
+          previewTargetOp("uninstall", [row.packName])
+        } else {
+          pushToast("⚠ Focus an installed [root] pack in Target & Bridges to uninstall")
+        }
+        break
+      }
+      case "target-restore": {
+        const row = workspaceTab === "target" ? targetWorkspaceRows[targetFocusIndex] : null
+        if (row?.kind === "backup") {
+          runTargetRestoreAction(row.backup.id)
+        } else if (targetBackups[0]) {
+          runTargetRestoreAction(targetBackups[0].id)
+        } else {
+          pushToast("⚠ No backup snapshots available to restore")
+        }
+        break
+      }
+      case "bridge-check": {
+        const packName = focusedTargetPackName()
+        if (packName) runBridgeCheckAction(packName)
+        else pushToast("⚠ Focus a pack first to run bridge check")
+        break
+      }
+      case "codex-install": {
+        const packName = focusedTargetPackName()
+        if (packName) openCodexInstallPreviewAction(packName)
+        else pushToast("⚠ Focus a pack first to install into Codex")
+        break
+      }
+      case "catalog-asset-filter":
+        cycleAssetFilter()
+        break
+      case "workspace-maintenance":
+        openMaintenanceModal("validate")
+        break
       case "target-refresh":
         refreshSourcesView(true)
         pushToast("✓ Refreshed sources & target status")
@@ -2944,9 +3337,10 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
 
   const paletteCommands = useMemo<PaletteCommand[]>(() => {
     const base: PaletteCommand[] = [
-      { id: "ws-catalog", label: "Switch to Catalog & Inspector", category: "Workspace", shortcut: "Tab", keywords: ["agents", "tree", "list"] },
+      { id: "ws-catalog", label: "Switch to Catalog & Inspector", category: "Workspace", shortcut: "Tab", keywords: ["packs", "agents", "skills", "commands", "tools", "plugins", "mcp"] },
+      { id: "ws-target", label: "Switch to Target & Bridges (OpenCode / Claude / Codex)", category: "Workspace", shortcut: "Tab", keywords: ["target", "installed", "update", "uninstall", "backup", "restore", "claude", "codex"] },
       { id: "ws-flows", label: "Switch to Flows & Call Graph", category: "Workspace", shortcut: "Tab", keywords: ["routing", "delegations", "topology", "subagents"] },
-      { id: "ws-sources", label: "Switch to Sources & OpenCode Target", category: "Workspace", shortcut: "O", keywords: ["github", "repo", "status", "installed"] },
+      { id: "ws-sources", label: "Switch to Sources & GitHub", category: "Workspace", shortcut: "O", keywords: ["github", "repo", "status", "sources"] },
       { id: "pane-toggle", label: "Toggle Focus: Main Panel / Right Sidebar", category: "Workspace", shortcut: "⇧← / ⇧→", keywords: ["sidebar", "inspector", "pane", "panel", "focus"], disabled: !layout.showInspector },
       { id: "agent-model", label: "Assign LLM Model (or Pack Flows)", category: "Agent", shortcut: "M", keywords: ["provider", "claude", "gpt", "gemini"], disabled: agents.length === 0 },
       { id: "agent-tune", label: "Tune Steps, Thinking Effort, Mode & Visibility", category: "Agent", shortcut: "T", keywords: ["reasoning", "variant", "mode", "hidden"], disabled: agents.length === 0 },
@@ -2959,14 +3353,22 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       { id: "repair-models", label: "Batch-Repair Invalid / Missing Models", category: "Pack", shortcut: "V", keywords: ["fix", "broken"], disabled: invalidModelGroups.length === 0 },
       { id: "pack-flows", label: "Configure Conditional IF/OR Pack Flows", category: "Pack", shortcut: "M", keywords: ["rules", "triggers", "routing"], disabled: agents.length === 0 },
       { id: "pack-install", label: "Preview & Install Packs into OpenCode", category: "Target & Bridges", shortcut: "E", keywords: ["deploy", "update", "lock"], disabled: catalogPacks.length === 0 },
+      { id: "target-update", label: "Update Installed OpenCode Packs", category: "Target & Bridges", shortcut: "U", keywords: ["upgrade", "pull", "lock"] },
+      { id: "target-uninstall", label: "Uninstall Focused Root Pack from OpenCode", category: "Target & Bridges", shortcut: "X", keywords: ["remove", "delete"] },
       { id: "target-reconcile", label: "Reconcile Installed OpenCode Target Now", category: "Target & Bridges", shortcut: "R", keywords: ["sync", "drift", "opencode.json"] },
+      { id: "target-reconcile-adopt", label: "Reconcile OpenCode Target with --adopt (Backup Local Edits)", category: "Target & Bridges", shortcut: "Shift+A", keywords: ["adopt", "backup", "drift"] },
+      { id: "target-restore", label: "Restore Target Backup Snapshot", category: "Target & Bridges", shortcut: "Shift+R", keywords: ["rollback", "backup", "restore"], disabled: targetBackups.length === 0 },
+      { id: "bridge-check", label: "Check Claude & Codex Bridge Compatibility", category: "Target & Bridges", shortcut: "Shift+K", keywords: ["check", "validate", "claude", "codex"], disabled: catalogPacks.length === 0 },
+      { id: "bridge-claude", label: "Generate Claude Code Plugin Bridge", category: "Target & Bridges", shortcut: "B", keywords: ["anthropic", "marketplace", "skills", "commands"], disabled: claudeBridgePacks.length === 0 },
+      { id: "bridge-codex", label: "Generate OpenAI Codex Bridge", category: "Target & Bridges", shortcut: "Shift+B", keywords: ["codex", "toml", "skills", "mcp"], disabled: codexBridgePacks.length === 0 },
+      { id: "codex-install", label: "Install Pack Directly into Codex (--codex)", category: "Target & Bridges", shortcut: "C", keywords: ["codex", "install", "skills", "mcp"], disabled: codexBridgePacks.length === 0 },
+      { id: "catalog-asset-filter", label: "Cycle Catalog Asset-Type Filter (All/Agents/Skills/Cmds/Tools/Plugins/MCP)", category: "Pack", shortcut: "F", keywords: ["filter", "skills", "commands", "tools", "plugins", "mcp"], disabled: catalogPacks.length === 0 },
+      { id: "workspace-maintenance", label: "Open Workspace Maintenance (Validate, Lint, Fix-Names, Audit)", category: "Pack", shortcut: "W", keywords: ["validate", "lint", "audit", "fix-names", "security"], disabled: catalogPacks.length === 0 },
       { id: "engine-self-update", label: "Check / Apply manage-agents Engine Release Update", category: "Target & Bridges", shortcut: "Shift+U", keywords: ["self-update", "version", "upgrade", "github", "release"] },
       { id: "source-pull", label: "Pull Git Source & Refresh GitHub Repos", category: "Target & Bridges", shortcut: "P", keywords: ["fetch", "git", "sync"] },
-      { id: "bridge-claude", label: "Generate Claude Code Plugin Bridge", category: "Target & Bridges", shortcut: "B", keywords: ["anthropic", "marketplace"], disabled: agents.length === 0 },
-      { id: "bridge-codex", label: "Generate OpenAI Codex Bridge", category: "Target & Bridges", shortcut: "Shift+B", keywords: ["codex", "toml"], disabled: codexBridgePacks.length === 0 },
       { id: "pack-init", label: isReadOnlyGitSource ? "Clone & Onboard Virtual Git Repo into Pack" : "Onboard Virtual Folder into OpenCode Pack (1.1)", category: "Pack", shortcut: "I", keywords: ["virtual", "manifest", "onboard", "clone"], disabled: !isWorkspaceVirtualPack },
       { id: "pack-doctor", label: "Open Pack Doctor & Auto-Fix Contract Issues", category: "Pack", shortcut: "D", keywords: ["validate", "doctor", "fix", "semver", "bump", "kit"], disabled: isWorkspaceVirtualPack || isReadOnlyGitSource || !hasEditablePacks },
-      { id: "pack-scaffold", label: "Create New Pack Agent, Skill or Slash Command", category: "Pack", shortcut: "N", keywords: ["new", "scaffold", "add", "agent", "skill", "command"], disabled: isWorkspaceVirtualPack || isReadOnlyGitSource || !hasEditablePacks },
+      { id: "pack-scaffold", label: "Create New Pack Agent, Skill, Command, Tool, Plugin or MCP", category: "Pack", shortcut: "N", keywords: ["new", "scaffold", "add", "agent", "skill", "command", "tool", "plugin", "mcp"], disabled: isWorkspaceVirtualPack || isReadOnlyGitSource || !hasEditablePacks },
       { id: "layout-adjust", label: "Adjust List / Inspector Split Width", category: "View & Motion", shortcut: "Shift+L", keywords: ["resize", "columns"] },
       { id: "toggle-motion", label: reducedMotionState ? "Enable Smooth 60fps Micro-Animations" : "Enable Reduced Motion Mode", category: "View & Motion", shortcut: "Ctrl+E", keywords: ["animation", "motion", "fps"] },
       { id: "help", label: "Open Keyboard & Mouse Guide", category: "View & Motion", shortcut: "?", keywords: ["shortcuts", "cheatsheet"] },
@@ -2981,7 +3383,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       })
     }
     return base
-  }, [agents, catalogPacks, codexBridgePacks, hasEditablePacks, isReadOnlyGitSource, invalidModelGroups.length, isWorkspaceVirtualPack, reducedMotionState, modelCatalog, layout.showInspector])
+  }, [agents, catalogPacks, claudeBridgePacks, codexBridgePacks, targetBackups.length, hasEditablePacks, isReadOnlyGitSource, invalidModelGroups.length, isWorkspaceVirtualPack, reducedMotionState, modelCatalog, layout.showInspector])
 
   const filteredPaletteCommands = useMemo(
     () => filterPaletteCommands(paletteCommands, paletteQuery),
@@ -3148,6 +3550,41 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       return
     }
 
+    if (viewMode === "maintenance") {
+      if (key === "escape") {
+        setViewMode("main")
+      } else if (key === "1") {
+        setMaintenanceTab("validate")
+        setMaintenanceScrollOffset(0)
+      } else if (key === "2") {
+        setMaintenanceTab("lint")
+        setMaintenanceScrollOffset(0)
+      } else if (key === "3") {
+        setMaintenanceTab("audit")
+        setMaintenanceScrollOffset(0)
+      } else if (key === "up" || key === "k") {
+        setMaintenanceScrollOffset(off => Math.max(0, off - 1))
+      } else if (key === "down" || key === "j") {
+        setMaintenanceScrollOffset(off => off + 1)
+      } else if (key === "r") {
+        refreshMaintenanceReports()
+        pushToast("✓ Maintenance reports refreshed")
+      } else if ((key === "enter" || key === "return") && maintenanceTab === "lint" && maintenanceFixPlan.length > 0 && !isReadOnlyGitSource) {
+        applyMaintenanceFixNames()
+      }
+      return
+    }
+
+    if (viewMode === "codex-install-confirm") {
+      if (key === "escape" || key === "n") {
+        setCodexInstallPreview(null)
+        setViewMode("main")
+      } else if ((key === "y" || key === "enter" || key === "return") && !isAsyncBusy) {
+        applyCodexInstallAction()
+      }
+      return
+    }
+
     if (viewMode === "command-palette") {
       const clampPaletteScroll = (nextIndex: number, total: number) => {
         setPaletteScrollOffset(offset => {
@@ -3189,7 +3626,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     if (viewMode === "help") {
       const vpRows = calculateHelpViewport(termWidth, termHeight).viewportRows
       const totalItems = helpContent.items.length
-      const numericTab = /^[1-4]$/.test(key) ? helpTabByNumber(Number(key)) : null
+      const numericTab = /^[1-9]$/.test(key) ? helpTabByNumber(Number(key)) : null
 
       if (key === "escape" || rawChar === "?" || key === "q") {
         setViewMode("main")
@@ -3287,6 +3724,103 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       return
     }
 
+    if (viewMode === "main" && workspaceTab === "target") {
+      const totalRows = targetWorkspaceRows.length
+      const page = Math.max(4, wsViewports.sourcesRows - 3)
+      const clampTargetScroll = (nextIndex: number) => {
+        setTargetScrollOffset(offset => clampListScroll(nextIndex, totalRows, offset, page))
+      }
+      if (key === "tab" && !e.shift) {
+        setWorkspaceTab("flows")
+        return
+      }
+      if (key === "backtab" || (key === "tab" && e.shift)) {
+        const order: TargetSubTab[] = ["installed", "bridges", "backups"]
+        const next = order[(order.indexOf(targetSubTab) + 1) % order.length]!
+        setTargetSubTab(next)
+        setTargetFocusIndex(0)
+        setTargetScrollOffset(0)
+        setTargetInspectorScroll(0)
+        return
+      }
+      if (key === "?" || (e.shift && key === "/")) {
+        openHelpGuide()
+        return
+      }
+      if ((e.shift && key === "left") || key === "[") {
+        setActivePane("list")
+        return
+      }
+      if ((e.shift && key === "right") || key === "]") {
+        if (layout.showInspector) setActivePane("inspector")
+        return
+      }
+      if (key === "r" && e.ctrl) {
+        refreshTargetStatus()
+        pushToast("✓ Refreshed target status & backups")
+        return
+      }
+      if (key === "1") {
+        setTargetSubTab("installed")
+        setTargetFocusIndex(0)
+        setTargetScrollOffset(0)
+        setTargetInspectorScroll(0)
+      } else if (key === "2") {
+        setTargetSubTab("bridges")
+        setTargetFocusIndex(0)
+        setTargetScrollOffset(0)
+        setTargetInspectorScroll(0)
+      } else if (key === "3") {
+        setTargetSubTab("backups")
+        setTargetFocusIndex(0)
+        setTargetScrollOffset(0)
+        setTargetInspectorScroll(0)
+      } else if (key === "up" || (key === "k" && !e.shift)) {
+        if (effectivePane === "inspector") {
+          setTargetInspectorScroll(off => Math.max(0, off - 1))
+        } else if (totalRows > 0) {
+          const next = targetFocusIndex > 0 ? targetFocusIndex - 1 : totalRows - 1
+          setTargetFocusIndex(next)
+          setTargetInspectorScroll(0)
+          clampTargetScroll(next)
+        }
+      } else if (key === "down" || key === "j") {
+        if (effectivePane === "inspector") {
+          setTargetInspectorScroll(off => off + 1)
+        } else if (totalRows > 0) {
+          const next = targetFocusIndex < totalRows - 1 ? targetFocusIndex + 1 : 0
+          setTargetFocusIndex(next)
+          setTargetInspectorScroll(0)
+          clampTargetScroll(next)
+        }
+      } else if (key === "u") {
+        executeActionById("target-update")
+      } else if (key === "x") {
+        executeActionById("target-uninstall")
+      } else if (key === "r" && !e.shift) {
+        runTargetReconcile()
+      } else if (key === "r" && e.shift) {
+        executeActionById("target-restore")
+      } else if (key === "a" && e.shift) {
+        previewTargetOp("reconcile", [], true)
+      } else if (key === "e") {
+        const row = targetWorkspaceRows[targetFocusIndex]
+        if (row?.kind === "bridge-pack") previewInstall([row.packName])
+        else if (row?.kind === "installed-pack") previewTargetOp("update", [row.packName])
+      } else if (key === "k" && e.shift) {
+        executeActionById("bridge-check")
+      } else if (key === "b" && !e.shift) {
+        openBridgeModalAction("claude")
+      } else if (key === "b" && e.shift) {
+        openBridgeModalAction("codex")
+      } else if (key === "c") {
+        executeActionById("codex-install")
+      } else if (key === "o") {
+        openSourcesModal()
+      }
+      return
+    }
+
     if (viewMode === "main" && workspaceTab === "sources") {
       const visibleSourceBudget = wsViewports.sourcesRows
       const clampScroll = (nextIndex: number, total: number) => {
@@ -3332,9 +3866,11 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         return
       }
 
-      if (key === "tab") {
-        setWorkspaceTab(e.shift ? "flows" : "catalog")
+      if (key === "tab" && !e.shift) {
+        setWorkspaceTab("catalog")
         setViewMode("main")
+      } else if (key === "backtab" || (key === "tab" && e.shift)) {
+        if (layout.showInspector) setActivePane(prev => (prev === "inspector" ? "list" : "inspector"))
       } else if ((e.shift && key === "left") || rawChar === "[") {
         setActivePane("list")
       } else if ((e.shift && key === "right") || rawChar === "]") {
@@ -3409,9 +3945,11 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       }
       const currentFlowNavRow = flowsNav.rows[Math.max(0, Math.min(flowsFocusIndex, Math.max(0, flowsNav.rows.length - 1)))] ?? null
       const flowsInsp = buildFlowsInspectorItems(currentFlowNavRow, agents, packFlowsByCategory, flowsNav.agentByShortName)
-      if (key === "tab") {
-        setWorkspaceTab(e.shift ? "catalog" : "sources")
-        if (!e.shift) refreshSourcesView(true)
+      if (key === "tab" && !e.shift) {
+        openSourcesModal()
+        refreshSourcesView(true)
+      } else if (key === "backtab" || (key === "tab" && e.shift)) {
+        if (layout.showInspector) setActivePane(prev => (prev === "inspector" ? "list" : "inspector"))
       } else if ((e.shift && key === "left") || rawChar === "[") {
         setActivePane("list")
       } else if ((e.shift && key === "right") || rawChar === "]") {
@@ -3481,9 +4019,19 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
 
     // 2. Main Catalog view mode
     if (viewMode === "main") {
-      if (key === "tab") {
-        setWorkspaceTab(e.shift ? "sources" : "flows")
-        if (e.shift) refreshSourcesView(true)
+      if (key === "tab" && !e.shift) {
+        refreshTargetStatus()
+        setWorkspaceTab("target")
+      } else if (key === "backtab" || (key === "tab" && e.shift)) {
+        if (currentItem?.type === "file" && currentItem.agent) {
+          const idx = INSPECTOR_TABS.indexOf(inspectorTab)
+          const nextTab = INSPECTOR_TABS[(idx + 1) % INSPECTOR_TABS.length]!
+          setInspectorTab(nextTab)
+          if (nextTab === "security" || nextTab === "delegations") setGraphScrollOffset(0)
+          if (nextTab === "resources") setResourceScrollIndex(0)
+        } else if (layout.showInspector) {
+          setActivePane(prev => (prev === "inspector" ? "list" : "inspector"))
+        }
       } else if ((e.shift && key === "left") || rawChar === "[") {
         setActivePane("list")
       } else if ((e.shift && key === "right") || rawChar === "]") {
@@ -3515,12 +4063,14 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       } else if ((key === "up" || key === "k") && effectivePane === "inspector" && inspectorTab === "overview" && currentItem) {
         setOverviewScrollOffset(offset => Math.max(0, offset - 1))
       } else if ((key === "down" || key === "j") && effectivePane === "inspector" && inspectorTab === "overview" && currentItem) {
-        const mdText = currentItem.type === "file" && currentItem.agent
-          ? (currentItem.agent.description || "No description provided.")
-          : packDescription(currentItem.category)
-        const total = layoutMarkdownDocument(mdText, Math.max(16, panelWidths.inspector - 8)).length
-        const page = Math.max(2, maxVisibleItems - (currentItem.type === "file" ? 7 : 6))
-        setOverviewScrollOffset(offset => Math.min(Math.max(0, total - page), offset + 1))
+        if (currentItem.type === "file" && currentItem.agent) {
+          const mdText = currentItem.agent.description || "No description provided."
+          const total = layoutMarkdownDocument(mdText, Math.max(16, panelWidths.inspector - 8)).length
+          const page = Math.max(2, maxVisibleItems - 7)
+          setOverviewScrollOffset(offset => Math.min(Math.max(0, total - page), offset + 1))
+        } else {
+          setOverviewScrollOffset(offset => offset + 1)
+        }
       } else if ((key === "up" || key === "k") && effectivePane === "inspector" && inspectorTab === "prompt" && currentItem?.agent) {
         setPromptScrollOffset(offset => Math.max(0, offset - 1))
       } else if ((key === "down" || key === "j") && effectivePane === "inspector" && inspectorTab === "prompt" && currentItem?.agent) {
@@ -3554,7 +4104,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         setGraphScrollOffset((offset) => Math.min(Math.max(0, itemCount - pageSize), offset + 1))
       } else if ((key === "down" || key === "j") && effectivePane === "inspector" && inspectorTab === "resources" && activeItems[focusedIndex]?.agent) {
         setResourceScrollIndex((offset) => Math.min(Math.max(0, resourceInspectorLines.length - wsViewports.resourcesInspectorRows), offset + 1))
-      } else if (key === "up" || key === "k") {
+      } else if (key === "up" || (key === "k" && !e.shift)) {
         if (activeItems.length === 0) return
         const next = focusedIndex > 0 ? focusedIndex - 1 : activeItems.length - 1
         setFocusedIndex(next)
@@ -3576,13 +4126,19 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
           return
         }
         const item = activeItems[focusedIndex]
-        if (item?.type === "folder") toggleFolderAtFocused()
+        if (item?.type === "folder" || item?.type === "section") toggleFolderAtFocused()
         else if (item?.type === "file") openModelOrFlowsAction()
       } else if (key === "left" || key === "h") {
         if (activeItems.length > 0) {
           const item = activeItems[focusedIndex]
           if (item.type === "folder" && expandedCategories.has(item.id)) {
             setExpandedCategories((prev) => {
+              const next = new Set(prev)
+              next.delete(item.id)
+              return next
+            })
+          } else if (item.type === "section" && expandedSections.has(item.id)) {
+            setExpandedSections(prev => {
               const next = new Set(prev)
               next.delete(item.id)
               return next
@@ -3594,6 +4150,12 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
           const item = activeItems[focusedIndex]
           if (item.type === "folder" && !expandedCategories.has(item.id)) {
             setExpandedCategories((prev) => {
+              const next = new Set(prev)
+              next.add(item.id)
+              return next
+            })
+          } else if (item.type === "section" && !expandedSections.has(item.id)) {
+            setExpandedSections(prev => {
               const next = new Set(prev)
               next.add(item.id)
               return next
@@ -3628,8 +4190,15 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         openBridgeModalAction("codex")
       } else if (key === "e") {
         executeActionById("pack-install")
+      } else if (key === "f" && !isUppercaseF) {
+        cycleAssetFilter()
+      } else if (key === "w") {
+        openMaintenanceModal("validate")
+      } else if (key === "k" && e.shift) {
+        executeActionById("bridge-check")
       } else if (key === "c") {
-        executeActionById("agent-color")
+        if (activeItems[focusedIndex]?.type === "file") executeActionById("agent-color")
+        else executeActionById("codex-install")
       } else if (key === "r") {
         executeActionById("agent-rename")
       } else if (key === "p") {
@@ -4295,7 +4864,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         } else if ((key === "space" || key === "left" || key === "right") && !isText) {
           const delta = key === "left" ? -1 : 1
           if (scaffoldField === "kind") {
-            const kinds: ScaffoldResourceKind[] = ["agent", "skill", "command"]
+            const kinds: ScaffoldResourceKind[] = ["agent", "skill", "command", "tool", "plugin", "mcp"]
             setScaffoldKind(prev => kinds[(kinds.indexOf(prev) + delta + kinds.length) % kinds.length])
           } else if (scaffoldField === "mode") {
             const modes: Array<"subagent" | "primary" | "all"> = ["subagent", "primary", "all"]
@@ -4872,6 +5441,9 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
           if (tabKey === "sources") {
             if (workspaceTab !== "sources") refreshSourcesView(true)
             setWorkspaceTab("sources")
+          } else if (tabKey === "target") {
+            refreshTargetStatus()
+            setWorkspaceTab("target")
           } else {
             setWorkspaceTab(tabKey)
           }
@@ -4889,6 +5461,65 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         reducedMotion={reducedMotionState}
         onDismiss={() => setToastMessage(null)}
       />
+
+      {/* Workspace Maintenance Modal */}
+      {viewMode === "maintenance" && (
+        <MaintenanceModal
+          termWidth={termWidth}
+          termHeight={termHeight}
+          activeTab={maintenanceTab}
+          validation={maintenanceValidation}
+          lint={maintenanceLint}
+          fixPlan={maintenanceFixPlan}
+          audit={maintenanceAudit}
+          isReadOnlyGitSource={isReadOnlyGitSource}
+          scrollOffset={maintenanceScrollOffset}
+          onSelectTab={tab => {
+            setMaintenanceTab(tab)
+            setMaintenanceScrollOffset(0)
+          }}
+          onScrollDelta={delta => setMaintenanceScrollOffset(off => Math.max(0, off + delta))}
+          onApplyFixNames={applyMaintenanceFixNames}
+          onRefresh={refreshMaintenanceReports}
+          onClose={() => setViewMode("main")}
+        />
+      )}
+
+      {/* Codex Install Preview Confirmation Modal */}
+      {viewMode === "codex-install-confirm" && codexInstallPreview && (
+        <box
+          position="absolute"
+          left={Math.max(0, Math.floor((termWidth - Math.min(82, termWidth - 6)) / 2))}
+          top={Math.max(0, Math.floor((termHeight - Math.min(22, termHeight - 4)) / 2))}
+          width={Math.min(82, termWidth - 6)}
+          height={Math.min(22, termHeight - 4)}
+          borderStyle="rounded"
+          borderColor={THEME.accentCyan}
+          backgroundColor={THEME.bgPanel}
+          flexDirection="column"
+          padding={1}
+          zIndex={45}
+        >
+          <text height={1} wrapMode="none" style={{ textColor: THEME.accentCyan }} b>
+            {` Confirm Codex Install (--codex) · ${terminalSafeText(codexInstallPreview.packName)} `}
+          </text>
+          <box flexDirection="column" flexGrow={1} minHeight={0} marginTop={1} overflow="hidden">
+            {codexInstallPreview.lines.slice(0, 14).map((line, i) => (
+              <text key={i} height={1} wrapMode="none" overflow="hidden" style={{ textColor: line.includes("⚠") ? THEME.accentAmber : THEME.fgPrimary }}>
+                {line}
+              </text>
+            ))}
+          </box>
+          <box flexDirection="row" justifyContent="space-between" height={1} marginTop={1}>
+            <text height={1} wrapMode="none" style={{ textColor: THEME.accentGreen }} b onMouseDown={applyCodexInstallAction}>
+              {" [Enter / Y] Install into Codex "}
+            </text>
+            <text height={1} wrapMode="none" style={{ textColor: THEME.fgMuted }} onMouseDown={() => { setCodexInstallPreview(null); setViewMode("main") }}>
+              {" [Esc / N] Cancel "}
+            </text>
+          </box>
+        </box>
+      )}
 
       {/* Command Palette Overlay */}
       {viewMode === "command-palette" && (
@@ -5040,6 +5671,59 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
           }}
           onJumpToCatalogAgent={agentPath => jumpToCatalogAgent(agentPath)}
         />
+      ) : workspaceTab === "target" ? (
+        /* Workspace 2: OpenCode v2 Target & Claude/Codex Bridges */
+        <TargetBridgesWorkspace
+          subTab={targetSubTab}
+          rows={targetWorkspaceRows}
+          installedCount={targetInstalledCount}
+          bridgesCount={catalogIndex.packs.length}
+          backupsCount={targetBackups.length}
+          focusedIndex={targetFocusIndex}
+          scrollOffset={targetScrollOffset}
+          listRows={wsViewports.sourcesRows}
+          targetStatusInfo={targetStatusInfo}
+          leftWidth={listPanelWidth}
+          rightWidth={panelWidths.inspector}
+          gutterWidth={panelWidths.gutter}
+          showInspector={layout.showInspector}
+          activePane={effectivePane}
+          focusBorderBlend={focusPaneBlend}
+          inspectorScrollOffset={targetInspectorScroll}
+          busySpinner={isAsyncBusy ? pulse.spinner : ""}
+          onSelectSubTab={tab => {
+            setTargetSubTab(tab)
+            setTargetFocusIndex(0)
+            setTargetScrollOffset(0)
+            setTargetInspectorScroll(0)
+          }}
+          onSelectPane={pane => setActivePane(pane)}
+          onFocusIndex={idx => {
+            setTargetFocusIndex(idx)
+            setTargetInspectorScroll(0)
+          }}
+          onScrollDelta={delta => {
+            const total = targetWorkspaceRows.length
+            if (!total) return
+            const page = Math.max(2, wsViewports.sourcesRows - 2)
+            const maxOff = Math.max(0, total - page)
+            setTargetScrollOffset(off => Math.max(0, Math.min(maxOff, off + delta)))
+          }}
+          onScrollInspectorDelta={delta => setTargetInspectorScroll(off => Math.max(0, off + delta))}
+          onInstallPack={packName => previewInstall([packName])}
+          onUpdatePack={packName => previewTargetOp("update", packName ? [packName] : [])}
+          onUninstallPack={packName => previewTargetOp("uninstall", [packName])}
+          onReconcile={adopt => (adopt ? previewTargetOp("reconcile", [], true) : runTargetReconcile())}
+          onRestoreBackup={backupId => runTargetRestoreAction(backupId)}
+          onRefresh={() => {
+            refreshTargetStatus()
+            pushToast("✓ Refreshed target status & backups")
+          }}
+          onBridgeCheck={packName => runBridgeCheckAction(packName)}
+          onBridgeClaude={packName => openBridgeModalAction("claude", packName)}
+          onBridgeCodex={packName => openBridgeModalAction("codex", packName)}
+          onCodexInstall={packName => openCodexInstallPreviewAction(packName)}
+        />
       ) : workspaceTab === "sources" ? (
         /* Workspace 3: Sources & OpenCode Target */
         <SourcesTargetWorkspace
@@ -5112,9 +5796,9 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
             title={
               layout.showInspector
                 ? effectivePane === "list"
-                  ? ` ● Catalog (${catalogPacks.length} packs · ${agents.length} agents) `
-                  : ` Catalog (${catalogPacks.length} packs · ${agents.length} agents) · ⇧← `
-                : ` Catalog (${catalogPacks.length} packs · ${agents.length} agents) `
+                  ? ` ● Catalog (${catalogPacks.length} packs · ${catalogIndex.totals.total} assets) `
+                  : ` Catalog (${catalogPacks.length} packs · ${catalogIndex.totals.total} assets) · ⇧← `
+                : ` Catalog (${catalogPacks.length} packs · ${catalogIndex.totals.total} assets) `
             }
             titleColor={effectivePane === "list" ? THEME.accentBlue : THEME.fgSecondary}
             flexDirection="column"
@@ -5189,6 +5873,40 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                     {catalogPacks.length > 0 ? "[Ctrl+A] All packs" : ""}
                   </text>
                 )}
+              </box>
+
+              {/* Asset-Type Filter Pills ([F] cycles) */}
+              <box
+                width="100%"
+                height={2}
+                borderStyle="single"
+                border={["bottom"]}
+                borderColor={THEME.borderSubtle}
+                flexDirection="row"
+                alignItems="center"
+                gap={1}
+                overflow="hidden"
+              >
+                {ASSET_TYPE_FILTERS.map(f => {
+                  const active = assetFilter === f.key
+                  return (
+                    <text
+                      key={f.key}
+                      height={1}
+                      wrapMode="none"
+                      backgroundColor={active ? THEME.bgPillActive : "transparent"}
+                      style={{ textColor: active ? THEME.accentBlue : THEME.fgMuted }}
+                      b={active}
+                      onMouseDown={(_self, event) => {
+                        event.stopPropagation()
+                        setActivePane("list")
+                        setAssetFilter(f.key)
+                      }}
+                    >
+                      {active ? ` ● ${listContentWidth >= 60 ? f.label : f.shortLabel} ` : ` ${listContentWidth >= 60 ? f.label : f.shortLabel} `}
+                    </text>
+                  )
+                })}
               </box>
 
               {/* Column Header */}
@@ -5287,7 +6005,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                           </box>
                           {gutter(`tree-${item.id}-1`)}
                           <text width={columnWidth(1)} wrapMode="none" overflow="hidden" style={{ textColor: isFocused ? "#ffffff" : THEME.accentAmber }} b>
-                            {middleEllipsis(`📦 ${terminalSafeText(item.category)} (${catCount})`, columnWidth(1))}
+                            {middleEllipsis(`📦 ${terminalSafeText(item.category)} (${item.pack.counts.total})`, columnWidth(1))}
                           </text>
                           {gutter(`tree-${item.id}-2`)}
                           <text
@@ -5305,6 +6023,73 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                             }}
                           >
                             {middleEllipsis(rightMeta, columnWidth(2))}
+                          </text>
+                        </box>
+                      )
+                    }
+
+                    if (item.type === "section") {
+                      const isSecExpanded = searchQuery.trim() !== "" || assetFilter !== "all" || expandedSections.has(item.id)
+                      return (
+                        <box
+                          key={`section-${item.id}`}
+                          width="100%"
+                          height={1}
+                          flexDirection="row"
+                          backgroundColor={isFocused ? THEME.bgRowFocus : "transparent"}
+                          onMouseDown={(_self, event) => {
+                            event.stopPropagation()
+                            setActivePane("list")
+                            setFocusedIndex(globalIndex)
+                            setExpandedSections(prev => {
+                              const next = new Set(prev)
+                              if (next.has(item.id)) next.delete(item.id)
+                              else next.add(item.id)
+                              return next
+                            })
+                          }}
+                        >
+                          <text width={columnWidth(0)} wrapMode="none" style={{ textColor: THEME.fgMuted }}>
+                            {isFocused ? "▎  " : "   "}
+                          </text>
+                          {gutter(`sec-${item.id}-1`)}
+                          <text width={columnWidth(1)} wrapMode="none" overflow="hidden" style={{ textColor: isFocused ? "#ffffff" : THEME.accentCyan }} b={isFocused}>
+                            {middleEllipsis(` ${isSecExpanded ? "▾" : "▸"} ${item.label.trim().replace(/^[▾▸]\s*/, "")}`, columnWidth(1))}
+                          </text>
+                          {gutter(`sec-${item.id}-2`)}
+                          <text width={columnWidth(2)} wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgMuted }}>
+                            {item.assetKind}
+                          </text>
+                        </box>
+                      )
+                    }
+
+                    if (item.type === "asset") {
+                      const kindTag = item.assetKind === "skill" ? "SK" : item.assetKind === "command" ? "CM" : item.assetKind === "tool" ? "TL" : item.assetKind === "plugin" ? "PL" : item.assetKind === "theme" ? "TH" : "MCP"
+                      const kindColor = item.assetKind === "skill" ? THEME.accentGreen : item.assetKind === "command" ? THEME.accentCyan : item.assetKind === "mcp" ? THEME.accentPurple : THEME.accentAmber
+                      return (
+                        <box
+                          key={`asset-${item.id}`}
+                          width="100%"
+                          height={1}
+                          flexDirection="row"
+                          backgroundColor={isFocused ? THEME.bgRowFocus : "transparent"}
+                          onMouseDown={(_self, event) => {
+                            event.stopPropagation()
+                            setActivePane("list")
+                            setFocusedIndex(globalIndex)
+                          }}
+                        >
+                          <text width={columnWidth(0)} wrapMode="none" style={{ textColor: isFocused ? "#ffffff" : kindColor }} b={isFocused}>
+                            {`${isFocused ? "▎" : " "}${kindTag}`}
+                          </text>
+                          {gutter(`asset-${item.id}-1`)}
+                          <text width={columnWidth(1)} wrapMode="none" overflow="hidden" style={{ textColor: isFocused ? "#ffffff" : THEME.fgPrimary }} b={isFocused}>
+                            {middleEllipsis(`  ${terminalSafeText(item.asset.name)}`, columnWidth(1))}
+                          </text>
+                          {gutter(`asset-${item.id}-2`)}
+                          <text width={columnWidth(2)} wrapMode="none" overflow="hidden" style={{ textColor: item.asset.executable ? THEME.accentAmber : THEME.fgMuted }}>
+                            {middleEllipsis(item.asset.executable ? "⚠ exec" : terminalSafeText(item.asset.description || item.asset.relPath), columnWidth(2))}
                           </text>
                         </box>
                       )
@@ -5505,52 +6290,54 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                   }
                 }}
               >
-                {/* Clickable 6-Tab Navigation Bar */}
-                <box
-                  flexDirection="row"
-                  width="100%"
-                  height={2}
-                  borderStyle="single"
-                  border={["bottom"]}
-                  borderColor={THEME.borderSubtle}
-                  alignItems="center"
-                  overflow="hidden"
-                >
-                  {(
-                    [
-                      ["overview", "1 Info", THEME.accentCyan],
-                      ["prompt", "2 Prompt", THEME.accentBlue],
-                      ["naming", "3 Name", THEME.accentAmber],
-                      ["security", "4 Sec", THEME.accentRed],
-                      ["delegations", "5 Graph", THEME.accentGreen],
-                      ["resources", "6 Res", THEME.accentPurple],
-                    ] as const
-                  ).map(([tKey, tLabel, tColor], idx) => {
-                    const active = inspectorTab === tKey
-                    return (
-                      <React.Fragment key={tKey}>
-                        {idx > 0 && <text wrapMode="none" style={{ textColor: THEME.borderSubtle }}>{" "}</text>}
-                        <box
-                          height={1}
-                          paddingLeft={panelWidths.inspector >= 56 ? 1 : 0}
-                          paddingRight={panelWidths.inspector >= 56 ? 1 : 0}
-                          backgroundColor={active ? THEME.bgPillActive : "transparent"}
-                          onMouseDown={(_self, event) => {
-                            event.stopPropagation()
-                            setActivePane("inspector")
-                            setInspectorTab(tKey)
-                            if (tKey === "security" || tKey === "delegations") setGraphScrollOffset(0)
-                            if (tKey === "resources") setResourceScrollIndex(0)
-                          }}
-                        >
-                          <text wrapMode="none" style={{ textColor: active ? tColor : THEME.fgSecondary }} b={active}>
-                            {panelWidths.inspector >= 46 ? tLabel : tLabel.replace(/^\d\s/, "")}
-                          </text>
-                        </box>
-                      </React.Fragment>
-                    )
-                  })}
-                </box>
+                {/* Clickable 6-Tab Navigation Bar (only when an Agent is focused) */}
+                {currentItem?.type === "file" && currentItem.agent && (
+                  <box
+                    flexDirection="row"
+                    width="100%"
+                    height={2}
+                    borderStyle="single"
+                    border={["bottom"]}
+                    borderColor={THEME.borderSubtle}
+                    alignItems="center"
+                    overflow="hidden"
+                  >
+                    {(
+                      [
+                        ["overview", "1 Info", THEME.accentCyan],
+                        ["prompt", "2 Prompt", THEME.accentBlue],
+                        ["naming", "3 Name", THEME.accentAmber],
+                        ["security", "4 Sec", THEME.accentRed],
+                        ["delegations", "5 Graph", THEME.accentGreen],
+                        ["resources", "6 Res", THEME.accentPurple],
+                      ] as const
+                    ).map(([tKey, tLabel, tColor], idx) => {
+                      const active = inspectorTab === tKey
+                      return (
+                        <React.Fragment key={tKey}>
+                          {idx > 0 && <text wrapMode="none" style={{ textColor: THEME.borderSubtle }}>{" "}</text>}
+                          <box
+                            height={1}
+                            paddingLeft={panelWidths.inspector >= 56 ? 1 : 0}
+                            paddingRight={panelWidths.inspector >= 56 ? 1 : 0}
+                            backgroundColor={active ? THEME.bgPillActive : "transparent"}
+                            onMouseDown={(_self, event) => {
+                              event.stopPropagation()
+                              setActivePane("inspector")
+                              setInspectorTab(tKey)
+                              if (tKey === "security" || tKey === "delegations") setGraphScrollOffset(0)
+                              if (tKey === "resources") setResourceScrollIndex(0)
+                            }}
+                          >
+                            <text wrapMode="none" style={{ textColor: active ? tColor : THEME.fgSecondary }} b={active}>
+                              {panelWidths.inspector >= 46 ? tLabel : tLabel.replace(/^\d\s/, "")}
+                            </text>
+                          </box>
+                        </React.Fragment>
+                      )
+                    })}
+                  </box>
+                )}
 
                 {currentItem ? (
                   <box flexDirection="column" flexGrow={1} minHeight={0} overflow="hidden" marginTop={1}>
@@ -5992,116 +6779,43 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                           </box>
                         )}
                       </box>
+                    ) : currentItem.type === "asset" ? (
+                      <AssetItemInspector
+                        asset={currentItem.asset}
+                        pack={catalogIndex.byName.get(currentItem.category)}
+                        inspectorWidth={panelWidths.inspector}
+                        scrollOffset={overviewScrollOffset}
+                        maxRows={maxVisibleItems}
+                      />
                     ) : (
-                      /* Pack Folder Inspector */
-                      <box flexDirection="column" flexGrow={1} overflow="hidden">
-                        <box flexDirection="row" justifyContent="space-between" width="100%">
-                          <text wrapMode="none" overflow="hidden" style={{ textColor: THEME.accentAmber }} b>
-                            {middleEllipsis(`📦 ${terminalSafeText(currentItem.category)}`, Math.max(14, panelWidths.inspector - 18))}
-                          </text>
-                          <text
-                            wrapMode="none"
-                            style={{ textColor: THEME.accentGreen }}
-                            b
-                            u
-                            onMouseDown={(_self, event) => {
-                              event.stopPropagation()
-                              executeActionById("pack-install")
-                            }}
-                          >
-                            [E] Install
-                          </text>
-                        </box>
-                        <text wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgMuted }} marginTop={1}>
-                          {middleEllipsis(`Dir: ${path.relative(workspaceRoot, packDir(workspaceRoot, currentItem.category) ?? workspaceRoot) || "."}/`, Math.max(16, panelWidths.inspector - 4))}
-                        </text>
-                        {(() => {
-                          const folderDir = packDir(workspaceRoot, currentItem.category)
-                          const isVirtual = Boolean(folderDir && !fs.existsSync(path.join(folderDir, "opencode-pack.json")))
-                          const lockedPack = targetStatusInfo?.lock?.packs?.[currentItem.category]
+                      (() => {
+                        const packEntry = catalogIndex.byName.get(currentItem.category)
+                        if (!packEntry) {
                           return (
-                            <box flexDirection="column" marginTop={1}>
-                              <text wrapMode="none" overflow="hidden" style={{ textColor: isVirtual ? THEME.accentCyan : THEME.accentGreen }}>
-                                {middleEllipsis(
-                                  isVirtual ? "Format: Virtual .md Pack" : `Format: OpenCode Pack${lockedPack ? ` · installed (${lockedPack.version})` : ""}`,
-                                  Math.max(16, panelWidths.inspector - 4),
-                                )}
-                              </text>
-                              <box flexDirection="row" marginTop={1} gap={2}>
-                                {(categoryAgentCounts.get(currentItem.category) ?? 0) > 0 && (<text
-                                  wrapMode="none"
-                                  style={{ textColor: THEME.accentCyan }}
-                                  u
-                                  onMouseDown={(_self, event) => {
-                                    event.stopPropagation()
-                                    openPackFlowsModal(currentItem.category)
-                                  }}
-                                >
-                                  [M] IF/OR Flows
-                                </text>)}
-                                {isVirtual ? (
-                                  <text
-                                    wrapMode="none"
-                                    style={{ textColor: THEME.accentGreen }}
-                                    b
-                                    u
-                                    onMouseDown={(_self, event) => {
-                                      event.stopPropagation()
-                                      openInitPackModal()
-                                    }}
-                                  >
-                                    {isReadOnlyGitSource ? "[I] Clone & Onboard" : "[I] Onboard Pack"}
-                                  </text>
-                                ) : !isReadOnlyGitSource ? (
-                                  <>
-                                    <text
-                                      wrapMode="none"
-                                      style={{ textColor: THEME.accentAmber }}
-                                      u
-                                      onMouseDown={(_self, event) => {
-                                        event.stopPropagation()
-                                        openPackDoctorModal("doctor")
-                                      }}
-                                    >
-                                      [D] Pack Doctor
-                                    </text>
-                                    <text
-                                      wrapMode="none"
-                                      style={{ textColor: THEME.accentGreen }}
-                                      u
-                                      onMouseDown={(_self, event) => {
-                                        event.stopPropagation()
-                                        openPackDoctorModal("scaffold")
-                                      }}
-                                    >
-                                      [N] New Resource
-                                    </text>
-                                  </>
-                                ) : null}
-                              </box>
+                            <box flexDirection="column">
+                              <text style={{ textColor: THEME.fgSecondary }}>Pack metadata unavailable.</text>
                             </box>
                           )
-                        })()}
-                        <box
-                          border={true}
-                          borderStyle="rounded"
-                          borderColor={THEME.borderSubtle}
-                          backgroundColor={THEME.bgInput}
-                          paddingLeft={1}
-                          paddingRight={1}
-                          marginTop={1}
-                          flexGrow={1}
-                          overflow="hidden"
-                        >
-                          <PromptMarkdownView
-                            markdown={packDescription(currentItem.category)}
-                            width={Math.max(16, panelWidths.inspector - 8)}
-                            maxRows={Math.max(2, maxVisibleItems - 6)}
+                        }
+                        return (
+                          <PackInspector
+                            pack={packEntry}
+                            focusedSection={currentItem.type === "section" ? currentItem.assetKind : null}
+                            targetStatusInfo={targetStatusInfo}
+                            isReadOnlyGitSource={isReadOnlyGitSource}
+                            inspectorWidth={panelWidths.inspector}
                             scrollOffset={overviewScrollOffset}
-                            showFooter={false}
+                            maxRows={maxVisibleItems}
+                            onInstallPack={packName => previewInstall([packName])}
+                            onBridgeCheck={packName => runBridgeCheckAction(packName)}
+                            onBridgeClaude={packName => openBridgeModalAction("claude", packName)}
+                            onBridgeCodex={packName => openBridgeModalAction("codex", packName)}
+                            onCodexInstall={packName => openCodexInstallPreviewAction(packName)}
+                            onOpenDoctor={() => openPackDoctorModal("doctor")}
+                            onOpenScaffold={() => openPackDoctorModal("scaffold")}
                           />
-                        </box>
-                      </box>
+                        )
+                      })()
                     )}
                   </box>
                 ) : (
@@ -7205,10 +7919,17 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         />
       )}
 
-      {/* Modal - Install a pack into OpenCode with Native Diff Preview */}
+      {/* Modal - Target Lifecycle Diff Preview (Install / Update / Uninstall / Reconcile) */}
       {viewMode === "install-confirm" && installPreview && (() => {
+        const opVerb = installPreview.operation === "reconcile" && installPreview.adopt
+          ? "Reconcile --adopt"
+          : installPreview.operation[0].toUpperCase() + installPreview.operation.slice(1)
         const packNames = installPreview.packs.map(pack => `'${terminalSafeText(pack)}'`).join(", ")
-        const packLabel = installPreview.packs.length === 1 ? terminalSafeText(installPreview.packs[0]) : `${installPreview.packs.length} packs`
+        const packLabel = installPreview.packs.length === 1
+          ? terminalSafeText(installPreview.packs[0])
+          : installPreview.packs.length > 1
+            ? `${installPreview.packs.length} packs`
+            : "target"
         const addedLines = installPreview.lines.filter(l => /^\s*\b(write|add|install|update)\b/i.test(l))
         const removedLines = installPreview.lines.filter(l => /^\s*\b(remove|delete|prune)\b/i.test(l))
         const hasDiffItems = addedLines.length > 0 || removedLines.length > 0
@@ -7220,17 +7941,19 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
             zIndex={45}
             border={true}
             borderStyle="rounded"
-            borderColor={installPreview.blocked ? THEME.borderDanger : THEME.borderSuccess}
+            borderColor={installPreview.blocked ? THEME.borderDanger : installPreview.operation === "uninstall" ? THEME.accentAmber : THEME.borderSuccess}
             backgroundColor={THEME.bgElevated}
-            title={` Install ${packLabel} `}
-            titleColor={installPreview.blocked ? THEME.accentRed : THEME.accentGreen}
+            title={` ${opVerb} ${packLabel} `}
+            titleColor={installPreview.blocked ? THEME.accentRed : installPreview.operation === "uninstall" ? THEME.accentAmber : THEME.accentGreen}
             padding={1}
             flexDirection="column"
             justifyContent="space-between"
           >
             <box flexDirection="column" flexGrow={1} overflow="hidden">
               <text style={{ textColor: THEME.fgPrimary }} b>
-                {`Install ${packNames} with dependencies into ${installPreview.target.replace(os.homedir(), "~")}`}
+                {installPreview.operation === "install"
+                  ? `Install ${packNames} with dependencies into ${installPreview.target.replace(os.homedir(), "~")}`
+                  : `${opVerb}${packNames ? ` ${packNames}` : ""} on ${installPreview.target.replace(os.homedir(), "~")}`}
               </text>
               <scrollbox scrollY={true} flexGrow={1} marginTop={1} overflow="hidden">
                 <box flexDirection="column">
@@ -7284,7 +8007,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                 </text>
               ) : (
                 <text style={{ textColor: THEME.accentGreen }} b onMouseDown={() => applyInstall(installPreview)}>
-                  [Y / ENTER] Confirm &amp; Install
+                  {`[Y / ENTER] Confirm & ${opVerb}`}
                 </text>
               )}
               {!installPreview.blocked && (

@@ -183,7 +183,7 @@ export function calculateWorkspaceViewports(
 ): WorkspaceViewports {
   const h = Math.max(0, Math.floor(terminalHeight))
   return {
-    catalogRows: Math.max(1, h - 15),
+    catalogRows: Math.max(1, h - 17),
     flowsRows: Math.max(1, h - 18),
     sourcesRows: Math.max(1, h - 21 - (options.hasSourcesStatus ? 2 : 0)),
     promptRows: Math.max(2, h - 18),

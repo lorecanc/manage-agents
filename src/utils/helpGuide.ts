@@ -1,6 +1,6 @@
 import type { WorkspaceTab } from "./commandPalette.js"
 
-export type HelpTabId = "catalog" | "flows" | "sources" | "global"
+export type HelpTabId = "catalog" | "target" | "flows" | "sources" | "global"
 
 export interface HelpTabMeta {
   id: HelpTabId
@@ -87,36 +87,45 @@ export const HELP_TABS: readonly HelpTabMeta[] = [
     index: 1,
     label: "1 Catalog",
     shortLabel: "1 Cat",
-    subtitle: "Edit agents, batch-select & switch Inspector tabs",
+    subtitle: "Browse packs, skills, commands, tools, plugins, MCP & agents",
     accent: "blue",
   },
   {
-    id: "flows",
+    id: "target",
     index: 2,
-    label: "2 Flows & Packs",
-    shortLabel: "2 Flows",
+    label: "2 Target & Bridges",
+    shortLabel: "2 Target",
+    subtitle: "OpenCode v2 lifecycle (update/uninstall/restore) & Claude/Codex bridges",
+    accent: "purple",
+  },
+  {
+    id: "flows",
+    index: 3,
+    label: "3 Flows & Packs",
+    shortLabel: "3 Flows",
     subtitle: "Configure IF/OR pack flows, repair models & bridges",
     accent: "amber",
   },
   {
     id: "sources",
-    index: 3,
-    label: "3 Sources",
-    shortLabel: "3 Src",
+    index: 4,
+    label: "4 Sources",
+    shortLabel: "4 Src",
     subtitle: "Connect GitHub repos, sync sources & reconcile target",
     accent: "green",
   },
   {
     id: "global",
-    index: 4,
-    label: "4 Global & Mouse",
-    shortLabel: "4 Global",
+    index: 5,
+    label: "5 Global & Mouse",
+    shortLabel: "5 Global",
     subtitle: "Switch workspaces, split layout, motion & mouse",
     accent: "purple",
   },
 ] as const
 
 export function defaultHelpTabForWorkspace(workspace: WorkspaceTab): HelpTabId {
+  if (workspace === "target") return "target"
   if (workspace === "flows") return "flows"
   if (workspace === "sources") return "sources"
   return "catalog"
@@ -167,9 +176,35 @@ function buildGroupsForTab(
             { id: "cat-install", keyLabel: "E", title: "Preview installation of selected packs or the focused pack", scope: "Target", actionId: "pack-install", disabled: noPacks },
             { id: "cat-mark-pack", keyLabel: "A", title: "Mark or unmark all agents in focused pack", scope: "Batch", actionId: "select-category", disabled: noAgents },
             { id: "cat-mark-model", keyLabel: "S", title: "Mark agents sharing the same model in pack", scope: "Batch", actionId: "select-same-model", disabled: noAgents },
-            { id: "cat-filter", keyLabel: "/", title: "Filter by agent or pack name", scope: "Filter", actionId: "catalog-search", disabled: noPacks },
+            { id: "cat-filter", keyLabel: "/", title: "Filter by pack, agent, skill, command, tool, plugin or MCP", scope: "Filter", actionId: "catalog-search", disabled: noPacks },
+            { id: "cat-asset-type", keyLabel: "F", title: "Cycle asset-type filter (All/Agents/Skills/Cmds/Tools/Plugins/Themes/MCP)", scope: "Filter", actionId: "catalog-asset-filter", disabled: noPacks },
+            { id: "cat-maintain", keyLabel: "W", title: "Open Workspace Maintenance (Validate, Lint, Audit, Fix-names)", scope: "Maintain", actionId: "workspace-maintenance", disabled: noPacks },
             { id: "cat-tabs", keyLabel: "1 – 6", title: "Switch Inspector sidebar tabs (or ◀/▶ when focused)", scope: "Sidebar" },
             { id: "cat-panes", keyLabel: "⇧← / ⇧→", title: "Switch focus between Main panel and Sidebar (also [ / ])", scope: "Panes", actionId: "pane-toggle" },
+          ],
+        },
+      ]
+
+    case "target":
+      return [
+        {
+          title: "OpenCode v2 Target Lifecycle",
+          items: [
+            { id: "tgt-update", keyLabel: "U", title: "Update focused installed pack (or all installed packs)", scope: "OpenCode", actionId: "target-update" },
+            { id: "tgt-uninstall", keyLabel: "X", title: "Uninstall focused root pack from OpenCode target", scope: "OpenCode", actionId: "target-uninstall" },
+            { id: "tgt-reconcile", keyLabel: "R", title: "Reconcile OpenCode target (re-apply locked packs)", scope: "OpenCode", actionId: "target-reconcile" },
+            { id: "tgt-adopt", keyLabel: "Shift+A", title: "Reconcile with --adopt (backup local edits & restore pack)", scope: "OpenCode", actionId: "target-reconcile-adopt" },
+            { id: "tgt-restore", keyLabel: "Shift+R", title: "Restore selected backup snapshot", scope: "Backup", actionId: "target-restore" },
+            { id: "tgt-refresh", keyLabel: "Ctrl+R", title: "Refresh OpenCode target status, drift & backups", scope: "Target", actionId: "target-refresh" },
+          ],
+        },
+        {
+          title: "Claude & Codex Bridges",
+          items: [
+            { id: "tgt-check", keyLabel: "Shift+K", title: "Run bridge compatibility check on focused pack", scope: "Bridge", actionId: "bridge-check", disabled: noPacks },
+            { id: "tgt-claude", keyLabel: "B", title: "Generate Claude Code plugin bridge (agents, skills, cmds, MCP)", scope: "Claude", actionId: "bridge-claude", disabled: noPacks },
+            { id: "tgt-codex", keyLabel: "Shift+B", title: "Generate OpenAI Codex bridge (agents, skills, MCP)", scope: "Codex", actionId: "bridge-codex", disabled: noPacks },
+            { id: "tgt-codex-install", keyLabel: "C", title: "Install pack directly into Codex (--codex)", scope: "Codex", actionId: "codex-install", disabled: noPacks },
           ],
         },
       ]
@@ -192,9 +227,9 @@ function buildGroupsForTab(
             { id: "flw-repair", keyLabel: "V", title: "Batch-repair invalid or missing models", scope: "Pack", actionId: "repair-models", disabled: !ctx.hasInvalidModels },
             { id: "flw-init", keyLabel: "I", title: "Onboard virtual folder or GitHub repo into Contract 1.1 pack", scope: "Virtual", actionId: "pack-init", disabled: !ctx.isVirtualPack },
             { id: "flw-doctor", keyLabel: "D", title: "Open Pack Doctor (validate, auto-fix V2/namespace, bump semver)", scope: "Pack", actionId: "pack-doctor", disabled: Boolean(ctx.isVirtualPack) || readOnly || noPacks },
-            { id: "flw-scaffold", keyLabel: "N", title: "Scaffold compliant agent, skill or command in pack", scope: "Author", actionId: "pack-scaffold", disabled: Boolean(ctx.isVirtualPack) || readOnly || noPacks },
-            { id: "flw-claude", keyLabel: "B", title: "Generate Claude Code plugin bridge", scope: "Bridge", actionId: "bridge-claude", disabled: noAgents },
-            { id: "flw-codex", keyLabel: "Shift+B", title: "Generate OpenAI Codex bridge", scope: "Bridge", actionId: "bridge-codex", disabled: noAgents },
+            { id: "flw-scaffold", keyLabel: "N", title: "Scaffold compliant agent, skill, command, tool, plugin or MCP", scope: "Author", actionId: "pack-scaffold", disabled: Boolean(ctx.isVirtualPack) || readOnly || noPacks },
+            { id: "flw-claude", keyLabel: "B", title: "Generate Claude Code plugin bridge", scope: "Bridge", actionId: "bridge-claude", disabled: noPacks },
+            { id: "flw-codex", keyLabel: "Shift+B", title: "Generate OpenAI Codex bridge", scope: "Bridge", actionId: "bridge-codex", disabled: noPacks },
           ],
         },
       ]
@@ -230,7 +265,8 @@ function buildGroupsForTab(
           title: "Global Navigation & View",
           items: [
             { id: "glb-palette", keyLabel: "Ctrl+K", title: "Open fuzzy Command Palette from anywhere", scope: "Global", actionId: "palette" },
-            { id: "glb-tab", keyLabel: "Tab / ⇧Tab", title: "Cycle browser tabs (Catalog → Flows → Sources)", scope: "Topbar", actionId: "ws-next" },
+            { id: "glb-tab", keyLabel: "Tab", title: "Cycle topbar tabs (Catalog → Target → Flows → Sources)", scope: "Topbar", actionId: "ws-next" },
+            { id: "glb-shifttab", keyLabel: "⇧Tab", title: "Cycle Inspector tabs (Catalog), sub-tabs (Target) or toggle sidebar", scope: "Sidebar" },
             { id: "glb-panes", keyLabel: "⇧← / ⇧→", title: "Switch focus between Main panel and right Sidebar", scope: "Panes", actionId: "pane-toggle" },
             { id: "glb-nav", keyLabel: "↑/↓ j/k", title: "Move focus across rows (or PgUp / PgDn)", scope: "Nav" },
             { id: "glb-tree", keyLabel: "◀/▶ h/l", title: "Collapse/expand folders, or switch Sidebar tabs", scope: "Tree/Tab" },

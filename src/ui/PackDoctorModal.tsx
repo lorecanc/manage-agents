@@ -84,12 +84,19 @@ export function PackDoctorModal({
   const findings = report?.findings ?? []
   const visibleFindings = findings.slice(scrollOffset, scrollOffset + maxFindingRows)
 
+  const slugOrPlaceholder = scaffoldId.trim() || "<id>"
   const previewPath =
     scaffoldKind === "agent"
-      ? `agents/${scaffoldId.trim() || "<id>"}.md`
+      ? `agents/${slugOrPlaceholder}.md`
       : scaffoldKind === "skill"
-        ? `skills/${scaffoldId.trim() || "<id>"}/SKILL.md`
-        : `commands/${scaffoldId.trim() || "<id>"}.md`
+        ? `skills/${slugOrPlaceholder}/SKILL.md`
+        : scaffoldKind === "command"
+          ? `commands/${slugOrPlaceholder}.md`
+          : scaffoldKind === "tool"
+            ? `tools/${manifest?.name ?? "<pack>"}/${slugOrPlaceholder}.mjs`
+            : scaffoldKind === "plugin"
+              ? `plugins/${slugOrPlaceholder}/index.mjs`
+              : `opencode.json → mcp.servers.${slugOrPlaceholder}`
 
   const labelColWidth = Math.min(18, Math.max(13, Math.floor(innerWidth * 0.24)))
   const valueMaxWidth = Math.max(12, innerWidth - labelColWidth - 3)
@@ -235,7 +242,7 @@ export function PackDoctorModal({
                 {scaffoldField === "kind" ? "▎Resource:" : " Resource:"}
               </text>
               <box flexDirection="row" gap={1} height={1}>
-                {(["agent", "skill", "command"] as const).map(k => (
+                {(["agent", "skill", "command", "tool", "plugin", "mcp"] as const).map(k => (
                   <React.Fragment key={k}>
                     {renderPill(scaffoldKind === k, scaffoldField === "kind", k, () => {
                       onFocusScaffoldField("kind")

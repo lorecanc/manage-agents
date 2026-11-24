@@ -115,7 +115,7 @@ test("workspace and modal viewport helpers stay positive and fit inside terminal
   for (const [w, h] of [[80, 24], [100, 26], [120, 34], [140, 42]] as const) {
     const ws = calculateWorkspaceViewports(h, { hasSourcesStatus: false })
     const wsWithStatus = calculateWorkspaceViewports(h, { hasSourcesStatus: true })
-    assert.equal(ws.catalogRows, h - 15)
+    assert.equal(ws.catalogRows, h - 17)
     assert.equal(ws.flowsRows, h - 18)
     assert.equal(ws.sourcesRows, h - 21)
     assert.equal(wsWithStatus.sourcesRows, Math.max(1, h - 23))
@@ -261,6 +261,7 @@ test("TUI lists never clip focused tail items across Catalog, Flows, Models, Del
     await press(renderer, renderOnce, "escape")
 
     // 4. Flows workspace: scroll through all 25 rows (1 pack + 24 agents)
+    await press(renderer, renderOnce, "tab")
     await press(renderer, renderOnce, "tab")
     for (let i = 1; i <= 24; i++) {
       await press(renderer, renderOnce, "down")
@@ -539,6 +540,7 @@ test("Browser topbar tabs, Shift+Left/Right panel switching across workspaces, a
     // 1. Browser topbar has active arch around Catalog and NO numeric prefixes ("1 Catalog", "2 Flows", "3 Sources")
     const catalogFrame = wide.captureCharFrame()
     assert.equal(catalogFrame.includes("│ ● Catalog │"), true)
+    assert.equal(catalogFrame.includes("Target & Bridges"), true)
     assert.equal(catalogFrame.includes("1 Catalog"), false)
     assert.equal(catalogFrame.includes("2 Flows"), false)
     assert.equal(catalogFrame.includes("3 Sources"), false)
@@ -549,7 +551,7 @@ test("Browser topbar tabs, Shift+Left/Right panel switching across workspaces, a
     assert.equal(wide.captureCharFrame().includes("● Inspector · ◀/▶ Tab"), true)
     assert.equal(wide.captureCharFrame().includes("⇧← Main"), true)
     await press(wide.renderer, wide.renderOnce, "escape")
-    assert.equal(wide.captureCharFrame().includes("● Catalog (1 packs · 4 agents)"), true)
+    assert.equal(wide.captureCharFrame().includes("● Catalog (1 packs · 4 assets)"), true)
 
     // 3. Expand pack, focus flow-build, press 5 (Graph tab in sidebar), Shift+Right into sidebar, Down to @flow-eye, Enter jumps to flow-eye!
     await press(wide.renderer, wide.renderOnce, "return", "\r")
@@ -561,7 +563,9 @@ test("Browser topbar tabs, Shift+Left/Right panel switching across workspaces, a
     await press(wide.renderer, wide.renderOnce, "return", "\r")
     assert.equal(wide.captureCharFrame().includes("Row 4/5"), true, "Enter in Graph sidebar jumped Catalog focus to flow-eye")
 
-    // 4. Tab switches to Flows & Graph browser tab; Shift+Right focuses Topology sidebar; Down selects #2 IF opencode/*; Enter opens PackFlowsModal on branch #2!
+    // 4. Tab switches to Target & Bridges, then Tab again switches to Flows & Graph; Shift+Right focuses Topology sidebar; Down selects #2 IF opencode/*; Enter opens PackFlowsModal on branch #2!
+    await press(wide.renderer, wide.renderOnce, "tab", "\t")
+    assert.equal(wide.captureCharFrame().includes("│ ● Target & Bridges │"), true)
     await press(wide.renderer, wide.renderOnce, "tab", "\t")
     const flowsFrame = wide.captureCharFrame()
     assert.equal(flowsFrame.includes("│ ● Flows & Graph │"), true)
@@ -579,9 +583,9 @@ test("Browser topbar tabs, Shift+Left/Right panel switching across workspaces, a
     assert.equal(modalFrame.includes("╰─ @eye"), true)
     await press(wide.renderer, wide.renderOnce, "escape")
 
-    // 5. Tab switches to Sources & Target browser tab; Shift+Right focuses OpenCode Target Status sidebar
+    // 5. Tab switches to Sources browser tab; Shift+Right focuses OpenCode Target Status sidebar
     await press(wide.renderer, wide.renderOnce, "tab", "\t")
-    assert.equal(wide.captureCharFrame().includes("│ ● Sources & Target │"), true)
+    assert.equal(wide.captureCharFrame().includes("│ ● Sources │"), true)
     await press(wide.renderer, wide.renderOnce, "right", "", { shift: true })
     assert.equal(wide.captureCharFrame().includes("● 🎯 OpenCode Target Status"), true)
 
@@ -820,9 +824,10 @@ test("PackFlowsModal MCP toggle writes the target-scope config override and refl
       reducedMotion: true,
       initialModelCatalog: { status: "unverified" as const, models: [] },
     }))
-    await waitUntil(renderOnce, captureCharFrame, frame => frame.includes("mcppack (1)"))
+    await waitUntil(renderOnce, captureCharFrame, frame => frame.includes("mcppack (2)"))
 
-    // Open the pack detail: Tab switches to Flows & Graph; Enter opens PackFlowsModal on the pack row.
+    // Open the pack detail: Tab -> Target & Bridges, Tab -> Flows & Graph; Enter opens PackFlowsModal on the pack row.
+    await press(renderer, renderOnce, "tab", "\t")
     await press(renderer, renderOnce, "tab", "\t")
     await waitUntil(renderOnce, captureCharFrame, frame => frame.includes("Flows & Graph"))
     await press(renderer, renderOnce, "return", "\r")
@@ -898,11 +903,12 @@ test("Catalog selects agent packs and installs their hidden dependencies in one 
   await ui.mockInput.pasteBracketedText(catalog)
   await waitFor("notebook")
   await press("return")
-  await waitFor("Catalog (2 packs · 2 agents)")
+  await waitFor("Catalog (3 packs · 3 assets)")
   assert.equal(loadSources().active, "notebook")
+  assert.ok(ui.captureCharFrame().includes("archive (1)"))
   assert.ok(ui.captureCharFrame().includes("editors (1)"))
-  assert.ok(!ui.captureCharFrame().includes("archive (0)"))
 
+  await press("down")
   await press("space")
   await waitFor("1 pack selected")
   assert.match(ui.captureCharFrame(), /\[X\].*editors \(1\)/)
@@ -924,21 +930,85 @@ test("Catalog selects agent packs and installs their hidden dependencies in one 
   await waitFor("editors (1)")
 
   await press("a", true)
-  await waitFor("2 packs selected")
+  await waitFor("3 packs selected")
+  assert.match(ui.captureCharFrame(), /\[X\].*archive \(1\)/)
   assert.match(ui.captureCharFrame(), /\[X\].*editors \(1\)/)
   assert.match(ui.captureCharFrame(), /\[X\].*writers \(1\)/)
   await press("e")
-  await waitFor("Install 'editors', 'writers'")
+  await waitFor("Install 'archive', 'editors', 'writers'")
   const installed = path.join(process.env.XDG_CONFIG_HOME, "opencode")
   await press("escape")
   assert.equal(fs.existsSync(path.join(installed, "commands", "index.md")), false)
-  await waitFor("2 packs selected")
+  await waitFor("3 packs selected")
   await press("e")
-  await waitFor("Install 'editors', 'writers'")
+  await waitFor("Install 'archive', 'editors', 'writers'")
   await press("y")
   await waitFor("Install Complete")
   assert.match(fs.readFileSync(path.join(installed, "agents", "editor.md"), "utf8"), /Edit\./)
   assert.match(fs.readFileSync(path.join(installed, "agents", "writer.md"), "utf8"), /Write\./)
   assert.match(fs.readFileSync(path.join(installed, "commands", "index.md"), "utf8"), /Index \$ARGUMENTS\./)
-  assert.deepEqual(readDesired(installed).roots, ["notebook/editors", "notebook/writers"])
+  assert.deepEqual(readDesired(installed).roots, ["notebook/archive", "notebook/editors", "notebook/writers"])
+})
+
+test("Tab cycles topbar workspaces while Shift+Tab / backtab cycles right Inspector tabs and Target sub-tabs", async t => {
+  const tmp = tempDir(t, "ma-tab-shifttab-")
+  const prevCfg = process.env.XDG_CONFIG_HOME
+  const prevCache = process.env.XDG_CACHE_HOME
+  process.env.XDG_CONFIG_HOME = path.join(tmp, "cfg")
+  process.env.XDG_CACHE_HOME = path.join(tmp, "cache")
+  t.after(() => {
+    if (prevCfg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = prevCfg
+    if (prevCache === undefined) delete process.env.XDG_CACHE_HOME; else process.env.XDG_CACHE_HOME = prevCache
+  })
+
+  const dir = path.join(tmp, "packs", "demo")
+  fs.mkdirSync(path.join(dir, "agents"), { recursive: true })
+  fs.writeFileSync(path.join(dir, "opencode-pack.json"), JSON.stringify({ contract: "1.1", name: "demo", version: "1.0.0", description: "Demo" }))
+  fs.writeFileSync(path.join(dir, "agents", "demo-worker.md"), "---\ndescription: Worker\nmodel: openai/gpt-4o\nmode: primary\n---\n\nPrompt body marker.\n")
+
+  const ui = await createTestRenderer({ width: 126, height: 32 })
+  t.after(() => { try { ui.renderer.destroy() } catch {} })
+  createRoot(ui.renderer).render(React.createElement(App, {
+    workspaceRoot: tmp,
+    listShare: 0.62,
+    reducedMotion: true,
+    initialModelCatalog: { status: "verified" as const, models: ["openai/gpt-4o"], variants: {} },
+  }))
+  const emit = async (name: string, opts: any = {}) => {
+    ui.renderer.keyInput.emit("keypress", { name, sequence: "", ctrl: false, meta: false, shift: false, ...opts })
+    await new Promise(r => setTimeout(r, 20))
+    await ui.renderOnce()
+  }
+  for (let i = 0; i < 25; i++) {
+    await new Promise(r => setTimeout(r, 20))
+    await ui.renderOnce()
+    if (ui.captureCharFrame().includes("demo (1)")) break
+  }
+
+  // Expand pack and focus agent
+  await emit("return")
+  await emit("down")
+  assert.equal(ui.captureCharFrame().includes("1 Info"), true)
+
+  // Shift+Tab cycles Inspector tab from Info -> Prompt (shows prompt body)
+  await emit("tab", { shift: true })
+  assert.equal(ui.captureCharFrame().includes("Prompt body marker."), true)
+
+  // backtab (ANSI \x1b[Z) cycles Inspector tab from Prompt -> Naming
+  await emit("backtab")
+  assert.equal(ui.captureCharFrame().includes("Filename style"), true)
+
+  // Plain Tab advances topbar to Target & Bridges; Shift+Tab cycles Target sub-tabs (Installed -> Bridges)
+  await emit("tab")
+  assert.equal(ui.captureCharFrame().includes("│ ● Target & Bridges │"), true)
+  await emit("tab", { shift: true })
+  assert.equal(ui.captureCharFrame().includes("📦 demo"), true)
+
+  // Plain Tab advances Target -> Flows -> Sources -> Catalog
+  await emit("tab")
+  assert.equal(ui.captureCharFrame().includes("│ ● Flows & Graph │"), true)
+  await emit("tab")
+  assert.equal(ui.captureCharFrame().includes("│ ● Sources │"), true)
+  await emit("tab")
+  assert.equal(ui.captureCharFrame().includes("│ ● Catalog │"), true)
 })

@@ -13,17 +13,20 @@ import {
 
 test("defaultHelpTabForWorkspace maps active workspace directly to matching help tab", () => {
   assert.equal(defaultHelpTabForWorkspace("catalog"), "catalog")
+  assert.equal(defaultHelpTabForWorkspace("target"), "target")
   assert.equal(defaultHelpTabForWorkspace("flows"), "flows")
   assert.equal(defaultHelpTabForWorkspace("sources"), "sources")
 })
 
-test("cycleHelpTab and helpTabByNumber navigate across all four guide tabs", () => {
-  assert.equal(HELP_TABS.length, 4)
-  assert.equal(cycleHelpTab("catalog", 1), "flows")
+test("cycleHelpTab and helpTabByNumber navigate across all five guide tabs", () => {
+  assert.equal(HELP_TABS.length, 5)
+  assert.equal(cycleHelpTab("catalog", 1), "target")
+  assert.equal(cycleHelpTab("target", 1), "flows")
   assert.equal(cycleHelpTab("catalog", -1), "global")
   assert.equal(cycleHelpTab("global", 1), "catalog")
   assert.equal(helpTabByNumber(1), "catalog")
-  assert.equal(helpTabByNumber(3), "sources")
+  assert.equal(helpTabByNumber(2), "target")
+  assert.equal(helpTabByNumber(4), "sources")
   assert.equal(helpTabByNumber(9), null)
 })
 

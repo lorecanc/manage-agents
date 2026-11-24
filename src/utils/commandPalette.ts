@@ -1,6 +1,6 @@
 import { terminalSafeText } from "./terminalText.js"
 
-export type WorkspaceTab = "catalog" | "flows" | "sources"
+export type WorkspaceTab = "catalog" | "target" | "flows" | "sources"
 
 export interface PaletteCommand {
   id: string
@@ -21,7 +21,7 @@ export interface ShortcutChip {
 
 export interface ShortcutContext {
   workspaceTab: WorkspaceTab
-  itemType?: "file" | "folder" | null
+  itemType?: "file" | "folder" | "section" | "asset" | null
   selectedCount: number
   isVirtualPack?: boolean
   isReadOnlyGitSource?: boolean
@@ -88,6 +88,23 @@ export function buildContextualShortcuts(ctx: ShortcutContext): ShortcutChip[] {
       }
     : null
 
+  if (ctx.workspaceTab === "target") {
+    const chips: ShortcutChip[] = [
+      { key: "U", label: "Update", actionId: "target-update", accent: true },
+      { key: "X", label: "Uninstall", actionId: "target-uninstall" },
+      { key: "R", label: "Reconcile", actionId: "target-reconcile", accent: true },
+      { key: "Shift+R", label: "Restore", actionId: "target-restore" },
+      { key: "Shift+K", label: "Bridge Check", actionId: "bridge-check" },
+      { key: "B", label: "Claude", actionId: "bridge-claude" },
+      { key: "Shift+B", label: "Codex", actionId: "bridge-codex" },
+      { key: "C", label: "Install Codex", actionId: "codex-install" },
+    ]
+    if (paneChip) chips.push(paneChip)
+    chips.push({ key: "Ctrl+K", label: "Palette", actionId: "palette", accent: true })
+    chips.push({ key: "?", label: "Help", actionId: "help" })
+    return chips
+  }
+
   if (ctx.workspaceTab === "sources") {
     const chips: ShortcutChip[] = [
       { key: "Enter", label: "Open Catalog", actionId: "source-activate", accent: true },
@@ -117,14 +134,16 @@ export function buildContextualShortcuts(ctx: ShortcutContext): ShortcutChip[] {
     return chips
   }
 
-  if (ctx.itemType === "folder") {
+  if (ctx.itemType === "folder" || ctx.itemType === "section" || ctx.itemType === "asset") {
     const chips: ShortcutChip[] = [
-      { key: "Enter", label: "Toggle Pack", actionId: "folder-toggle" },
+      { key: "Enter", label: ctx.itemType === "asset" ? "Inspect" : "Toggle", actionId: "folder-toggle" },
       { key: "Space", label: "Select Pack", actionId: "select-toggle" },
-      { key: "E", label: "Install / Update", actionId: "pack-install", accent: true },
-      { key: "M", label: "IF/OR Flows", actionId: "pack-flows", accent: true },
-      { key: "A", label: "Mark Agents", actionId: "select-category" },
-      { key: "B", label: "Claude Bridge", actionId: "bridge-claude" },
+      { key: "E", label: "Install", actionId: "pack-install", accent: true },
+      { key: "M", label: "IF/OR Flows", actionId: "pack-flows" },
+      { key: "F", label: "Filter Type", actionId: "catalog-asset-filter" },
+      { key: "Shift+K", label: "Bridge Check", actionId: "bridge-check" },
+      { key: "B", label: "Claude", actionId: "bridge-claude" },
+      { key: "W", label: "Maintain", actionId: "workspace-maintenance" },
     ]
     if (ctx.isVirtualPack) {
       chips.push({

@@ -65,6 +65,24 @@ test("buildContextualShortcuts adapts actions to workspace tab and focused item 
   assert.ok(agentShortcuts.some(chip => chip.label === "Mark (2)"))
   assert.ok(agentShortcuts.some(chip => chip.actionId === "repair-models"))
 
+  const targetShortcuts = buildContextualShortcuts({
+    workspaceTab: "target",
+    selectedCount: 0,
+  })
+  assert.ok(targetShortcuts.some(chip => chip.actionId === "target-update"))
+  assert.ok(targetShortcuts.some(chip => chip.actionId === "target-uninstall"))
+  assert.ok(targetShortcuts.some(chip => chip.actionId === "target-restore"))
+  assert.ok(targetShortcuts.some(chip => chip.actionId === "bridge-check"))
+  assert.ok(targetShortcuts.some(chip => chip.actionId === "codex-install"))
+
+  const assetShortcuts = buildContextualShortcuts({
+    workspaceTab: "catalog",
+    itemType: "asset",
+    selectedCount: 0,
+  })
+  assert.ok(assetShortcuts.some(chip => chip.actionId === "catalog-asset-filter"))
+  assert.ok(assetShortcuts.some(chip => chip.actionId === "workspace-maintenance"))
+
   const sourcesShortcuts = buildContextualShortcuts({
     workspaceTab: "sources",
     selectedCount: 0,
