@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "repository": "lorecanc/manage-agents",
+  "algorithm": "ed25519",
+  "publicKeys": [
+    {
+      "keyId": "ed25519-f5f4bf219434",
+      "publicKey": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAnHF35osJ6zJIQOavBBHvqoeYmJv23q6DV8h/eMv+cpM=\n-----END PUBLIC KEY-----\n",
+      "createdAt": "2026-11-25T12:39:45.847Z"
+    }
+  ]
+}

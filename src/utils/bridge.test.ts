@@ -1052,7 +1052,7 @@ test("scopes sibling command references to the plugin", () => {
 test("bridge rejects command skill IDs containing control characters", (t) => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "claude-command-control-"))
   t.after(() => fs.rmSync(workspace, { recursive: true, force: true }))
-  const name = "pipeline-\u0001unsafe"
+  const name = "pipeline-\u007funsafe"
   fs.mkdirSync(path.join(workspace, "commands"), { recursive: true })
   fs.writeFileSync(path.join(workspace, "commands", `${name}.md`), "---\ndescription: Unsafe ID\n---\nFix it.\n")
 

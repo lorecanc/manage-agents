@@ -43,7 +43,7 @@ test("T1 — movePathWithRetry restores original target when fallback copy parti
 test("T2 — validatePack treats oversized opencode.json and control characters in paths/IDs as errors", (t) => {
   const root = tempDir(t, "wave1-pack-validation-")
   const packDir = path.join(root, "pack")
-  const badAgentId = "bad\u0001agent"
+  const badAgentId = "bad\u007fagent"
   const badServerId = "local\u0001cmd"
   writePack(packDir, {
     [`agents/${badAgentId}.md`]: "---\ndescription: Helper\nmode: subagent\n---\nHelp.\n",

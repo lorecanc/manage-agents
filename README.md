@@ -73,15 +73,19 @@ Run with `manage-agents` (if linked), `./manage-agents.mjs`, `node manage-agents
 
 **Self-bootstrapping launcher:** When launched from a source checkout, `manage-agents.mjs` verifies `node_modules` against `package.json` (installing with `--ignore-scripts` if out of sync unless `MANAGE_AGENTS_SKIP_AUTO_INSTALL=1` is set) and automatically rebuilds `dist/index.js` via `esbuild` whenever `src/` or `package.json` is newer.
 
-### Self-Update from GitHub Releases
+### Install and update from GitHub Releases
 
-Tagged `v*` GitHub Releases ship prebuilt `manage-agents-<tag>.tar.gz` bundles (`dist/` included, no build step needed):
+Download `manage-agents-<tag>.tar.gz` from the [latest GitHub Release](https://github.com/lorecanc/manage-agents/releases/latest), rather than GitHub's automatic source archive. Extract it into a writable directory and run `node manage-agents.mjs` or `bun manage-agents.mjs` from the extracted directory. The archive includes the prebuilt `dist/` and the trusted release signing key. The launcher installs JavaScript dependencies on first run; no build step is needed.
+
+In the TUI, press `Shift+U` to check for an update, then `Enter` to install it when available. Restart `manage-agents` to load the new version. From the command line:
 
 ```bash
 manage-agents version                # inspect version, channel, and bundle hash (--json supported)
 manage-agents self-update --check    # check for newer v* releases without modifying disk
-manage-agents self-update            # verify SHA-256 + bundleHash (+ Ed25519 sig), update, and reconcile router
+manage-agents self-update            # verify the Ed25519 signature and archive, update, and reconcile the router
 ```
+
+If you installed a copy before the trusted key was added, update your Git checkout or copy the official [`release-signing.json`](https://github.com/lorecanc/manage-agents/blob/main/release-signing.json) next to `manage-agents.mjs` before using self-update.
 
 ---
 

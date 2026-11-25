@@ -42,6 +42,7 @@
   },
   "files": [
     "manage-agents.mjs",
+    "release-signing.json",
     "dist",
     "assets/plugin-icon.png",
     "contract",

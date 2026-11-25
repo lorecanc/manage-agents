@@ -313,7 +313,7 @@ if (isDirectEntrypoint()) {
 
   if (process.env.MANAGE_AGENTS_SKIP_AUTO_INSTALL !== "1" && (hasSources || existsSync(join(scriptDir, "package-lock.json"))) && !dependenciesMatch(scriptDir, hasSources && needsBuild)) {
     const installCommand = process.versions.bun
-      ? (existsSync(join(scriptDir, "bun.lock")) ? "bun install --frozen-lockfile --ignore-scripts" : "bun install --ignore-scripts")
+      ? (existsSync(join(scriptDir, "bun.lock")) ? "bun install --frozen-lockfile --ignore-scripts" : "bun install --no-save --ignore-scripts")
       : (existsSync(join(scriptDir, "package-lock.json")) ? "npm ci --ignore-scripts --no-audit --no-fund" : "npm install --ignore-scripts --no-audit --no-fund")
     const installResult = spawnSync(installCommand, { cwd: scriptDir, shell: true, stdio: ["inherit", 2, 2], windowsHide: true })
     if (installResult.status !== 0) process.exit(installResult.status ?? 1)

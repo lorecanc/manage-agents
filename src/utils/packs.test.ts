@@ -172,10 +172,10 @@ test("oversized manifests and pack configs are errors", (t) => {
 
 test("control characters are rejected in resource paths and config identifiers or executable strings", (t) => {
   const paths = validatePack(makePack(t, {
-    "agents/tainted\u0001.md": "agent",
-    "commands/tainted\u001b.md": "command",
+    "agents/tainted\u007f.md": "agent",
+    "commands/tainted\u0085.md": "command",
   }))
-  assert.deepEqual(paths.issues.filter(issue => issue.code === "invalid-path").map(issue => `${issue.level} ${issue.path}`).sort(), ["error agents/tainted\u0001.md", "error commands/tainted\u001b.md"])
+  assert.deepEqual(paths.issues.filter(issue => issue.code === "invalid-path").map(issue => `${issue.level} ${issue.path}`).sort(), ["error agents/tainted\u007f.md", "error commands/tainted\u0085.md"])
   assert.deepEqual(paths.ids.agents, [])
   assert.deepEqual(paths.ids.commands, [])
   assert.deepEqual(paths.agents, [])

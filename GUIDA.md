@@ -24,6 +24,10 @@ rispettare il contratto.
 Serve Node.js `>=26.4.0` oppure Bun `>=1.3.0`. OpenTUI usa FFI, quindi con Node il launcher si riavvia da solo con
 `--experimental-ffi`.
 
+Per installare una versione già compilata, scarica `manage-agents-<tag>.tar.gz` dall'[ultima release su GitHub](https://github.com/lorecanc/manage-agents/releases/latest), estrailo in una cartella scrivibile e avvia `node manage-agents.mjs` o `bun manage-agents.mjs` da quella cartella. Il launcher installa le dipendenze al primo avvio; non serve compilare.
+
+Per installare dal sorgente:
+
 ```bash
 git clone https://github.com/lorecanc/manage-agents.git manage-agents && cd manage-agents
 npm ci            # oppure: bun install
@@ -201,10 +205,11 @@ manage-agents self-update --yes
 ```
 
 `self-update` aggiorna `manage-agents` stesso. Il comando interroga l'ultima GitHub Release pubblicata dai tag `v*` del
-repository del motore (o tramite l'alias `manage-agents update --self`), verifica SHA-256, manifest interno ed eventuale
-firma `Ed25519` configurata in `release-signing.json`, sostituisce in modo transazionale il pacchetto e riallinea il
-plugin router nel target OpenCode. Nella TUI la stessa funzione è accessibile con `Shift-U` o dalla Command Palette
-(`Ctrl-K`).
+repository del motore (o tramite l'alias `manage-agents update --self`), verifica la firma Ed25519, lo SHA-256 e il
+manifest interno, sostituisce il pacchetto in modo transazionale e riallinea il plugin router nel target OpenCode.
+Nella TUI premi `Shift+U` o apri la Command Palette (`Ctrl+K`), conferma con Invio e riavvia dopo l'installazione.
+Se la tua copia precede la prima release firmata, aggiorna il checkout Git oppure copia il file ufficiale
+[`release-signing.json`](https://github.com/lorecanc/manage-agents/blob/main/release-signing.json) accanto a `manage-agents.mjs`.
 
 ### Disinstallare
 

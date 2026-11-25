@@ -34,6 +34,7 @@ jobs:
     needs: [test]
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    environment: release
     permissions:
       contents: write
     steps:
@@ -57,12 +58,10 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run build
-      - name: Package release archive and metadata
+      - name: Package release archive
         env:
           TAG_NAME: ${{ github.ref_name }}
           TARGET_SHA: ${{ github.sha }}
-          REPO_SLUG: ${{ github.repository }}
-          RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.RELEASE_SIGNING_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           pkg_name="manage-agents-${TAG_NAME}"
@@ -70,8 +69,10 @@ jobs:
           stage_dir="${stage_root}/${pkg_name}"
           out_dir="artifacts/release-assets"
           archive_path="${out_dir}/${pkg_name}.tar.gz"
+          test "$TAG_NAME" = "v$(node -p 'require("./package.json").version')"
           rm -rf "$stage_root" "$out_dir" && mkdir -p "$stage_dir" "$out_dir"
           git archive --format=tar HEAD | tar -xf - -C "$stage_dir"
+          test -s "$stage_dir/release-signing.json"
           cp -R dist "$stage_dir/dist"
           node manage-agents.mjs --no-auto-commit version --write-manifest \
             --ref-type tag \
@@ -81,10 +82,39 @@ jobs:
           touch "$stage_dir/dist/index.js"
           tar -czf "$archive_path" -C "$stage_root" "$pkg_name"
           rm -rf "$stage_root"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - name: Smoke test release archive with Node and Bun
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          pkg_name="manage-agents-${TAG_NAME}"
+          smoke_root="$(mktemp -d)"
+          trap 'rm -rf "$smoke_root"' EXIT
+          for runtime in node bun; do
+            mkdir "$smoke_root/$runtime"
+            tar -xzf "artifacts/release-assets/${pkg_name}.tar.gz" -C "$smoke_root/$runtime"
+            "$runtime" "$smoke_root/$runtime/$pkg_name/manage-agents.mjs" version --json > "$smoke_root/$runtime/version.json"
+            node -e '
+              const info = require(process.argv[1]);
+              if (info.channel !== "release" || info.dirty || info.version !== process.env.TAG_NAME) {
+                throw new Error(`Expected clean release ${process.env.TAG_NAME}, got ${info.displayVersion}`);
+              }
+            ' "$smoke_root/$runtime/version.json"
+          done
+      - name: Sign release metadata
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          TARGET_SHA: ${{ github.sha }}
+          REPO_SLUG: ${{ github.repository }}
+          RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.RELEASE_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_SIGNING_PRIVATE_KEY"
           node manage-agents.mjs --no-auto-commit release sign \
             --tag "$TAG_NAME" \
             --sha "$TARGET_SHA" \
-            --assets-dir "$out_dir" \
+            --assets-dir artifacts/release-assets \
             --repo "$REPO_SLUG"
       - name: Publish GitHub Release
         env:
@@ -95,8 +125,6 @@ jobs:
           assets=(
             "artifacts/release-assets/manage-agents-${TAG_NAME}.tar.gz"
             "artifacts/release-assets/release-metadata.json"
+            "artifacts/release-assets/release-metadata.json.sig"
           )
-          if [[ -f "artifacts/release-assets/release-metadata.json.sig" ]]; then
-            assets+=("artifacts/release-assets/release-metadata.json.sig")
-          fi
           gh release create "$TAG_NAME" "${assets[@]}" --verify-tag --generate-notes

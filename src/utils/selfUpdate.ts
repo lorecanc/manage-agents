@@ -1109,7 +1109,8 @@ function fsyncPathTree(target: string): void {
     for (const name of fs.readdirSync(target)) fsyncPathTree(path.join(target, name))
   }
   if (process.platform === "win32" && stat.isDirectory()) return
-  const fd = fs.openSync(target, "r")
+  // Windows' FlushFileBuffers requires a write-capable handle, without truncating the file.
+  const fd = fs.openSync(target, process.platform === "win32" ? fs.constants.O_WRONLY : fs.constants.O_RDONLY)
   try {
     fs.fsyncSync(fd)
   } finally {
@@ -1266,7 +1267,7 @@ function runDependencyInstallSync(engineRoot: string, env: NodeJS.ProcessEnv): v
   const args = isBun
     ? fs.existsSync(path.join(engineRoot, "bun.lock"))
       ? ["install", "--frozen-lockfile", "--ignore-scripts"]
-      : ["install", "--ignore-scripts"]
+      : ["install", "--no-save", "--ignore-scripts"]
     : fs.existsSync(path.join(engineRoot, "package-lock.json"))
       ? ["ci", "--ignore-scripts", "--no-audit", "--no-fund"]
       : ["install", "--ignore-scripts", "--no-audit", "--no-fund"]

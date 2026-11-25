@@ -48,13 +48,14 @@ function setup(t: test.TestContext, overrides: { flow?: Record<string, string>; 
 /** Every file under dir (state and transaction dirs excluded) with its sha256; absolute target paths normalized. */
 function snapshot(dir: string, ignoreState = true): Record<string, string> {
   const out: Record<string, string> = {}
+  const jsonDir = JSON.stringify(dir).slice(1, -1)
   const visit = (current: string) => {
     for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
       const full = path.join(current, entry.name)
       const rel = path.relative(dir, full).split(path.sep).join("/")
       if (ignoreState && rel === ".manage-agents") continue
       if (entry.isDirectory()) visit(full)
-      else out[rel] = crypto.createHash("sha256").update(fs.readFileSync(full, "utf8").split(dir).join("<target>")).digest("hex")
+      else out[rel] = crypto.createHash("sha256").update(fs.readFileSync(full, "utf8").replaceAll(jsonDir, "<target>").replaceAll(dir, "<target>")).digest("hex")
     }
   }
   visit(dir)
@@ -150,7 +151,7 @@ test("mixed JSONC writes keep personal MCP comments attached", async (t) => {
   const next = parseJsonc(text) as Record<string, any>
   assert.deepEqual(next.mcp.servers, { db: personalDb, personal: personalOther })
   assert.deepEqual(next.plugins, ["my-personal-plugin", { package: "./plugins/guard", options: { strict: true } }])
-  assert.ok(next.instructions.some((instruction: string) => instruction.endsWith("instructions/base.md")))
+  assert.ok(next.instructions.includes(path.join(target, "instructions", "base.md")))
   assert.ok(fs.existsSync(path.join(target, "agents/flow-build.md")))
   assert.match(text, /"db"\s*:\s*\{[^{}]*\}\s*,\s*\/\/ keep my personal db/)
 })
@@ -343,7 +344,7 @@ test("install preserves an unmanaged same-name MCP server", async (t) => {
   assert.deepEqual(config(target).mcp.servers, { db: personalDb, personal: personalOther })
   assert.ok(fs.existsSync(path.join(target, "agents/flow-build.md")))
   assert.ok(config(target).plugins.some((plugin: unknown) => typeof plugin === "object" && plugin !== null && (plugin as { package?: string }).package === "./plugins/guard"))
-  assert.ok(config(target).instructions.some((instruction: string) => instruction.endsWith("instructions/base.md")))
+  assert.ok(config(target).instructions.includes(path.join(target, "instructions", "base.md")))
   assert.equal(readInstalled(target).config.base?.objects?.["mcp.servers"]?.db, undefined, "the colliding entry remains unmanaged")
   assert.ok(result.plan!.warnings.some(warning => /opencode\.json/.test(warning) && /db/.test(warning) && /base/.test(warning)))
 
@@ -843,6 +844,7 @@ test("git sources: reconcile installs the locked revision after a pull; update m
   const repo = path.join(base, "repo")
   fs.mkdirSync(repo)
   gitIn(repo, "init", "--quiet", "--initial-branch=main")
+  fs.writeFileSync(path.join(repo, ".gitattributes"), "*.md text eol=lf\n")
   writePack(path.join(repo, "packs", "notes"), { "agents/notes.md": "v1\n" }, { name: "notes", version: "1.0.0" })
   gitIn(repo, "add", "-A")
   gitIn(repo, "commit", "--quiet", "-m", "v1")

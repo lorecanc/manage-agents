@@ -1112,7 +1112,7 @@ test("resource discovery lists the pack's skills, tool families and tools, and M
     ["tool", "notes", false]
   ])
   assert.equal(resources.tools.find(tool => tool.name === "slide_preview")!.familyKey, "slide_*")
-  assert.equal(resources.tools.find(tool => tool.name === "slide_build")!.relativePath, path.join("tools", "slides", "slide_build.ts"))
+  assert.equal(resources.tools.find(tool => tool.name === "slide_build")!.relativePath, "tools/slides/slide_build.ts")
 
   const configuredMcp = resources.mcpServers.find(resource => resource.serverKey === "chrome-devtools")!
   assert.equal(configuredMcp.configuredInOpencode, true)
@@ -1168,7 +1168,7 @@ test("resource discovery sees the skills, tools and MCP servers of required pack
 
   assert.deepEqual(resources.skills.filter(skill => skill.kind === "skill").map(skill => skill.name), ["app-skill", "base-skill", "mid-skill"])
   assert.deepEqual(resources.tools.map(tool => tool.name), ["base_*", "base_tool", "mid_*", "mid_tool"])
-  assert.equal(resources.tools.find(tool => tool.name === "base_tool")!.relativePath, path.join("tools", "base", "base_tool.ts"))
+  assert.equal(resources.tools.find(tool => tool.name === "base_tool")!.relativePath, "tools/base/base_tool.ts")
   assert.deepEqual(resources.mcpServers.map(server => [server.serverKey, server.recommendedInRepo]), [["base-server", true]])
   assert.equal(resources.opencodeRawContent, null)
 })

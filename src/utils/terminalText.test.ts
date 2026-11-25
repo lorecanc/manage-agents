@@ -135,7 +135,8 @@ test("bridge confirms untrusted executable content before writing and sanitizes 
   const root = tempDir(t, "terminal-bridge-trust-")
   const env = isolatedCliEnv(root)
   const workspace = path.join(root, "workspace")
-  const outputDir = path.join(workspace, "generated\u001b[31m-plugin")
+  const control = process.platform === "win32" ? "\u007f" : "\u001b[31m"
+  const outputDir = path.join(workspace, `generated${control}-plugin`)
   writePack(path.join(workspace, "packs", "demo"), {
     "agents/demo-agent.md": "---\ndescription: Demo agent\nmode: subagent\n---\nHelp with the demo.\n",
     "opencode.json": JSON.stringify({ mcp: { servers: { local_cmd: { type: "local", command: ["echo", "hi"] } } } }),
@@ -150,7 +151,8 @@ test("bridge confirms untrusted executable content before writing and sanitizes 
   const accepted = runCli([...args, "--yes"], env)
   assert.equal(accepted.status, 0, `--yes should permit bridge generation; stdout=${accepted.stdout}; stderr=${accepted.stderr}`)
   assert.equal(fs.existsSync(outputDir), true)
-  assert.equal(accepted.stdout.includes("\u001b"), false, "bridge output must not contain terminal escape sequences")
+  assert.match(accepted.stdout, /generated-plugin/)
+  assert.equal(accepted.stdout.includes(control[0]), false, "bridge output must not contain the terminal control character")
 })
 
 test("bridge does not trust an unrelated workspace from --source", (t) => {
