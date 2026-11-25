@@ -13,6 +13,7 @@ import { discoverAllPacks, findSource, lastFetchedRevision, pullSource, revision
 import { own, setOwn } from "./values.js"
 import { buildRuntimeRouting, CONFIG_SECTIONS, effectiveOverrides, loadOverrideSettings, loadRoutingSettings, patchFrontmatter, patchedConfigSections, resolveEffectiveCallers, routesOfEntry, type PackOverrides } from "./userSettings.js"
 import { validateVirtualPack, VIRTUAL_PACK_VERSION, virtualManifestHash } from "./virtualPacks.js"
+import { jsoncArrayPath, rewriteJsoncPreservingComments } from "./targetJsonc.js"
 
 export interface DesiredState {
   desiredVersion: 1
@@ -54,6 +55,12 @@ export interface AdoptedConfigEntry {
   value: unknown
 }
 
+export interface SkippedMcpServer {
+  configFile: string
+  key: string
+  pack: string
+}
+
 export interface ReconcilePlan {
   target: string
   packs: string[]
@@ -63,6 +70,8 @@ export interface ReconcilePlan {
   released: string[]
   conflicts: string[]
   warnings: string[]
+  /** Unmanaged MCP server names preserved instead of replaced by a pack definition. */
+  skippedMcpServers: SkippedMcpServer[]
   /** Unmanaged or locally changed content replaced by this plan; backed up before the write. */
   adopted: { files: string[]; config: AdoptedConfigEntry[] }
   configFile: string
@@ -299,7 +308,7 @@ function engineRuntimeDir(): string {
 export function planReconcile(target: string, lock: PackLock, registry: SourceRegistry, options: PlanOptions = {}): ReconcilePlan {
   const previous = readInstalled(target)
   const configFile = Boolean(fs.lstatSync(assertSafeTargetSubpath(target, "opencode.jsonc", { allowLeafSymlink: true }), { throwIfNoEntry: false })) ? "opencode.jsonc" : "opencode.json"
-  const plan: ReconcilePlan = { target, packs: [], writes: [], deletes: [], released: [], conflicts: [], warnings: [], adopted: { files: [], config: [] }, configFile, configText: null, expected: {}, installed: previous }
+  const plan: ReconcilePlan = { target, packs: [], writes: [], deletes: [], released: [], conflicts: [], warnings: [], skippedMcpServers: [], adopted: { files: [], config: [] }, configFile, configText: null, expected: {}, installed: previous }
   const { packs, problems } = loadLockedPacks(lock, registry, options.env)
   plan.packs = packs.map(pack => pack.name)
   plan.conflicts.push(...problems)
@@ -443,7 +452,8 @@ function planConfig(target: string, configFile: string, packs: LoadedPack[], pre
     plan.conflicts.push(`${configFile} is a symlink; replace it with a regular file (or install into the directory it points to with --target)`)
     return unchangedState
   }
-  const text = fs.existsSync(full) ? fs.readFileSync(full, "utf8") : null
+  const originalBytes = fs.existsSync(full) ? fs.readFileSync(full) : null
+  const text = originalBytes?.toString("utf8") ?? null
   let current: Record<string, any>
   try {
     const parsed = text === null ? { $schema: SCHEMA } : parseJsonc(text)
@@ -455,6 +465,7 @@ function planConfig(target: string, configFile: string, packs: LoadedPack[], pre
   }
 
   const unmanaged: Record<string, any> = structuredClone(current)
+  const unmanagedArrayOrigins = Object.fromEntries(ARRAY_SECTIONS.map(section => [section, Array.isArray(unmanaged[section]) ? (unmanaged[section] as unknown[]).map((_, index) => index) : []])) as Record<typeof ARRAY_SECTIONS[number], number[]>
   const changedLocally = new Set<string>()
   const emptiedSections = new Set<string>()
   for (const contribution of Object.values(previous.config)) {
@@ -463,7 +474,10 @@ function planConfig(target: string, configFile: string, packs: LoadedPack[], pre
       if (!Array.isArray(list)) continue
       for (const entry of contribution[section] ?? []) {
         const index = list.findIndex(item => isDeepStrictEqual(item, entry))
-        if (index !== -1) list.splice(index, 1)
+        if (index !== -1) {
+          list.splice(index, 1)
+          unmanagedArrayOrigins[section].splice(index, 1)
+        }
       }
     }
     for (const [section, values] of Object.entries(contribution.objects ?? {})) {
@@ -501,6 +515,11 @@ function planConfig(target: string, configFile: string, packs: LoadedPack[], pre
       return "managed"
     }
     if (identical) return "kept"
+    if (section === "mcp.servers" && !changedLocally.has(id)) {
+      plan.skippedMcpServers.push({ configFile, key, pack })
+      plan.warnings.push(`${configFile}: unmanaged mcp.servers ${JSON.stringify(key)} is preserved; skipping pack ${JSON.stringify(pack)}'s definition. Remove it from the config to use the pack's definition on a later reconcile.`)
+      return "skip"
+    }
     plan.conflicts.push(changedLocally.has(id)
       ? `${configFile}: ${section} "${key}" was changed locally; rerun with --adopt to back it up and replace it`
       : `${configFile}: ${section} "${key}" exists and is not managed by manage-agents; rerun with --adopt to back it up and replace it`)
@@ -519,7 +538,10 @@ function planConfig(target: string, configFile: string, packs: LoadedPack[], pre
         if (section === "plugins" && implicitPlugins.has(key) && explicitPlugins.has(key)) continue
         const list: unknown[] = Array.isArray(unmanaged[section]) ? unmanaged[section] : []
         const index = list.findIndex(item => arrayKey(section, item) === key)
-        if (claim(section, key, entry, name, { present: index !== -1, value: list[index], remove: () => list.splice(index, 1), legacy: section === "plugins" && legacyPlugins.has(key) }) !== "managed") continue
+        if (claim(section, key, entry, name, { present: index !== -1, value: list[index], remove: () => {
+          list.splice(index, 1)
+          unmanagedArrayOrigins[section].splice(index, 1)
+        }, legacy: section === "plugins" && legacyPlugins.has(key) }) !== "managed") continue
         managedArrays[section].push(entry)
         ;(recorded[section] as unknown[]).push(entry)
       }
@@ -536,8 +558,10 @@ function planConfig(target: string, configFile: string, packs: LoadedPack[], pre
   }
 
   const next: Record<string, any> = structuredClone(unmanaged)
+  const arrayOrigins = new Map<string, readonly (number | null)[]>()
   for (const section of ARRAY_SECTIONS) {
     const merged = [...(Array.isArray(next[section]) ? next[section] : []), ...managedArrays[section]]
+    arrayOrigins.set(jsoncArrayPath([section]), [...unmanagedArrayOrigins[section], ...managedArrays[section].map(() => null)])
     if (merged.length) next[section] = merged
     else delete next[section]
   }
@@ -566,12 +590,18 @@ function planConfig(target: string, configFile: string, packs: LoadedPack[], pre
 
   const unchanged = text === null ? !packs.length : isDeepStrictEqual(next, current)
   if (!unchanged) {
-    plan.configText = `${JSON.stringify(next, null, 2)}\n`
-    plan.expected[configFile] = text === null ? null : hashFile(full)
-    if (text !== null && !isPlainJson(text)) {
-      plan.warnings.push(`${configFile} has comments or trailing commas, which are not preserved; the previous file is saved in the backup`)
-      plan.adopted.files.push(configFile)
-    }
+    const preserveSource = text !== null && (configFile === "opencode.jsonc" || !isPlainJson(text))
+    if (preserveSource) {
+      try {
+        const rewritten = rewriteJsoncPreservingComments(text, current, next, arrayOrigins)
+        if (!isDeepStrictEqual(parseJsonc(rewritten), next)) throw new Error("semantic mismatch")
+        plan.configText = rewritten
+      } catch {
+        plan.conflicts.push(`${configFile}: comments could not be preserved safely; resolve the JSONC conflict and retry`)
+        return unchangedState
+      }
+    } else plan.configText = `${JSON.stringify(next, null, 2)}\n`
+    plan.expected[configFile] = originalBytes === null ? null : sha256(originalBytes)
   }
   return { config: contributions, createdSections }
 }
@@ -988,7 +1018,7 @@ export async function restoreBackup(target: string, backupId: string): Promise<{
     if (fs.lstatSync(configPath, { throwIfNoEntry: false })?.isSymbolicLink()) throw new Error(`${configFile} is a symlink; restore does not replace it`)
     const fileBackups = (backup.files as string[]).filter(rel => rel !== configFile)
     const backupPath = (rel: string) => assertSafeTargetSubpath(target, `.manage-agents/backups/${backupId}/files/${rel}`, { allowLeafSymlink: true })
-    const plan: ReconcilePlan = { target, packs: [], writes: [], deletes: [], released: [], conflicts: [], warnings: [], adopted: { files: [], config: [] }, configFile, configText: null, expected: {}, installed }
+    const plan: ReconcilePlan = { target, packs: [], writes: [], deletes: [], released: [], conflicts: [], warnings: [], skippedMcpServers: [], adopted: { files: [], config: [] }, configFile, configText: null, expected: {}, installed }
     for (const rel of fileBackups) {
       delete installed.files[rel]
       const from = backupPath(rel)
@@ -1001,20 +1031,38 @@ export async function restoreBackup(target: string, backupId: string): Promise<{
       installed.config = {}
       delete installed.createdSections
     } else if (backup.config.length) {
-      const config = fs.existsSync(configPath) ? parseJsonc(fs.readFileSync(configPath, "utf8")) as Record<string, any> : { $schema: SCHEMA }
+      const originalBytes = fs.existsSync(configPath) ? fs.readFileSync(configPath) : null
+      const originalText = originalBytes?.toString("utf8") ?? null
+      const current = originalText === null ? { $schema: SCHEMA } : parseJsonc(originalText) as Record<string, any>
+      const config = structuredClone(current)
+      const arrayOrigins = new Map<string, readonly (number | null)[]>()
       for (const entry of backup.config as AdoptedConfigEntry[]) {
         if ((ARRAY_SECTIONS as readonly string[]).includes(entry.section)) {
           const list: unknown[] = Array.isArray(config[entry.section]) ? config[entry.section] : (config[entry.section] = [])
+          const originPath = jsoncArrayPath([entry.section])
+          const origins = [...(arrayOrigins.get(originPath) ?? (Array.isArray(current[entry.section]) ? (current[entry.section] as unknown[]).map((_, index) => index) : []))]
           const index = list.findIndex(item => arrayKey(entry.section, item) === entry.key)
           if (index !== -1) list.splice(index, 1, entry.value)
           else list.push(entry.value)
+          if (index !== -1) origins.splice(index, 1, origins[index])
+          else origins.push(null)
+          arrayOrigins.set(originPath, origins)
           for (const contribution of Object.values(installed.config)) (contribution as any)[entry.section] = ((contribution as any)[entry.section] ?? []).filter((item: unknown) => arrayKey(entry.section, item) !== entry.key)
         } else {
           setOwn(ensurePath(config, entry.section), entry.key, entry.value)
           for (const contribution of Object.values(installed.config)) delete contribution.objects?.[entry.section]?.[entry.key]
         }
       }
-      plan.configText = `${JSON.stringify(config, null, 2)}\n`
+      if (originalText !== null && (configFile === "opencode.jsonc" || !isPlainJson(originalText))) {
+        try {
+          const rewritten = rewriteJsoncPreservingComments(originalText, current, config, arrayOrigins)
+          if (!isDeepStrictEqual(parseJsonc(rewritten), config)) throw new Error("semantic mismatch")
+          plan.configText = rewritten
+        } catch {
+          throw new Error(`${configFile}: comments could not be preserved safely; the backup was not restored`)
+        }
+      } else plan.configText = `${JSON.stringify(config, null, 2)}\n`
+      plan.expected[configFile] = originalBytes === null ? null : sha256(originalBytes)
     }
     const lock = readLock(target)
     applyPlan(plan, { desired: readDesired(target), lock: lock ?? { lockVersion: 1, contract: "1.0", roots: [], packs: {} } })

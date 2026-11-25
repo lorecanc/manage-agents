@@ -1,5 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import { spawnSync } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -7,10 +8,11 @@ import React from "react"
 import { createTestRenderer } from "@opentui/core/testing"
 import { createRoot } from "@opentui/react"
 import { tempDir, writePack } from "../../test/helpers.js"
-import { readDesired } from "./installer.js"
-import { loadSources } from "./sources.js"
+import { changeTarget, installChange, readDesired } from "./installer.js"
+import { addSource, loadSources, saveSources } from "./sources.js"
 import { App } from "../App.js"
 import { chunkPillsByWidth } from "../ui/ParameterTuningModal.js"
+import { loadRoutingSettings, saveRoutingSettings, setRoutes } from "./userSettings.js"
 import {
   adjustListShare,
   calculateLayout,
@@ -1020,4 +1022,110 @@ test("Tab cycles topbar workspaces while Shift+Tab / backtab cycles right Inspec
   assert.equal(ui.captureCharFrame().includes("│ ● Sources │"), true)
   await emit("tab")
   assert.equal(ui.captureCharFrame().includes("│ ● Catalog │"), true)
+})
+
+test("direct TUI reconcile shows the skipped personal MCP warning", async t => {
+  const tmp = tempDir(t, "ma-tui-reconcile-skipped-mcp-")
+  const previousConfig = process.env.XDG_CONFIG_HOME
+  const previousCache = process.env.XDG_CACHE_HOME
+  process.env.XDG_CONFIG_HOME = path.join(tmp, "xdg-config")
+  process.env.XDG_CACHE_HOME = path.join(tmp, "xdg-cache")
+  t.after(() => {
+    if (previousConfig === undefined) delete process.env.XDG_CONFIG_HOME
+    else process.env.XDG_CONFIG_HOME = previousConfig
+    if (previousCache === undefined) delete process.env.XDG_CACHE_HOME
+    else process.env.XDG_CACHE_HOME = previousCache
+  })
+
+  const source = path.join(tmp, "fixture-source")
+  const packDb = { type: "local", command: ["pack-db-mcp"] }
+  writePack(path.join(source, "demo"), {
+    "agents/demo-worker.md": "---\ndescription: Demo worker\nmode: primary\n---\nWork.\n",
+    "opencode.json": JSON.stringify({ mcp: { servers: { db: packDb } } }),
+  }, { name: "demo", version: "1.0.0" })
+  fs.mkdirSync(source, { recursive: true })
+  for (const args of [
+    ["init", "--quiet", "--initial-branch=main"],
+    ["add", "-A"],
+    ["-c", "user.name=manage-agents test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "fixture pack"],
+  ]) {
+    const result = spawnSync("git", args, { cwd: source, encoding: "utf8" })
+    assert.equal(result.status, 0, result.stderr)
+  }
+
+  const registry = loadSources()
+  addSource(registry, "fixture", source, { trusted: true })
+  registry.active = "fixture"
+  saveSources(registry)
+  const routing = loadRoutingSettings()
+  setRoutes(routing.default, "not-installed", "*", { ghost: "openai/gpt-4o" })
+  saveRoutingSettings(routing)
+
+  const target = path.join(process.env.XDG_CONFIG_HOME, "opencode")
+  fs.mkdirSync(target, { recursive: true })
+  const personalDb = { type: "local", command: ["personal-db-mcp"] }
+  fs.writeFileSync(path.join(target, "opencode.json"), JSON.stringify({ mcp: { servers: { db: personalDb } } }))
+  const installed = await changeTarget(target, "install", registry, installChange(registry, ["demo"]), { confirm: async () => true })
+  assert.equal(installed.status, "applied", JSON.stringify(installed.plan?.conflicts))
+  assert.ok(fs.existsSync(path.join(target, ".manage-agents", "lock.json")), "the fixture target must have an installed pack lock")
+
+  const ui = await createTestRenderer({ width: 150, height: 40 })
+  t.after(() => { try { ui.renderer.destroy() } catch {} })
+  createRoot(ui.renderer).render(React.createElement(App, {
+    workspaceRoot: tmp,
+    listShare: 2 / 3,
+    reducedMotion: true,
+  }))
+  const waitUntil = async (predicate: (frame: string) => boolean, label: string) => {
+    for (let attempt = 0; attempt < 50; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 20))
+      await ui.renderOnce()
+      const frame = ui.captureCharFrame()
+      if (predicate(frame)) return frame
+    }
+    assert.fail(`Missing ${label} in frame:\n${ui.captureCharFrame()}`)
+  }
+  await waitUntil(frame => frame.includes("│ ● Catalog │"), "Catalog workspace")
+  let frameRows = ui.captureCharFrame().split("\n")
+  const topbarRow = frameRows.findIndex(row => row.includes("manage-agents"))
+  assert.notEqual(topbarRow, -1, "the workspace topbar should be visible")
+  await ui.mockMouse.click(frameRows[topbarRow]!.indexOf("Target & Bridges") + 2, topbarRow)
+  await ui.renderOnce()
+  await waitUntil(frame => frame.includes("│ ● Target & Bridges │"), "Target & Bridges workspace")
+  frameRows = ui.captureCharFrame().split("\n")
+  const reconcileRow = frameRows.findIndex(row => row.includes("R Reconcile"))
+  assert.notEqual(reconcileRow, -1, `the installed-pack reconcile action should be visible:\n${ui.captureCharFrame()}`)
+  ui.renderer.keyInput.emit("keypress", { name: "r", sequence: "r", ctrl: false, meta: false, shift: false } as any)
+  await new Promise(resolve => setImmediate(resolve))
+  await new Promise(resolve => setTimeout(resolve, 14))
+  await ui.renderOnce()
+  const resultFrame = await waitUntil(frame => /already up to date|is up to date/i.test(frame), "successful reconcile result")
+
+  assert.match(resultFrame, /warning:/i, `the reconcile result should show the skipped MCP warning, not only a toast:\n${resultFrame}`)
+  assert.match(resultFrame, /Files:/, `the reconcile result should include its detail frame:\n${resultFrame}`)
+  assert.match(resultFrame, /opencode\.json.*mcp\.servers/, `the MCP warning should name its config file:\n${resultFrame}`)
+  assert.match(resultFrame, /\bdb\b/, `the warning should name the kept server:\n${resultFrame}`)
+  assert.match(resultFrame, /\bdemo\b/, `the warning should name the skipped pack:\n${resultFrame}`)
+  assert.match(resultFrame, /preserv|skip/i, `the warning should explain that the personal server was kept and the pack entry skipped:\n${resultFrame}`)
+  assert.equal((resultFrame.match(/mcp\.servers/gi) ?? []).length, 1, `the result should contain exactly one MCP warning:\n${resultFrame}`)
+  assert.match(resultFrame, /warning:.*routing for "not-installed" has no effect/i, `the unrelated routing warning should remain visible:\n${resultFrame}`)
+  assert.doesNotMatch(resultFrame, /personal-db-mcp|pack-db-mcp/, `the warning should not disclose either server's command value:\n${resultFrame}`)
+
+  ui.renderer.keyInput.emit("keypress", { name: "return", sequence: "\r", ctrl: false, meta: false, shift: false } as any)
+  await new Promise(resolve => setImmediate(resolve))
+  await new Promise(resolve => setTimeout(resolve, 14))
+  await ui.renderOnce()
+  await waitUntil(frame => frame.includes("OpenCode v2 Target & Bridges"), "return to the target workspace")
+
+  const configPath = path.join(target, "opencode.json")
+  const withoutPersonalServer = JSON.parse(fs.readFileSync(configPath, "utf8"))
+  delete withoutPersonalServer.mcp.servers.db
+  fs.writeFileSync(configPath, JSON.stringify(withoutPersonalServer))
+
+  ui.renderer.keyInput.emit("keypress", { name: "r", sequence: "r", ctrl: false, meta: false, shift: false } as any)
+  await new Promise(resolve => setImmediate(resolve))
+  await new Promise(resolve => setTimeout(resolve, 14))
+  await ui.renderOnce()
+  const routingOnlyFrame = await waitUntil(frame => /up to date/i.test(frame), "routing-only reconcile toast")
+  assert.doesNotMatch(routingOnlyFrame, /Files:|warning:/i, `a routing-only warning should not open a result panel:\n${routingOnlyFrame}`)
 })

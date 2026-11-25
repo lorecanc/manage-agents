@@ -713,6 +713,10 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
           setActionResultTitle("Reconcile Failed")
           setActionResultLines(summary)
           setViewMode("action-result")
+        } else if ((result.status === "applied" || result.status === "unchanged") && result.plan?.skippedMcpServers.length) {
+          setActionResultTitle("Reconcile Complete")
+          setActionResultLines(summary)
+          setViewMode("action-result")
         }
       } catch (error: any) {
         pushToast(`✗ Reconcile failed: ${terminalSafeText(error?.message || error)}`)

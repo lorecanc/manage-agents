@@ -8,7 +8,7 @@ import test from "node:test"
 import { tempDir, writePack } from "../../test/helpers.js"
 import { applyPlan, changeTarget, installChange, planReconcile, readInstalled, reconcileChange, restoreBackup, rollbackInterrupted, targetStatus, uninstallChange, updateChange, withTargetLock, type ChangeOptions } from "./installer.js"
 import { readLock } from "./lock.js"
-import { MAX_SCANNED_BYTES } from "./packs.js"
+import { MAX_SCANNED_BYTES, parseJsonc } from "./packs.js"
 import { addSource, pullSource, type SourceRegistry } from "./sources.js"
 import { loadOverrideSettings, removeConfigEntry, saveOverrideSettings, scopeOf, setConfigOverride, unsetConfigOverride } from "./userSettings.js"
 
@@ -100,33 +100,281 @@ test("determinism: the same desired state and lock give the same tree on two cle
   assert.equal((await first.install(["flow"])).status, "unchanged")
 })
 
-test("user config is preserved; a JSONC file with comments is backed up with a warning", async (t) => {
+test("target writes preserve live JSONC comments", async (t) => {
   const { target, install } = setup(t)
-  fs.writeFileSync(path.join(target, "opencode.jsonc"), `{\n  // mine\n  "model": "x/y",\n  "plugins": ["my-npm-plugin"],\n}\n`)
+  fs.writeFileSync(path.join(target, "opencode.jsonc"), `{
+  // mine
+  "model": "x/y", // inline model note
+  "homepage": "https://example.test/a//b",
+  /* retained plugins note */
+  "plugins": ["my-npm-plugin",],
+}
+`)
   const result = await install(["flow"])
 
   assert.equal(result.status, "applied")
-  const next = JSON.parse(fs.readFileSync(path.join(target, "opencode.jsonc"), "utf8"))
+  const text = fs.readFileSync(path.join(target, "opencode.jsonc"), "utf8")
+  const next = parseJsonc(text) as Record<string, any>
   assert.equal(next.model, "x/y")
+  assert.equal(next.homepage, "https://example.test/a//b")
   assert.deepEqual(next.plugins, ["my-npm-plugin", { package: "./plugins/guard", options: { strict: true } }])
-  assert.ok(result.plan!.warnings.some(warning => /comments/.test(warning)))
-  assert.match(fs.readFileSync(path.join(target, ".manage-agents", "backups", result.backupId!, "files", "opencode.jsonc"), "utf8"), /\/\/ mine/)
+  assert.deepEqual(next.mcp.servers.db, { type: "local", command: ["db-mcp"] })
+  assert.match(text, /\/\/ mine/)
+  assert.match(text, /\/\/ inline model note/)
+  assert.match(text, /\/\* retained plugins note \*\//)
 })
 
-test("config overrides patch the contribution: a matching user server is 'kept', stays theirs, no --adopt", async (t) => {
-  const { env, target, install, registry, options } = setup(t)
-  fs.writeFileSync(path.join(target, "opencode.json"), JSON.stringify({ mcp: { servers: { db: { type: "local", command: ["my-db-mcp", "--port", "1"] } } } }))
+test("mixed JSONC writes keep personal MCP comments attached", async (t) => {
+  const { target, install } = setup(t)
+  const personalDb = { type: "local", command: ["personal-db-mcp"] }
+  const personalOther = { type: "remote", url: "https://personal.example/mcp" }
+  fs.writeFileSync(path.join(target, "opencode.jsonc"), `{
+  "model": "personal/model",
+  "mcp": {
+    "servers": {
+      "db": {
+        "type": "local",
+        "command": ["personal-db-mcp"]
+      }, // keep my personal db
+      "personal": { "type": "remote", "url": "https://personal.example/mcp" }
+    }
+  },
+  "plugins": ["my-personal-plugin",],
+}
+`)
 
-  // Without the override the user's server blocks the install of the pack's `db` entry.
-  assert.equal((await install(["flow"])).status, "failed")
+  const result = await install(["flow"])
+
+  assert.equal(result.status, "applied", JSON.stringify(result.plan?.conflicts))
+  const text = fs.readFileSync(path.join(target, "opencode.jsonc"), "utf8")
+  const next = parseJsonc(text) as Record<string, any>
+  assert.deepEqual(next.mcp.servers, { db: personalDb, personal: personalOther })
+  assert.deepEqual(next.plugins, ["my-personal-plugin", { package: "./plugins/guard", options: { strict: true } }])
+  assert.ok(next.instructions.some((instruction: string) => instruction.endsWith("instructions/base.md")))
+  assert.ok(fs.existsSync(path.join(target, "agents/flow-build.md")))
+  assert.match(text, /"db"\s*:\s*\{[^{}]*\}\s*,\s*\/\/ keep my personal db/)
+})
+
+test("JSONC adoption and restore preserve live comments", async (t) => {
+  const { target, install } = setup(t)
+  const configPath = path.join(target, "opencode.jsonc")
+  const personalDb = { type: "local", command: ["personal-db-mcp"] }
+  fs.writeFileSync(configPath, `{
+  "model": "personal/model", // keep my model note
+  "mcp": {
+    "servers": {
+      "db": {
+        "type": "local",
+        "command": ["personal-db-mcp"] // keep my command note
+      } // keep my db entry note
+    }
+  },
+  "plugins": ["my-personal-plugin",],
+}
+`)
+
+  const adopted = await install(["flow"], { adopt: true })
+
+  assert.equal(adopted.status, "applied", JSON.stringify(adopted.plan?.conflicts))
+  const adoptedText = fs.readFileSync(configPath, "utf8")
+  const adoptedConfig = parseJsonc(adoptedText) as Record<string, any>
+  assert.deepEqual(adoptedConfig.mcp.servers.db, { type: "local", command: ["db-mcp"] })
+  assert.deepEqual(readInstalled(target).config.base?.objects?.["mcp.servers"]?.db, { type: "local", command: ["db-mcp"] })
+  assert.match(adoptedText, /\/\/ keep my model note/)
+  assert.match(adoptedText, /\/\/ keep my command note/)
+  assert.match(adoptedText, /\/\/ keep my db entry note/)
+
+  const afterAdopt = adoptedText.replace("{", "{\n  // added after adopt")
+  assert.notEqual(afterAdopt, adoptedText)
+  fs.writeFileSync(configPath, afterAdopt)
+  const restored = await restoreBackup(target, adopted.backupId!)
+
+  assert.ok(restored.config.some(entry => entry.section === "mcp.servers" && entry.key === "db" && JSON.stringify(entry.value) === JSON.stringify(personalDb)))
+  const restoredText = fs.readFileSync(configPath, "utf8")
+  const restoredConfig = parseJsonc(restoredText) as Record<string, any>
+  assert.deepEqual(restoredConfig.mcp.servers.db, personalDb)
+  assert.match(restoredText, /\/\/ keep my model note/)
+  assert.match(restoredText, /\/\/ keep my command note/)
+  assert.match(restoredText, /\/\/ keep my db entry note/)
+  assert.match(restoredText, /\/\/ added after adopt/)
+})
+
+test("JSONC uninstall preserves adjacent comments and the identity/order of user array entries", async (t) => {
+  const { target, install, registry, options } = setup(t)
+  const personalServer = { type: "remote", url: "https://personal.example/mcp" }
+  fs.writeFileSync(path.join(target, "opencode.jsonc"), `{
+  "plugins": [
+    "personal-before", // keep the preceding entry
+    "personal-after", // keep the trailing adjacent comment
+  ],
+  "mcp": { "servers": { "personal": { "type": "remote", "url": "https://personal.example/mcp" } } },
+}
+`)
+
+  const installed = await install(["flow"])
+  assert.equal(installed.status, "applied", JSON.stringify(installed.plan?.conflicts))
+  const installedConfig = parseJsonc(fs.readFileSync(path.join(target, "opencode.jsonc"), "utf8")) as Record<string, any>
+  assert.deepEqual(installedConfig.plugins, ["personal-before", "personal-after", { package: "./plugins/guard", options: { strict: true } }])
+
+  const removed = await changeTarget(target, "uninstall", registry, uninstallChange(["flow"]), options)
+  assert.equal(removed.status, "applied")
+  const text = fs.readFileSync(path.join(target, "opencode.jsonc"), "utf8")
+  const restored = parseJsonc(text) as Record<string, any>
+  assert.deepEqual(restored.plugins, ["personal-before", "personal-after"])
+  assert.deepEqual(restored.mcp.servers, { personal: personalServer })
+  assert.match(text, /"personal-before"\s*,\s*\/\/ keep the preceding entry/)
+  assert.match(text, /"personal-after",?[ \t]*\/\/ keep the trailing adjacent comment/)
+})
+
+test("JSONC uninstall removes consecutive interior array entries", async (t) => {
+  const { source, target, registry, options } = setup(t)
+  writePack(path.join(source, "array-pack"), {
+    "agents/array-worker.md": "---\ndescription: Array worker\nmode: primary\n---\nWork.\n",
+    "opencode.json": JSON.stringify({ plugins: ["npm-first", "npm-second"] }),
+  }, { name: "array-pack" })
+  const configPath = path.join(target, "opencode.jsonc")
+  fs.writeFileSync(configPath, `{
+  "plugins": ["personal-before", "personal-after",],
+}
+`)
+
+  const installed = await changeTarget(target, "install", registry, installChange(registry, ["array-pack"], options.env), options)
+  assert.equal(installed.status, "applied", JSON.stringify(installed.plan?.conflicts))
+  assert.deepEqual((parseJsonc(fs.readFileSync(configPath, "utf8")) as Record<string, any>).plugins, ["personal-before", "personal-after", "npm-first", "npm-second"])
+
+  fs.writeFileSync(configPath, `{
+  "plugins": [
+    "personal-before", // keep before
+    "npm-first", // managed first
+    "npm-second", // managed second
+    "personal-after", // keep after
+  ],
+}
+`)
+  const beforeRemoval = snapshot(target, false)
+  const removed = await changeTarget(target, "uninstall", registry, uninstallChange(["array-pack"]), options)
+
+  assert.equal(removed.status, "applied", removed.plan!.conflicts.join("\n"))
+  const text = fs.readFileSync(configPath, "utf8")
+  assert.deepEqual((parseJsonc(text) as Record<string, any>).plugins, ["personal-before", "personal-after"])
+  assert.match(text, /"personal-before",[ \t]*\/\/ keep before/)
+  assert.match(text, /"personal-after",?[ \t]*\/\/ keep after/)
+  assert.ok(!fs.existsSync(path.join(target, "agents/array-worker.md")))
+  assert.deepEqual(readLock(target)?.roots, [])
+  assert.notDeepEqual(snapshot(target, false), beforeRemoval)
+})
+
+test("JSONC uninstall removes an interior object entry", async (t) => {
+  const { source, target, registry, options } = setup(t)
+  const managedServer = { type: "local", command: ["managed-mcp"] }
+  const personalBefore = { type: "remote", url: "https://before.example/mcp" }
+  const personalAfter = { type: "remote", url: "https://after.example/mcp" }
+  writePack(path.join(source, "object-pack"), {
+    "agents/object-worker.md": "---\ndescription: Object worker\nmode: primary\n---\nWork.\n",
+    "opencode.json": JSON.stringify({ mcp: { servers: { managed: managedServer } } }),
+  }, { name: "object-pack" })
+  const configPath = path.join(target, "opencode.jsonc")
+  fs.writeFileSync(configPath, JSON.stringify({ mcp: { servers: { "personal-before": personalBefore, "personal-after": personalAfter } } }))
+
+  const installed = await changeTarget(target, "install", registry, installChange(registry, ["object-pack"], options.env), options)
+  assert.equal(installed.status, "applied", JSON.stringify(installed.plan?.conflicts))
+  const installedConfig = parseJsonc(fs.readFileSync(configPath, "utf8")) as Record<string, any>
+  assert.deepEqual(installedConfig.mcp.servers.managed, managedServer)
+  fs.writeFileSync(configPath, `{
+  "mcp": {
+    "servers": {
+      "personal-before": { "type": "remote", "url": "https://before.example/mcp" },
+      "managed": { "type": "local", "command": ["managed-mcp"] },
+      "personal-after": { "type": "remote", "url": "https://after.example/mcp" }
+    }
+  }
+}
+`)
+  const beforeRemoval = snapshot(target, false)
+
+  const removed = await changeTarget(target, "uninstall", registry, uninstallChange(["object-pack"]), options)
+
+  assert.equal(removed.status, "applied", removed.plan!.conflicts.join("\n"))
+  assert.deepEqual(parseJsonc(fs.readFileSync(configPath, "utf8")), { mcp: { servers: { "personal-before": personalBefore, "personal-after": personalAfter } } })
+  assert.ok(!fs.existsSync(path.join(target, "agents/object-worker.md")))
+  assert.deepEqual(readLock(target)?.roots, [])
+  assert.notDeepEqual(snapshot(target, false), beforeRemoval)
+})
+
+test("JSONC decoded duplicate keys are rejected only when their path is edited", async (t) => {
+  const { target, install, registry, options } = setup(t)
+  const configPath = path.join(target, "opencode.jsonc")
+  fs.writeFileSync(configPath, `{
+  "mcp": {
+    "servers": {
+      "db": { "type": "local", "command": ["personal-db-mcp"] },
+      "d\\u0062": { "type": "remote", "url": "https://last.personal.example/mcp" }
+    }
+  },
+  "plugins": ["personal-plugin",],
+}
+`)
+
+  const installed = await install(["flow"])
+  assert.equal(installed.status, "applied", JSON.stringify(installed.plan?.conflicts))
+  assert.equal(installed.plan!.skippedMcpServers.filter(server => server.key === "db").length, 1)
+  const unchangedDuplicateText = fs.readFileSync(configPath, "utf8")
+  assert.ok(unchangedDuplicateText.includes('"d\\u0062"'), "the duplicate spelling survives an unrelated edit path")
+  const beforeAdoption = snapshot(target, false)
+
+  const adopted = await changeTarget(target, "reconcile", registry, reconcileChange, { ...options, adopt: true })
+  assert.equal(adopted.status, "failed")
+  assert.match(adopted.plan!.conflicts.join("\n"), /opencode\.jsonc: comments could not be preserved safely/)
+  assert.deepEqual(snapshot(target, false), beforeAdoption, "ambiguous duplicate keys must block without writes when the edited path reaches them")
+})
+
+test("install preserves an unmanaged same-name MCP server", async (t) => {
+  const { target, install, registry, options } = setup(t)
+  const personalDb = { type: "local", command: ["personal-db-mcp"], environment: { PROFILE: "personal" } }
+  const personalOther = { type: "remote", url: "https://personal.example/mcp" }
+  fs.writeFileSync(path.join(target, "opencode.json"), JSON.stringify({
+    model: "personal/model",
+    mcp: { servers: { db: personalDb, personal: personalOther } },
+  }))
+
+  const result = await install(["flow"])
+
+  assert.equal(result.status, "applied", JSON.stringify(result.plan?.conflicts))
+  assert.deepEqual(config(target).mcp.servers, { db: personalDb, personal: personalOther })
+  assert.ok(fs.existsSync(path.join(target, "agents/flow-build.md")))
+  assert.ok(config(target).plugins.some((plugin: unknown) => typeof plugin === "object" && plugin !== null && (plugin as { package?: string }).package === "./plugins/guard"))
+  assert.ok(config(target).instructions.some((instruction: string) => instruction.endsWith("instructions/base.md")))
+  assert.equal(readInstalled(target).config.base?.objects?.["mcp.servers"]?.db, undefined, "the colliding entry remains unmanaged")
+  assert.ok(result.plan!.warnings.some(warning => /opencode\.json/.test(warning) && /db/.test(warning) && /base/.test(warning)))
+
+  const reconciled = await changeTarget(target, "reconcile", registry, reconcileChange, options)
+  assert.equal(reconciled.status, "unchanged")
+
+  const removed = await changeTarget(target, "uninstall", registry, uninstallChange(["flow"]), options)
+  assert.equal(removed.status, "applied")
+  assert.deepEqual(config(target).mcp.servers, { db: personalDb, personal: personalOther }, "uninstall must leave the skipped server unmanaged")
+  assert.equal(readInstalled(target).config.base, undefined)
+})
+
+test("config overrides keep an exact personal server silent and leave a differing one for explicit adoption", async (t) => {
+  const { env, target, install, registry, options } = setup(t)
+  const personalDb = { type: "local", command: ["my-db-mcp", "--port", "1"] }
+  fs.writeFileSync(path.join(target, "opencode.json"), JSON.stringify({ mcp: { servers: { db: personalDb } } }))
+
+  const installed = await install(["flow"])
+  assert.equal(installed.status, "applied", JSON.stringify(installed.plan?.conflicts))
+  assert.deepEqual(config(target).mcp.servers.db, personalDb)
+  assert.equal(readInstalled(target).config.base?.objects?.["mcp.servers"]?.db, undefined)
+  assert.ok(installed.plan!.skippedMcpServers.some(server => server.key === "db" && server.pack === "base"))
 
   const settings = loadOverrideSettings(env)
-  setConfigOverride(scopeOf(settings, target), "base", "mcp.servers", "db", { command: ["my-db-mcp", "--port", "1"] })
+  setConfigOverride(scopeOf(settings, target), "base", "mcp.servers", "db", { command: personalDb.command })
   saveOverrideSettings(settings, env)
 
   const result = await install(["flow"])
-  assert.equal(result.status, "applied", JSON.stringify(result.plan?.conflicts))
-  assert.deepEqual(config(target).mcp.servers.db, { type: "local", command: ["my-db-mcp", "--port", "1"] })
+  assert.equal(result.status, "unchanged")
+  assert.deepEqual(config(target).mcp.servers.db, personalDb)
+  assert.equal(result.plan!.skippedMcpServers.length, 0, "an exact contribution match is silent")
   assert.equal(readInstalled(target).config.base?.objects?.["mcp.servers"]?.db, undefined, "a kept entry stays the user's")
 
   assert.equal((await changeTarget(target, "reconcile", registry, reconcileChange, options)).status, "unchanged")
@@ -135,13 +383,50 @@ test("config overrides patch the contribution: a matching user server is 'kept',
   const next = loadOverrideSettings(env)
   assert.equal(unsetConfigOverride(scopeOf(next, target), "base", "mcp.servers", "db", []), true)
   saveOverrideSettings(next, env)
-  const blocked = await changeTarget(target, "reconcile", registry, reconcileChange, options)
-  assert.equal(blocked.status, "failed")
-  assert.match(blocked.plan!.conflicts[0], /mcp\.servers "db".*rerun with --adopt/)
+  const skipped = await changeTarget(target, "reconcile", registry, reconcileChange, options)
+  assert.equal(skipped.status, "unchanged")
+  assert.deepEqual(config(target).mcp.servers.db, personalDb)
+  assert.ok(skipped.plan!.skippedMcpServers.some(server => server.key === "db" && server.pack === "base"))
 
   const adopted = await changeTarget(target, "reconcile", registry, reconcileChange, { ...options, adopt: true })
   assert.equal(adopted.status, "applied")
   assert.deepEqual(config(target).mcp.servers.db, { type: "local", command: ["db-mcp"] })
+  assert.ok(adopted.backupId)
+  assert.deepEqual(adopted.plan!.adopted.config.find(entry => entry.section === "mcp.servers" && entry.key === "db")?.value, personalDb)
+  await restoreBackup(target, adopted.backupId!)
+  assert.deepEqual(config(target).mcp.servers.db, personalDb)
+})
+
+test("a locally changed managed MCP server still blocks reconcile without --adopt", async (t) => {
+  const { target, install, registry, options } = setup(t)
+  assert.equal((await install(["flow"])).status, "applied")
+  const current = config(target)
+  current.mcp.servers.db = { type: "local", command: ["changed-after-managed"] }
+  fs.writeFileSync(path.join(target, "opencode.json"), JSON.stringify(current))
+  const before = snapshot(target, false)
+
+  const blocked = await changeTarget(target, "reconcile", registry, reconcileChange, options)
+
+  assert.equal(blocked.status, "failed")
+  assert.match(blocked.plan!.conflicts.join("\n"), /mcp\.servers "db" was changed locally; rerun with --adopt/)
+  assert.equal(blocked.plan!.skippedMcpServers.length, 0, "managed local drift is not an unmanaged skip")
+  assert.deepEqual(snapshot(target, false), before)
+})
+
+test("duplicate MCP claims created by config overrides remain pack conflicts", async (t) => {
+  const { target, env, install } = setup(t)
+  const settings = loadOverrideSettings(env)
+  setConfigOverride(scopeOf(settings, target), "base", "mcp.servers", "shared", { type: "local", command: ["base-shared-mcp"] })
+  setConfigOverride(scopeOf(settings, target), "flow", "mcp.servers", "shared", { type: "local", command: ["flow-shared-mcp"] })
+  saveOverrideSettings(settings, env)
+  const before = snapshot(target, false)
+
+  const result = await install(["flow"])
+
+  assert.equal(result.status, "failed")
+  assert.match(result.plan!.conflicts.join("\n"), /mcp\.servers "shared" is set differently by base and flow/)
+  assert.equal(result.plan!.skippedMcpServers.length, 0, "pack-to-pack ownership is not an unmanaged personal-server skip")
+  assert.deepEqual(snapshot(target, false), before)
 })
 
 test("config overrides can remove an entry (null), toggle servers and merge nested fields", async (t) => {
@@ -169,7 +454,7 @@ test("config overrides can remove an entry (null), toggle servers and merge nest
   assert.equal(config(target).mcp, undefined, "the pack contributes no server any more and the section it created goes too")
 })
 
-test("unmanaged collisions block before any write; --adopt backs up, restore puts it back", async (t) => {
+test("a file collision blocks before any write; --adopt backs up, restore puts it back", async (t) => {
   const { target, install, options } = setup(t)
   fs.mkdirSync(path.join(target, "agents"))
   fs.writeFileSync(path.join(target, "agents/flow-build.md"), "mine\n")
@@ -178,7 +463,8 @@ test("unmanaged collisions block before any write; --adopt backs up, restore put
 
   const blocked = await install(["flow"])
   assert.equal(blocked.status, "failed")
-  assert.deepEqual(blocked.plan!.conflicts.map(conflict => conflict.split(" ")[0]).sort(), ["agents/flow-build.md", "opencode.json:"])
+  assert.deepEqual(blocked.plan!.conflicts.map(conflict => conflict.split(" ")[0]).sort(), ["agents/flow-build.md"])
+  assert.ok(blocked.plan!.skippedMcpServers.some(server => server.key === "db" && server.pack === "base"), "the differing personal server is skipped, not a blocking conflict")
   assert.deepEqual(snapshot(target, false), before)
 
   const adopted = await install(["flow"], { adopt: true })
@@ -239,6 +525,31 @@ test("local source edits: reconcile refuses until update, install keeps other pa
   assert.equal(update.status, "applied")
   assert.deepEqual(update.changes.map(change => `${change.kind} ${change.name}`), ["upgrade base"])
   assert.equal(fs.readFileSync(path.join(target, "resources/base/rules.md"), "utf8"), "new rules\n")
+})
+
+test("an unmanaged MCP skip keeps untrusted executable approval scoped to the installed lock", async (t) => {
+  const { target, install, registry, options } = setup(t, { trusted: false })
+  const personalDb = { type: "local", command: ["personal-db-mcp"] }
+  fs.writeFileSync(path.join(target, "opencode.json"), JSON.stringify({ mcp: { servers: { db: personalDb } } }))
+  const asked: string[][] = []
+
+  const accepted = await install(["flow"], { confirm: async reasons => { asked.push(reasons); return true } })
+
+  assert.equal(accepted.status, "applied", JSON.stringify(accepted.plan?.conflicts))
+  assert.equal(asked.length, 1)
+  assert.ok(asked[0]!.some(reason => /base: source "main" is not trusted and the pack carries executable content/.test(reason)))
+  assert.equal(accepted.plan!.skippedMcpServers.length, 1)
+  assert.equal(accepted.backupId, null, "skipping an unmanaged personal entry is not adoption")
+  assert.deepEqual(config(target).mcp.servers.db, personalDb)
+  assert.equal(readInstalled(target).config.base?.objects?.["mcp.servers"]?.db, undefined)
+  const approvedLock = readLock(target)
+
+  const unchanged = await changeTarget(target, "reconcile", registry, reconcileChange, {
+    ...options,
+    confirm: async () => assert.fail("the same installed executable lock must not prompt again"),
+  })
+  assert.equal(unchanged.status, "unchanged")
+  assert.deepEqual(readLock(target), approvedLock)
 })
 
 test("confirmation: untrusted executable content is declined without writing; accepted once, not asked again", async (t) => {
@@ -410,6 +721,34 @@ test("the target changing between planning and apply aborts without writing", as
   assert.equal(fs.readFileSync(path.join(target, "agents/flow-build.md"), "utf8"), "typed while the prompt was open\n")
   assert.ok(!fs.existsSync(path.join(target, "commands")))
   assert.ok(!fs.existsSync(path.join(target, ".manage-agents", "txn")) || !fs.readdirSync(path.join(target, ".manage-agents", "txn")).length)
+})
+
+test("a JSONC preimage changing during confirmation aborts without applying config or files", async (t) => {
+  const { target, install } = setup(t, { trusted: false })
+  const configPath = path.join(target, "opencode.jsonc")
+  fs.writeFileSync(configPath, `{
+  // original live comment
+  "model": "before",
+}
+`)
+  const changedText = `{
+  // edited while the confirmation prompt was open
+  "model": "changed by user",
+}
+`
+
+  const raced = await install(["flow"], {
+    confirm: async reasons => {
+      assert.ok(reasons.some(reason => /base: source "main" is not trusted/.test(reason)))
+      fs.writeFileSync(configPath, changedText)
+      return true
+    },
+  }).catch((error: Error) => error)
+
+  assert.ok(raced instanceof Error && /opencode\.jsonc changed while installing; nothing was written/.test(raced.message), String(raced))
+  assert.equal(fs.readFileSync(configPath, "utf8"), changedText)
+  assert.ok(!fs.existsSync(path.join(target, "agents/flow-build.md")))
+  assert.equal(readLock(target), null)
 })
 
 test("a symlinked opencode.json is reported, never replaced", { skip: process.platform === "win32" }, async (t) => {

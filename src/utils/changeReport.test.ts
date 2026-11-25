@@ -12,6 +12,7 @@ function plan(overrides: Partial<ReconcilePlan> = {}): ReconcilePlan {
     released: [],
     conflicts: [],
     warnings: [],
+    skippedMcpServers: [],
     adopted: { files: [], config: [] },
     configFile: "opencode.json",
     configText: null,

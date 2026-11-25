@@ -142,9 +142,19 @@ manage-agents install catalog/docs@^2.0.0 --dry-run
 Un pack si indica come `[sorgente/]pack[@intervallo]`. I pack già installati mantengono la versione bloccata nel lock.
 `--dry-run` mostra il piano senza scrivere, `--json` produce un report leggibile da script.
 
-La parte gestita di `opencode.json` viene rigenerata dai pack. Le tue chiavi restano. Le sezioni che il motore svuota
-(per esempio `mcp.servers` o `experimental`) vengono rimosse, mentre una sezione vuota scritta da te resta dov'è. Un
-`opencode.jsonc` con commenti viene riscritto come JSON semplice, e l'originale finisce nel backup.
+Le voci gestite di `opencode.json` vengono rigenerate dai pack e le altre chiavi restano tue. Le sezioni svuotate dal
+motore (per esempio `mcp.servers` o `experimental`) vengono rimosse, mentre una sezione vuota scritta da te resta dov'è.
+Se nel target esiste già un `mcp.servers.<nome>` non gestito con una definizione diversa da quella di un server
+omonimo del pack, prevale la tua voce: install e reconcile proseguono senza `--adopt` e mostrano un avviso con il nome
+del server e del pack. La voce intera resta personale e non viene acquisita dal motore. I conflitti tra pack e le
+modifiche alle voci già gestite continuano a richiedere la normale risoluzione. Per sostituire la definizione
+personale, usa `--adopt`: il motore la salva nel backup e assume la gestione della nuova voce. Se il pack è già stato
+approvato, puoi eliminare la voce personale e lanciare `reconcile` per aggiungere la definizione del pack.
+
+Se il target usa `opencode.jsonc`, install, update, reconcile, uninstall e il ripristino di singole voci preservano i
+commenti esistenti. Quando una voce viene rimossa, i commenti associati restano nel file come commenti autonomi. Le
+operazioni normali non creano backup solo per conservare i commenti; il ripristino di un backup storico dell'intero
+file ripristina i byte salvati.
 
 ### Installare nel profilo personale Codex
 
@@ -210,12 +220,12 @@ che avevi già, con lo stesso contenuto del pack, resta tuo anche dopo la disins
 Prima di scrivere, il motore controlla tutti i conflitti:
 
 - lo stesso ID (agente, comando, skill, plugin, server MCP) o lo stesso percorso in due pack;
-- un file o una voce di configurazione che appartiene a te;
+- un file o una voce di configurazione che appartiene a te, salvo il caso della definizione MCP omonima descritta sopra;
 - un file gestito che hai modificato a mano.
 
-Ogni conflitto viene segnalato e non si scrive niente. Se vuoi che il pack prenda il posto della tua versione,
-ripeti con `--adopt`: il motore salva la tua copia in `<target>/.manage-agents/backups/<id>/` e la sostituisce. Per
-tornare indietro:
+Gli altri conflitti vengono segnalati e non si scrive niente. Se vuoi che il pack prenda il posto di una voce personale
+in conflitto, ripeti con `--adopt`: il motore salva la tua copia in `<target>/.manage-agents/backups/<id>/` e la
+sostituisce assumendone la gestione. Per tornare indietro:
 
 ```bash
 manage-agents restore <backup-id>
@@ -499,10 +509,10 @@ manage-agents --no-auto-commit bridge --pack pipeline --target claude
 
 | Sintomo | Cosa fare |
 |---|---|
-| `install` si ferma su un conflitto | leggi l'elenco; se il pack deve sostituire la tua versione, ripeti con `--adopt` e annulla eventualmente con `restore <backup-id>` |
+| `install` si ferma su un conflitto | leggi l'elenco; per sostituire una voce personale in conflitto, ripeti con `--adopt` e annulla eventualmente con `restore <backup-id>` |
 | «needs confirmation» senza terminale | controlla le righe stampate e ripeti con `--yes`, oppure rendi fidata la sorgente con `source trust` |
 | più candidati per lo stesso pack | indica la sorgente (`catalog/flow`) o usa `source prefer <pack> <sorgente>` |
-| `status` termina con exit 1 | un file gestito è stato cambiato o cancellato, o c'è un'impostazione in sospeso: `reconcile` (con `--adopt` per sovrascrivere le modifiche) |
+| `status` termina con exit 1 | un file gestito è stato cambiato o cancellato, o c'è un'impostazione in sospeso: esegui `reconcile`; usa `--adopt` per sostituire modifiche personali in conflitto |
 | comando bloccato dal lock | un `<target>/.manage-agents/install.lock` rimasto viene recuperato da solo quando il processo che lo teneva non esiste più |
 | la sorgente git non cambia | `source pull <nome>` oppure `update`; controlla il `--ref` della sorgente |
 | selettore modelli non disponibile | verifica che `opencode models` funzioni; nella finestra d'errore `Y` riprova |

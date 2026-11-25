@@ -189,9 +189,13 @@ Rules:
 - The managed part of `opencode.json` is regenerated from the pack contributions; the user's own keys are
   preserved. A section (`mcp.servers`, `lsp`, `experimental`, ...) left empty by removing managed entries is
   removed too; an empty section the user wrote stays.
-- Conflicts, including collisions with files the user created, are detected before anything is written. If the
-  target changes between that check and the write (for example while a confirmation prompt is open), nothing is
-  written.
+- Conflicts, including collisions with files the user created and edits to managed entries, are detected before
+  anything is written. An exception is an existing unmanaged `mcp.servers.<name>` with a different definition from
+  a pack's same-name server: the personal entry is retained in full, the warning names the server and pack, and
+  install/reconcile continue without `--adopt`. Managed drift and pack-to-pack conflicts remain conflicts. The
+  engine does not take ownership of the personal entry; after the pack is approved, removing that entry and running
+  `reconcile` adds the pack definition. If the target changes between conflict checking and writing (for example
+  while a confirmation prompt is open), nothing is written.
 - A file changed by the user is never deleted silently. A file or config entry the user already had with exactly
   the pack's content stays the user's: uninstalling the pack leaves it in place.
 - A symlinked `opencode.json` is never replaced. It is reported, so that the file it points to can be edited or
@@ -212,8 +216,9 @@ Commands:
 Details:
 
 - **Conflicts**: two packs providing the same ID or the same path with different content, a file or config entry
-  the user owns, or a managed file changed locally. Each is reported before anything is written. `--adopt` backs
-  up the user's version to `.manage-agents/backups/<id>/` and replaces it. Files installed by the
+  the user owns (except for the unmanaged same-name MCP server case above), or a managed file changed locally. Each
+  is reported before anything is written. `--adopt` backs up the user's version to `.manage-agents/backups/<id>/`,
+  replaces it, and takes ownership. Files installed by the
   `export` command of earlier manage-agents versions (listed in `.resource-export-manifest.json`) are replaced
   without `--adopt`, and still backed up, so a target set up that way moves to packs with a plain `install`.
 - **Plugin options**: a pack's plugins are registered as `./plugins/<name>`. A pack that requires another may
@@ -221,7 +226,9 @@ Details:
 - **Transactions**: changes are staged inside the target and recorded in `.manage-agents/journal.json`. A failure
   or a crash is rolled back by the next command, and `.manage-agents/install.lock` lets one command at a time work
   on a target.
-- **JSONC**: an `opencode.jsonc` with comments is rewritten as plain JSON, and the original is kept in the backup.
+- **JSONC**: ordinary install, update, reconcile, uninstall, and entry-level restore preserve comments in an existing
+  target `opencode.jsonc`. Comments from removed entries remain as standalone comments. Routine writes do not create
+  backups just to preserve comments; restoring a historical whole-file backup restores its saved bytes.
 - **Confirmation**: a pack from an untrusted source with executable content, and any change to executable content,
   need confirmation: `--yes`, or an answer at the terminal.
 
