@@ -234,3 +234,48 @@ test("installVibeAgentProfiles refuses an invalid plugin name", () => {
   const plugin = makePluginSource(parent, "acme-pack")
   assert.throws(() => installVibeAgentProfiles(plugin, "../escape", env), /Invalid Vibe plugin name/)
 })
+
+test("installVibePlugin keeps platform-gated servers only on matching machines", () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "vibe-gated-"))
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "vibe-gated-home-"))
+  const env = { ...process.env, VIBE_HOME: home }
+  const plugin = makePluginSource(parent, "acme-pack")
+  fs.writeFileSync(path.join(plugin, "mcp.json"), JSON.stringify({
+    $schema: "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+    mcpServers: {
+      cupertino: { type: "stdio", command: "cupertino", args: ["serve"] },
+      shadcn: { type: "stdio", command: "npx", args: ["-y", "shadcn@latest", "mcp"] }
+    }
+  }, null, 2))
+  fs.writeFileSync(path.join(plugin, "mcp-platforms.json"), JSON.stringify({ cupertino: "darwin" }, null, 2))
+  const linux = installVibePlugin(plugin, "acme-pack", env, "linux")
+  assert.match(linux.warnings.join("\n"), /skipped MCP server 'cupertino' \(darwin only\) on this machine/)
+  const installed = JSON.parse(fs.readFileSync(path.join(linux.path, "mcp.json"), "utf8"))
+  assert.equal(Object.hasOwn(installed.mcpServers, "cupertino"), false)
+  assert.ok(installed.mcpServers.shadcn)
+  assert.equal(installed.$schema, "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json")
+  // Idempotent on the same machine, full on the gated one.
+  const again = installVibePlugin(plugin, "acme-pack", env, "linux")
+  assert.equal(again.changed, false)
+  const mac = installVibePlugin(plugin, "acme-pack", env, "darwin")
+  assert.equal(mac.warnings.length, 0)
+  assert.ok(JSON.parse(fs.readFileSync(path.join(mac.path, "mcp.json"), "utf8")).mcpServers.cupertino)
+})
+
+test("installVibePlugin prunes mcp.json when every server is gated away", () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "vibe-gated-"))
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "vibe-gated-home-"))
+  const env = { ...process.env, VIBE_HOME: home }
+  const plugin = makePluginSource(parent, "acme-pack")
+  fs.writeFileSync(path.join(plugin, "mcp.json"), JSON.stringify({
+    $schema: "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+    mcpServers: { cupertino: { type: "stdio", command: "cupertino", args: ["serve"] } }
+  }, null, 2))
+  fs.writeFileSync(path.join(plugin, "mcp-platforms.json"), JSON.stringify({ cupertino: "darwin" }, null, 2))
+  const mac = installVibePlugin(plugin, "acme-pack", env, "darwin")
+  assert.ok(fs.existsSync(path.join(mac.path, "mcp.json")))
+  const linux = installVibePlugin(plugin, "acme-pack", env, "linux")
+  assert.equal(fs.existsSync(path.join(linux.path, "mcp.json")), false)
+  assert.match(linux.warnings.join("\n"), /skipped MCP server 'cupertino'/)
+  assert.match(linux.warnings.join("\n"), /pruned 'mcp\.json' \(not applicable on this platform\)/)
+})

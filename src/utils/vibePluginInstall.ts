@@ -30,10 +30,11 @@ export function vibePluginsRoot(env: NodeJS.ProcessEnv = process.env): string {
 
 /**
  * Make `target` identical to `source`, mirroring content only: non-directory
- * entries are always copied as regular files. Returns true when anything was
- * written or pruned.
+ * entries are always copied as regular files. `overrides` rewrites (or, with
+ * `null`, drops) individual files: the platform-gated mcp.json of this machine.
+ * Returns true when anything was written or pruned.
  */
-function mirrorPluginTree(source: string, target: string, warnings: string[], relative: string): boolean {
+function mirrorPluginTree(source: string, target: string, warnings: string[], relative: string, overrides?: Map<string, Buffer | null>): boolean {
   let changed = false
   // A target that is itself a link or a plain file is never written through:
   // the real directory replaces it, so the install can never escape itself.
@@ -61,7 +62,31 @@ function mirrorPluginTree(source: string, target: string, warnings: string[], re
       throw new Error(`Vibe plugin source must not contain a symlink: ${from}`)
     }
     if (entry.isDirectory()) {
-      if (mirrorPluginTree(from, to, warnings, label)) changed = true
+      if (mirrorPluginTree(from, to, warnings, label, overrides)) changed = true
+      continue
+    }
+    const override = overrides?.get(label)
+    if (override === null) {
+      // The file is not for this machine: keep it out of the installed copy.
+      if (fs.lstatSync(to, { throwIfNoEntry: false })) {
+        fs.rmSync(to, { force: true })
+        changed = true
+        warnings.push(`pruned '${label}' (not applicable on this platform)`)
+      }
+      continue
+    }
+    if (override !== undefined) {
+      let stat = fs.lstatSync(to, { throwIfNoEntry: false })
+      if (stat?.isSymbolicLink()) {
+        fs.rmSync(to, { force: true })
+        changed = true
+        warnings.push(`replaced the linked '${label}'`)
+        stat = undefined
+      }
+      if (!stat || !fs.readFileSync(to).equals(override)) {
+        fs.writeFileSync(to, override)
+        changed = true
+      }
       continue
     }
     if (!fs.existsSync(to) || (fs.statSync(to).mode & 0o111) !== (fs.statSync(from).mode & 0o111) ||
@@ -74,16 +99,66 @@ function mirrorPluginTree(source: string, target: string, warnings: string[], re
 }
 
 /**
+ * Per-file mirror overrides for platform-gated MCP servers: the generated
+ * mcp.json stays complete and machine-independent, `mcp-platforms.json`
+ * records each server's gate, and the installed copy keeps only the servers
+ * built for this machine (a plugin's mcp.json cannot express conditions).
+ */
+function vibeMcpPlatformOverrides(source: string, platform: string, warnings: string[]): Map<string, Buffer | null> | null {
+  const mcpPath = path.join(source, "mcp.json")
+  const sidecarPath = path.join(source, "mcp-platforms.json")
+  if (!fs.existsSync(mcpPath) || !fs.existsSync(sidecarPath)) return null
+  let document: any
+  let sidecar: any
+  try {
+    document = JSON.parse(fs.readFileSync(mcpPath, "utf8"))
+    sidecar = JSON.parse(fs.readFileSync(sidecarPath, "utf8"))
+  } catch {
+    return null
+  }
+  if (!document || typeof document !== "object" || !document.mcpServers || typeof document.mcpServers !== "object" ||
+      !sidecar || typeof sidecar !== "object" || Array.isArray(sidecar)) return null
+  const gates = new Map<string, string[]>()
+  for (const [name, value] of Object.entries(sidecar as Record<string, unknown>)) {
+    if (typeof value !== "string") continue
+    const platforms = value.split(",").map(item => item.trim().toLowerCase()).filter(Boolean)
+    if (platforms.length > 0) gates.set(name, platforms)
+  }
+  if (gates.size === 0) return null
+  const kept: Record<string, unknown> = {}
+  let gated = false
+  for (const [name, server] of Object.entries(document.mcpServers as Record<string, unknown>)) {
+    const gate = gates.get(name)
+    if (gate && !gate.includes(platform.toLowerCase())) {
+      warnings.push(`skipped MCP server '${name}' (${gate.join(", ")} only) on this machine`)
+      gated = true
+      continue
+    }
+    kept[name] = server
+  }
+  if (!gated) return null
+  const overrides = new Map<string, Buffer | null>()
+  if (Object.keys(kept).length > 0) {
+    overrides.set("mcp.json", Buffer.from(`${JSON.stringify({ ...document, mcpServers: kept }, null, 2)}\n`, "utf8"))
+  } else {
+    overrides.set("mcp.json", null)
+  }
+  return overrides
+}
+
+/**
  * Mirror the generated plugin from `sourceDir` into the Vibe plugins root.
  *
  * The source must be a real directory with a `plugin.json` manifest whose
  * `name` matches `pluginName`; the install then always ends up as
- * `<pluginsRoot>/<pluginName>/`.
+ * `<pluginsRoot>/<pluginName>/`. Platform-gated MCP servers are kept only
+ * when they match `platform` (this machine by default).
  */
 export function installVibePlugin(
   sourceDir: string,
   pluginName: string,
-  env: NodeJS.ProcessEnv = process.env
+  env: NodeJS.ProcessEnv = process.env,
+  platform: string = process.platform
 ): VibePluginInstallResult {
   const resolvedSource = path.resolve(sourceDir)
   const stat = fs.lstatSync(resolvedSource, { throwIfNoEntry: false })
@@ -106,9 +181,10 @@ export function installVibePlugin(
     throw new Error(`plugin.json declares name "${String(manifestName)}" but the install name is "${pluginName}"; regenerate the bridge so they match`)
   }
   const warnings: string[] = []
+  const overrides = vibeMcpPlatformOverrides(resolvedSource, platform, warnings)
   const target = path.join(vibePluginsRoot(env), pluginName)
   fs.mkdirSync(path.dirname(target), { recursive: true })
-  const changed = mirrorPluginTree(resolvedSource, target, warnings, "")
+  const changed = mirrorPluginTree(resolvedSource, target, warnings, "", overrides)
   return { path: target, changed, warnings }
 }
 

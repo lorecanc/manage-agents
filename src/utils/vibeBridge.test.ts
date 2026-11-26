@@ -486,6 +486,39 @@ test("disabled MCP servers required by agent permissions are emitted with a warn
   assert.ok(result.warnings.some(warning => warning.includes("emitted because translated agents require it")))
 })
 
+test("platform-gated MCP servers ship with an mcp-platforms.json sidecar", () => {
+  const agents = [
+    agent(
+      "a.md",
+      "m",
+      {
+        mode: "primary",
+        permission: { "cupertino_*": "allow", read: "allow" }
+      },
+      "Uses the cupertino_* tools."
+    )
+  ]
+  const workspace = makeWorkspace({
+    "opencode.json": JSON.stringify({
+      mcp: {
+        servers: {
+          cupertino: { type: "local", command: ["cupertino", "serve"], disabled: true, platform: "darwin" },
+          shadcn: { type: "local", command: ["npx", "-y", "shadcn@latest", "mcp"] }
+        }
+      }
+    })
+  })
+  const output = path.join(workspace, "bridges", "vibe")
+  const result = bridgeToVibe(agents, "p", "", output, workspace)
+  const mcp = JSON.parse(fs.readFileSync(path.join(output, "mcp.json"), "utf8"))
+  // Disabled but required: still emitted, so the committed bridge stays machine-independent.
+  assert.ok(mcp.mcpServers.cupertino)
+  assert.ok(mcp.mcpServers.shadcn)
+  const sidecar = JSON.parse(fs.readFileSync(path.join(output, "mcp-platforms.json"), "utf8"))
+  assert.deepEqual(sidecar, { cupertino: "darwin" })
+  assert.match(fs.readFileSync(path.join(output, "README.md"), "utf8"), /mcp-platforms\.json/)
+})
+
 test("agents that reference MCP servers warn that spawned subagents have no MCP", () => {
   const agents = [
     agent(

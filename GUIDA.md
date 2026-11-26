@@ -449,7 +449,9 @@ subagent lanciabile: `agent_type = "subagent"` anche per il `mode: primary`, con
 le descrizioni superano al massimo 300 caratteri, troncate a confine di parola con un avviso), `skills/` (le skill del
 pack copiate con il nome fissato; i comandi diventano skill invocabili con `/<nome>` e `user-invocable: true`, con
 `$ARGUMENTS` sostituito da `$request`) e `mcp.json` (i server MCP come `stdio` o `streamable-http`, solo header
-statici: un `Authorization: Bearer {env:VAR}` non si può spedire in un plugin e va installato con `vibe mcp add`). I permessi diventano restringimenti per tool (`[tools.bash] permission =
+statici: un `Authorization: Bearer {env:VAR}` non si può spedire in un plugin e va installato con `vibe mcp add`). Un server
+può dichiarare `platform` (`darwin`, `linux`, `win32`): resta nell'mcp.json committato, viene registrato nel sidecar
+`mcp-platforms.json` e l'installer lo tiene solo sulle macchine corrispondenti (per esempio cupertino solo su macOS). I permessi diventano restringimenti per tool (`[tools.bash] permission =
 "never"` per i divieti, incluso il complemento del catch-all `"*": deny`), i riferimenti agli agenti vengono riscritti
 con lo scope `<plugin>:<nome>` e i nomi degli strumenti adattati a Vibe (`todo`, `ask_user_question`, `agents.spawn`,
 `read_file`, `write_file`). A fine generazione il plugin viene installato in `~/.vibe/plugins/<nome>/` (a meno di

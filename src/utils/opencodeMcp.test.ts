@@ -2,12 +2,33 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import {
   isLocalServer,
+  isServerAvailableOnPlatform,
   isServerDisabled,
   normalizeMcpConfig,
   readMcpServerNames,
   readMcpServers,
+  serverPlatform,
   setServerDisabled
 } from "./opencodeMcp.js"
+
+test("serverPlatform normalizes the optional platform gate", () => {
+  assert.deepEqual(serverPlatform({}), null)
+  assert.deepEqual(serverPlatform({ type: "local", command: ["x"] }), null)
+  assert.deepEqual(serverPlatform({ platform: "darwin" }), ["darwin"])
+  assert.deepEqual(serverPlatform({ platform: "Darwin, Linux" }), ["darwin", "linux"])
+  assert.deepEqual(serverPlatform({ platform: ["darwin", "win32"] }), ["darwin", "win32"])
+  assert.deepEqual(serverPlatform({ platform: "" }), null)
+  assert.deepEqual(serverPlatform({ platform: [] }), null)
+})
+
+test("isServerAvailableOnPlatform gates a server to its machine class", () => {
+  assert.equal(isServerAvailableOnPlatform({}), true)
+  assert.equal(isServerAvailableOnPlatform({}, "darwin"), true)
+  assert.equal(isServerAvailableOnPlatform({ platform: "darwin" }, "darwin"), true)
+  assert.equal(isServerAvailableOnPlatform({ platform: "darwin" }, "linux"), false)
+  assert.equal(isServerAvailableOnPlatform({ platform: "darwin,linux" }, "linux"), true)
+  assert.equal(isServerAvailableOnPlatform({ platform: ["darwin"] }, "win32"), false)
+})
 
 test("readMcpServers reads the V2 mcp.servers shape", () => {
   const servers = { fs: { type: "local", command: ["mcp-fs"] } }

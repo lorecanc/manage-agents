@@ -6,7 +6,7 @@ import os from "node:os"
 import path from "node:path"
 import test from "node:test"
 import { tempDir, writePack } from "../../test/helpers.js"
-import { applyPlan, changeTarget, installChange, planReconcile, readInstalled, reconcileChange, restoreBackup, rollbackInterrupted, targetStatus, uninstallChange, updateChange, withTargetLock, type ChangeOptions } from "./installer.js"
+import { applyPlan, changeTarget, installChange, packContribution, planReconcile, readInstalled, reconcileChange, restoreBackup, rollbackInterrupted, targetStatus, uninstallChange, updateChange, withTargetLock, type ChangeOptions, type LoadedPack } from "./installer.js"
 import { readLock } from "./lock.js"
 import { MAX_SCANNED_BYTES, parseJsonc } from "./packs.js"
 import { addSource, pullSource, type SourceRegistry } from "./sources.js"
@@ -868,4 +868,28 @@ test("git sources: reconcile installs the locked revision after a pull; update m
   assert.equal(update.status, "applied")
   assert.equal(fs.readFileSync(path.join(target, "agents/notes.md"), "utf8"), "v2\n")
   assert.deepEqual(targetStatus(target, registry, env).drift, [])
+})
+
+test("packContribution skips MCP servers gated to another platform", () => {
+  const pack = {
+    name: "acme",
+    locked: {},
+    dir: "/tmp/acme",
+    validation: { ids: { plugins: [] }, files: [] },
+    fileHashes: {},
+    configText: JSON.stringify({
+      mcp: {
+        servers: {
+          cupertino: { type: "local", command: ["cupertino", "serve"], disabled: true, platform: "darwin" },
+          shadcn: { type: "local", command: ["npx", "-y", "shadcn@latest", "mcp"] }
+        }
+      }
+    })
+  } as unknown as LoadedPack
+  const linux = packContribution(pack, "/targets/demo", undefined, "linux")
+  assert.deepEqual(linux.contribution.objects["mcp.servers"], { shadcn: { type: "local", command: ["npx", "-y", "shadcn@latest", "mcp"] } })
+  assert.deepEqual(linux.skippedMcpServers, ["cupertino"])
+  const mac = packContribution(pack, "/targets/demo", undefined, "darwin")
+  assert.ok((mac.contribution.objects["mcp.servers"] as Record<string, any>).cupertino)
+  assert.deepEqual(mac.skippedMcpServers, [])
 })

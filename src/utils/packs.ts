@@ -5,6 +5,7 @@ import semver from "semver"
 import YAML from "yaml"
 import { isModelRef, isTrigger, validateConditionalRule, type ConditionalRule } from "./values.js"
 import { extractFrontmatter } from "./agents.js"
+import { MCP_SERVER_PLATFORMS } from "./opencodeMcp.js"
 
 /** Pack contract implemented by this engine (contract/CONTRACT.md). */
 export const CONTRACT_VERSION = { major: 1, minor: 1 } as const
@@ -494,6 +495,13 @@ export function validatePack(packRoot: string, options: ValidatePackOptions = {}
       else for (const [name, server] of Object.entries((servers ?? {}) as Record<string, unknown>)) {
         if (CONTROL_CHAR_RE.test(name)) { error("config-invalid", file, "mcp.servers keys must not contain control characters"); continue }
         if (!isObject(server) || (server.type !== "local" && server.type !== "remote")) { error("config-invalid", file, `mcp.servers.${name} needs "type": "local" or "remote"`); continue }
+        if (server.platform !== undefined) {
+          const tokens = typeof server.platform === "string" ? server.platform.split(",") : Array.isArray(server.platform) ? server.platform : null
+          if (!tokens || !tokens.every(token => (MCP_SERVER_PLATFORMS as readonly string[]).includes(String(token).trim().toLowerCase()))) {
+            error("config-invalid", file, `mcp.servers.${name}.platform must be a comma-separated list of: ${MCP_SERVER_PLATFORMS.join(", ")}`)
+            continue
+          }
+        }
         ids.mcpServers.push(name)
         if (server.type === "local") {
           if (typeof server.command === "string" && CONTROL_CHAR_RE.test(server.command)) { error("config-invalid", file, `mcp.servers.${name}.command must not contain control characters`); continue }

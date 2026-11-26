@@ -31,7 +31,7 @@ import type { TranslationConfig } from "./translationConfig.js"
 import { scanOpenCodeCompanions, type OpenCodeCompanions } from "./bridge.js"
 import { assertInsideRealWorkspace, realpathThroughExistingAncestor } from "./pathValidation.js"
 import { isKnownPermissionKey, translatePermissionsV2ToV1 } from "./v2Compat.js"
-import { isServerDisabled, readMcpServers } from "./opencodeMcp.js"
+import { isServerDisabled, readMcpServers, serverPlatform } from "./opencodeMcp.js"
 import { parseJsonc, toolModuleName } from "./packs.js"
 import { adaptToolReferences, collectBashAllowlist, isOpenCodeCustomToolKey, legacyAgentAlias, renderBashAllowlistSection, type BashAllowlist } from "./bridgeToolReferences.js"
 
@@ -796,7 +796,7 @@ function copyCompanionSkill(
 
 // --- README ---
 
-function renderMcpSetup(config: VibeMcpConfig | null): string[] {
+function renderMcpSetup(config: VibeMcpConfig | null, platforms: Record<string, string> = {}): string[] {
   if (!config || config.servers.length === 0) return []
   const lines = [
     "## MCP setup",
@@ -813,6 +813,10 @@ function renderMcpSetup(config: VibeMcpConfig | null): string[] {
   lines.push(
     "",
     `The plugin carries these servers as-is. Authenticated remote servers (and \`{env:VAR}\` headers) cannot be expressed in a plugin's static mcp.json: install them at the Vibe config level instead, for example ${markdownCode("vibe mcp add <name> --url <url> --api-key-env <VAR>")}, or via OAuth.`,
+    ...(Object.keys(platforms).length > 0 ? [
+      "",
+      `Platform-gated servers (${Object.entries(platforms).map(([name, value]) => `\`${name}\`: ${value}`).join(", ")}) are recorded in \`mcp-platforms.json\`: the manager's installer keeps them only on matching machines, because a plugin's mcp.json cannot express conditions.`
+    ] : []),
     "",
     "In a session, run `/mcp` (or `/mcp status`) to verify every server is connected.",
     ""
@@ -866,6 +870,7 @@ function renderReadme(
   companions: OpenCodeCompanions,
   warnings: string[],
   mcpConfig: VibeMcpConfig | null,
+  mcpPlatforms: Record<string, string>,
   bashAllowlists: BashAllowlist[],
   hasCommands: boolean,
   hasHooks: boolean
@@ -912,7 +917,7 @@ function renderReadme(
     "",
     "OpenCode tool names in prompts are rewritten where Vibe has an equivalent (`todowrite` → `todo`, `question` → `ask_user_question`, Task tool → `agents.spawn`, `read` → `read_file`, `write` → `write_file`). Prompts that rely on custom tools shipped by the pack start with a runtime note saying they are unavailable here and that the documented fallbacks apply." + (hasCommands ? " Commands were translated into user-invocable skills: their `$ARGUMENTS` placeholder became `$request`, and `!`substitutions`` became inline bash blocks." : ""),
     "",
-    ...renderMcpSetup(mcpConfig),
+    ...renderMcpSetup(mcpConfig, mcpPlatforms),
     ...renderVibeCompanionSection(companions),
     ...renderBashAllowlistSection("vibe", bashAllowlists),
     ...renderAgentList(plugin)
@@ -989,6 +994,14 @@ export function writeVibePlugin(
   const mcpSource = config.vibe.emitMcp === false ? {} : readBridgeMcpServers(workspaceRoot, warnings)
   const mcpConfig = buildVibeMcpConfig(mcpSource, requiredServers, warnings)
   const activeServerNames = (mcpConfig?.servers ?? []).map(([name]) => name)
+  // Platform gates travel as a sidecar: mcp.json stays machine-independent
+  // (committed bridges stay byte-identical everywhere) and the installer of
+  // each machine drops the servers that are not built for it.
+  const mcpPlatforms: Record<string, string> = {}
+  for (const name of activeServerNames) {
+    const platforms = serverPlatform(mcpSource[name] ?? {})
+    if (platforms) mcpPlatforms[name] = platforms.join(",")
+  }
   const aliases = buildAgentAliasMap(agents, prefix)
   const targets = resolveTargets(agents, config)
   const translatedAgents = agents.map(agent => convertVibeAgent(agent, prefix, aliases, config, warnings, agents, targets, customTools, activeServerNames, normalizedPluginName))
@@ -1068,11 +1081,12 @@ export function writeVibePlugin(
   }
   const mcpJson = renderVibeMcpJson(mcpConfig)
   if (mcpJson) artifacts.set("mcp.json", mcpJson)
+  if (Object.keys(mcpPlatforms).length > 0) artifacts.set("mcp-platforms.json", `${JSON.stringify(mcpPlatforms, null, 2)}\n`)
   if (config.vibe.emitReadme !== false) {
     const bashAllowlists = agents
       .map((agent, index) => collectBashAllowlist(translatedAgents[index]?.name ?? agent.filename, agent.frontmatter))
       .filter((allowlist): allowlist is BashAllowlist => allowlist !== null)
-    artifacts.set("README.md", renderReadme(plugin, companions, warnings, mcpConfig, bashAllowlists, commandNames.size > 0, emitHooks))
+    artifacts.set("README.md", renderReadme(plugin, companions, warnings, mcpConfig, mcpPlatforms, bashAllowlists, commandNames.size > 0, emitHooks))
   }
 
   const files: string[] = []

@@ -11,6 +11,7 @@ import { hasErrors, installableFiles, MANIFEST_FILE, MAX_SCANNED_BYTES, parseJso
 import { hashFile, orderByRequires, packContent, parsePackRequest, resolvePacks, type ResolveOptions } from "./resolver.js"
 import { discoverAllPacks, findSource, lastFetchedRevision, pullSource, revisionSnapshot, sourceRevision, type GitOptions, type SourceRegistry } from "./sources.js"
 import { own, setOwn } from "./values.js"
+import { isServerAvailableOnPlatform } from "./opencodeMcp.js"
 import { buildRuntimeRouting, CONFIG_SECTIONS, effectiveOverrides, loadOverrideSettings, loadRoutingSettings, patchFrontmatter, patchedConfigSections, resolveEffectiveCallers, routesOfEntry, type PackOverrides } from "./userSettings.js"
 import { validateVirtualPack, VIRTUAL_PACK_VERSION, virtualManifestHash } from "./virtualPacks.js"
 import { jsoncArrayPath, rewriteJsoncPreservingComments } from "./targetJsonc.js"
@@ -234,7 +235,7 @@ const arrayKey = (section: string, entry: unknown) => section === "plugins" ? pl
  * The pack's opencode.json(c) and AGENTS.md as target config entries. Every shipped plugin is registered; the
  * plugins registered only implicitly are listed in `implicitPlugins`, so a dependent pack can configure them.
  */
-export function packContribution(pack: LoadedPack, target: string, overrides: Required<PackOverrides> = { agents: {}, commands: {}, config: {} }): { contribution: Contribution; implicitPlugins: Set<string> } {
+export function packContribution(pack: LoadedPack, target: string, overrides: Required<PackOverrides> = { agents: {}, commands: {}, config: {} }, platform: string = process.platform): { contribution: Contribution; implicitPlugins: Set<string>; skippedMcpServers: string[] } {
   const contribution: Contribution = { plugins: [], skills: [], instructions: [], objects: {} }
   if (pack.configText && Buffer.byteLength(pack.configText, "utf8") > MAX_SCANNED_BYTES) throw new Error(`pack configuration exceeds maximum scanned size (${MAX_SCANNED_BYTES} bytes)`)
   const config = pack.configText !== null ? parseJsonc(pack.configText) as Record<string, any> : {}
@@ -280,7 +281,20 @@ export function packContribution(pack: LoadedPack, target: string, overrides: Re
       setOwn(section, id, patched)
     }
   }
-  return { contribution, implicitPlugins }
+  // Platform-gated MCP servers (`platform` key) never reach a target on a
+  // machine they are not built for; the contribution stays machine-independent.
+  const skippedMcpServers: string[] = []
+  const servers = contribution.objects["mcp.servers"]
+  if (isObject(servers)) {
+    for (const name of Object.keys(servers)) {
+      if (isObject(servers[name]) && !isServerAvailableOnPlatform(servers[name], platform)) {
+        delete servers[name]
+        skippedMcpServers.push(name)
+      }
+    }
+    if (Object.keys(servers).length === 0) delete contribution.objects["mcp.servers"]
+  }
+  return { contribution, implicitPlugins, skippedMcpServers }
 }
 
 export interface PlanOptions {
@@ -527,7 +541,16 @@ function planConfig(target: string, configFile: string, packs: LoadedPack[], pre
   }
 
   const engine = { name: ENGINE_OWNER, contribution: { plugins: [`./${ROUTER_DIR}`], skills: [], instructions: [], objects: {} } as Contribution, implicitPlugins: new Set<string>() }
-  const computed = [...packs.map(pack => ({ name: pack.name, ...packContribution(pack, target, overrides.get(pack.name)) })), ...(withRouter ? [engine] : [])]
+  const computed = [
+    ...packs.map(pack => {
+      const contributed = packContribution(pack, target, overrides.get(pack.name))
+      for (const server of contributed.skippedMcpServers) {
+        plan.warnings.push(`mcp.servers ${JSON.stringify(server)} from pack ${JSON.stringify(pack.name)} is gated to another platform; skipped on ${process.platform}`)
+      }
+      return { name: pack.name, ...contributed }
+    }),
+    ...(withRouter ? [engine] : [])
+  ]
   const explicitPlugins = new Set(computed.flatMap(({ contribution, implicitPlugins }) => contribution.plugins.map(pluginKey).filter(key => !implicitPlugins.has(key))))
   for (const { name, contribution, implicitPlugins } of computed) {
     const recorded: Contribution = { plugins: [], skills: [], instructions: [], objects: {} }

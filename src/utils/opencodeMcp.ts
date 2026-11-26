@@ -46,3 +46,25 @@ export function isLocalServer(server: Record<string, any>): boolean {
 export function readMcpServerNames(config: Record<string, any>): string[] {
   return Object.keys(readMcpServers(config)).sort()
 }
+
+/** Platforms an MCP server can be gated to with the optional `platform` key. */
+export const MCP_SERVER_PLATFORMS = ["darwin", "linux", "win32"] as const
+
+/**
+ * Normalized platform list from the optional `platform` key: a single value
+ * (`"darwin"`), a comma-separated string (`"darwin,linux"`) or an array.
+ * `null` means the server installs on every machine.
+ */
+export function serverPlatform(server: Record<string, any>): string[] | null {
+  const raw = server.platform
+  const list = typeof raw === "string" ? raw.split(",") : Array.isArray(raw) ? raw : null
+  if (!list) return null
+  const platforms = [...new Set(list.map(item => String(item).trim().toLowerCase()).filter(Boolean))]
+  return platforms.length > 0 ? platforms : null
+}
+
+/** True when the server installs on the given platform (this machine by default). */
+export function isServerAvailableOnPlatform(server: Record<string, any>, platform: string = process.platform): boolean {
+  const platforms = serverPlatform(server)
+  return platforms === null || platforms.includes(platform.toLowerCase())
+}
