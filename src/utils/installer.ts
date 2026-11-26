@@ -12,6 +12,7 @@ import { hashFile, orderByRequires, packContent, parsePackRequest, resolvePacks,
 import { discoverAllPacks, findSource, lastFetchedRevision, pullSource, revisionSnapshot, sourceRevision, type GitOptions, type SourceRegistry } from "./sources.js"
 import { own, setOwn } from "./values.js"
 import { isServerAvailableOnPlatform } from "./opencodeMcp.js"
+import { BROWSER_TOKEN, detectBrowserExecutable, expandBrowserToken } from "./browserDetect.js"
 import { buildRuntimeRouting, CONFIG_SECTIONS, effectiveOverrides, loadOverrideSettings, loadRoutingSettings, patchFrontmatter, patchedConfigSections, resolveEffectiveCallers, routesOfEntry, type PackOverrides } from "./userSettings.js"
 import { validateVirtualPack, VIRTUAL_PACK_VERSION, virtualManifestHash } from "./virtualPacks.js"
 import { jsoncArrayPath, rewriteJsoncPreservingComments } from "./targetJsonc.js"
@@ -235,7 +236,7 @@ const arrayKey = (section: string, entry: unknown) => section === "plugins" ? pl
  * The pack's opencode.json(c) and AGENTS.md as target config entries. Every shipped plugin is registered; the
  * plugins registered only implicitly are listed in `implicitPlugins`, so a dependent pack can configure them.
  */
-export function packContribution(pack: LoadedPack, target: string, overrides: Required<PackOverrides> = { agents: {}, commands: {}, config: {} }, platform: string = process.platform): { contribution: Contribution; implicitPlugins: Set<string>; skippedMcpServers: string[] } {
+export function packContribution(pack: LoadedPack, target: string, overrides: Required<PackOverrides> = { agents: {}, commands: {}, config: {} }, platform: string = process.platform, browserExecutable?: string | null): { contribution: Contribution; implicitPlugins: Set<string>; skippedMcpServers: string[]; unresolvedMcpTokens: string[] } {
   const contribution: Contribution = { plugins: [], skills: [], instructions: [], objects: {} }
   if (pack.configText && Buffer.byteLength(pack.configText, "utf8") > MAX_SCANNED_BYTES) throw new Error(`pack configuration exceeds maximum scanned size (${MAX_SCANNED_BYTES} bytes)`)
   const config = pack.configText !== null ? parseJsonc(pack.configText) as Record<string, any> : {}
@@ -294,7 +295,21 @@ export function packContribution(pack: LoadedPack, target: string, overrides: Re
     }
     if (Object.keys(servers).length === 0) delete contribution.objects["mcp.servers"]
   }
-  return { contribution, implicitPlugins, skippedMcpServers }
+  // `{browser}` is resolved here, machine by machine: the target config gets
+  // this machine's browser, never a literal placeholder.
+  const unresolvedMcpTokens: string[] = []
+  const remaining = contribution.objects["mcp.servers"]
+  if (isObject(remaining)) {
+    for (const [name, server] of Object.entries(remaining)) {
+      if (!isObject(server) || !Array.isArray(server.command)) continue
+      if (!server.command.some(part => typeof part === "string" && part.includes(BROWSER_TOKEN))) continue
+      const executable = browserExecutable !== undefined ? browserExecutable : detectBrowserExecutable({ platform })
+      const expanded = expandBrowserToken(server.command.map(String), executable)
+      server.command = expanded.elements
+      if (expanded.unresolved) unresolvedMcpTokens.push(name)
+    }
+  }
+  return { contribution, implicitPlugins, skippedMcpServers, unresolvedMcpTokens }
 }
 
 export interface PlanOptions {
@@ -546,6 +561,9 @@ function planConfig(target: string, configFile: string, packs: LoadedPack[], pre
       const contributed = packContribution(pack, target, overrides.get(pack.name))
       for (const server of contributed.skippedMcpServers) {
         plan.warnings.push(`mcp.servers ${JSON.stringify(server)} from pack ${JSON.stringify(pack.name)} is gated to another platform; skipped on ${process.platform}`)
+      }
+      for (const server of contributed.unresolvedMcpTokens) {
+        plan.warnings.push(`mcp.servers ${JSON.stringify(server)} from pack ${JSON.stringify(pack.name)} uses the {browser} placeholder but no browser was detected on this machine; the argument was dropped`)
       }
       return { name: pack.name, ...contributed }
     }),

@@ -893,3 +893,30 @@ test("packContribution skips MCP servers gated to another platform", () => {
   assert.ok((mac.contribution.objects["mcp.servers"] as Record<string, any>).cupertino)
   assert.deepEqual(mac.skippedMcpServers, [])
 })
+
+test("packContribution resolves {browser} in MCP commands for this machine", () => {
+  const pack = {
+    name: "acme",
+    locked: {},
+    dir: "/tmp/acme",
+    validation: { ids: { plugins: [] }, files: [] },
+    fileHashes: {},
+    configText: JSON.stringify({
+      mcp: {
+        servers: {
+          "chrome-devtools": { type: "local", command: ["npx", "-y", "chrome-devtools-mcp@latest", "--executable-path={browser}", "--headless"] }
+        }
+      }
+    })
+  } as unknown as LoadedPack
+  const resolved = packContribution(pack, "/targets/demo", undefined, "linux", "/snap/bin/chromium")
+  assert.deepEqual((resolved.contribution.objects["mcp.servers"] as Record<string, any>)["chrome-devtools"].command, [
+    "npx", "-y", "chrome-devtools-mcp@latest", "--executable-path=/snap/bin/chromium", "--headless"
+  ])
+  assert.deepEqual(resolved.unresolvedMcpTokens, [])
+  const missing = packContribution(pack, "/targets/demo", undefined, "linux", null)
+  assert.deepEqual((missing.contribution.objects["mcp.servers"] as Record<string, any>)["chrome-devtools"].command, [
+    "npx", "-y", "chrome-devtools-mcp@latest", "--headless"
+  ])
+  assert.deepEqual(missing.unresolvedMcpTokens, ["chrome-devtools"])
+})

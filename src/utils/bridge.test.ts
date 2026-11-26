@@ -796,6 +796,18 @@ test("translates V1 and V2 OpenCode MCP declarations to the same Claude .mcp.jso
   assert.deepEqual(v1.mcpServers["remote-tool"], { type: "http", url: "https://example.test/mcp" })
 })
 
+test("drops {browser} arguments from the Claude .mcp.json", () => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "claude-bridge-browser-"))
+  fs.writeFileSync(path.join(workspace, "opencode.json"), JSON.stringify({
+    mcp: { servers: { "chrome-devtools": { type: "local", command: ["npx", "-y", "chrome-devtools-mcp@latest", "--executable-path={browser}", "--headless"] } } }
+  }))
+  const output = path.join(workspace, "claude")
+  const result = bridgeToClaudeCode([fixture("pipeline-orchestrator.md", "")], "pipeline", "pipeline-", output, workspace, DEFAULT_TRANSLATION_CONFIG)
+  const mcp = JSON.parse(fs.readFileSync(path.join(output, ".mcp.json"), "utf8"))
+  assert.deepEqual(mcp.mcpServers["chrome-devtools"], { command: "npx", args: ["-y", "chrome-devtools-mcp@latest", "--headless"] })
+  assert.ok(result.warnings.some(warning => warning.includes("dropped the {browser} argument")))
+})
+
 test("keeps MCP permissions declared in V2 permissions arrays", () => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "claude-bridge-mcp-v2-permissions-"))
   fs.writeFileSync(path.join(workspace, "opencode.json"), JSON.stringify({

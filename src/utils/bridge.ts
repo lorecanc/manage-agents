@@ -10,6 +10,7 @@ import { toolModuleName, toolModulePaths } from "./packs.js"
 import { assertInsideRealWorkspace, realpathThroughExistingAncestor } from "./pathValidation.js"
 import { isKnownPermissionKey, translatePermissionsV2ToV1 } from "./v2Compat.js"
 import { isServerDisabled, readMcpServers } from "./opencodeMcp.js"
+import { stripBrowserToken } from "./browserDetect.js"
 import { adaptToolReferences, legacyAgentAlias, collectBashAllowlist, isOpenCodeCustomToolKey, renderBashAllowlistSection, type BashAllowlist } from "./bridgeToolReferences.js"
 
 type ResolvedModelTarget = ReturnType<typeof resolveModelTarget>
@@ -593,7 +594,11 @@ function buildClaudeMcpConfig(
       const commandParts = Array.isArray(server.command)
         ? server.command.map(String)
         : typeof server.command === "string" ? server.command.trim().split(/\s+/) : []
-      if (commandParts.length === 0 && typeof server.url !== "string") continue
+      const withoutBrowser = stripBrowserToken(commandParts)
+      if (withoutBrowser.dropped) {
+        warnings.push(`[mcp] '${name}': dropped the {browser} argument; Claude installs the committed plugin verbatim, so the server detects the browser itself`)
+      }
+      if (withoutBrowser.elements.length === 0 && typeof server.url !== "string") continue
 
       if (typeof server.url === "string") {
         // Claude Code parses an entry without "type" as stdio and drops it for lacking "command".
@@ -602,8 +607,8 @@ function buildClaudeMcpConfig(
       }
 
       const translated: Record<string, any> = {
-        command: commandParts[0],
-        ...(commandParts.length > 1 ? { args: commandParts.slice(1) } : {})
+        command: withoutBrowser.elements[0],
+        ...(withoutBrowser.elements.length > 1 ? { args: withoutBrowser.elements.slice(1) } : {})
       }
       if (server.environment && typeof server.environment === "object") {
         translated.env = Object.fromEntries(

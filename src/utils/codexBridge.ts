@@ -7,6 +7,7 @@ import type { TranslationConfig } from "./translationConfig.js"
 import { assertInsideRealWorkspace, realpathThroughExistingAncestor } from "./pathValidation.js"
 import { isKnownPermissionKey, translatePermissionsV2ToV1 } from "./v2Compat.js"
 import { isServerDisabled, readMcpServers } from "./opencodeMcp.js"
+import { stripBrowserToken } from "./browserDetect.js"
 import { parseJsonc, toolModuleName, toolModulePaths } from "./packs.js"
 import { adaptToolReferences, legacyAgentAlias, collectBashAllowlist, isOpenCodeCustomToolKey, renderBashAllowlistSection, type BashAllowlist } from "./bridgeToolReferences.js"
 
@@ -405,7 +406,11 @@ function translateMcpServer(name: string, server: Record<string, any>, warnings:
   const commandParts = Array.isArray(server.command)
     ? server.command.map(String)
     : typeof server.command === "string" ? server.command.trim().split(/\s+/) : []
-  const [command, ...args] = commandParts
+  const withoutBrowser = stripBrowserToken(commandParts)
+  if (withoutBrowser.dropped) {
+    warnings.push(`[mcp] '${name}': dropped the {browser} argument; the Codex project runs the server with its own browser detection`)
+  }
+  const [command, ...args] = withoutBrowser.elements
   if (!command) return null
   const translated: CodexMcpServer = { command, ...(args.length ? { args } : {}) }
   const env: Array<[string, string]> = []

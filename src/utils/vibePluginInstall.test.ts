@@ -279,3 +279,42 @@ test("installVibePlugin prunes mcp.json when every server is gated away", () => 
   assert.match(linux.warnings.join("\n"), /skipped MCP server 'cupertino'/)
   assert.match(linux.warnings.join("\n"), /pruned 'mcp\.json' \(not applicable on this platform\)/)
 })
+
+test("installVibePlugin resolves {browser} placeholders for this machine", () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "vibe-browser-"))
+  const makeHome = () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "vibe-browser-home-"))
+    return { env: { ...process.env, VIBE_HOME: home }, home }
+  }
+  const plugin = makePluginSource(parent, "acme-pack")
+  fs.writeFileSync(path.join(plugin, "mcp.json"), JSON.stringify({
+    $schema: "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+    mcpServers: {
+      "chrome-devtools": {
+        type: "stdio",
+        command: "npx",
+        args: ["-y", "chrome-devtools-mcp@latest", "--executable-path={browser}", "--headless"]
+      }
+    }
+  }, null, 2))
+  const resolved = installVibePlugin(plugin, "acme-pack", makeHome().env, "linux", "/snap/bin/chromium")
+  const mcp = JSON.parse(fs.readFileSync(path.join(resolved.path, "mcp.json"), "utf8"))
+  assert.deepEqual(mcp.mcpServers["chrome-devtools"].args, ["-y", "chrome-devtools-mcp@latest", "--executable-path=/snap/bin/chromium", "--headless"])
+  assert.equal(resolved.warnings.length, 0)
+  const missing = installVibePlugin(plugin, "acme-pack", makeHome().env, "linux", null)
+  const dropped = JSON.parse(fs.readFileSync(path.join(missing.path, "mcp.json"), "utf8"))
+  assert.deepEqual(dropped.mcpServers["chrome-devtools"].args, ["-y", "chrome-devtools-mcp@latest", "--headless"])
+  assert.match(missing.warnings.join("\n"), /no browser was detected on this machine; the argument was dropped/)
+  // Without tokens and without gates the mirror stays byte-exact.
+  const plainSource = makePluginSource(parent, "plain-pack")
+  fs.writeFileSync(path.join(plainSource, "mcp.json"), JSON.stringify({
+    $schema: "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+    mcpServers: { docs: { type: "stdio", command: "docs-mcp" } }
+  }, null, 2))
+  const plainHome = makeHome()
+  const first = installVibePlugin(plainSource, "plain-pack", plainHome.env, "linux")
+  const second = installVibePlugin(plainSource, "plain-pack", plainHome.env, "linux")
+  assert.equal(second.changed, false)
+  assert.equal(second.warnings.length, 0)
+  assert.equal(fs.readFileSync(path.join(second.path, "mcp.json"), "utf8"), fs.readFileSync(path.join(plainSource, "mcp.json"), "utf8"))
+})

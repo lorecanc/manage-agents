@@ -486,6 +486,23 @@ test("disabled MCP servers required by agent permissions are emitted with a warn
   assert.ok(result.warnings.some(warning => warning.includes("emitted because translated agents require it")))
 })
 
+test("{browser} placeholders stay in the committed mcp.json for the installer to resolve", () => {
+  const agents = [agent("a.md", "m", { mode: "primary" }, "Body")]
+  const workspace = makeWorkspace({
+    "opencode.json": JSON.stringify({
+      mcp: {
+        servers: {
+          "chrome-devtools": { type: "local", command: ["npx", "-y", "chrome-devtools-mcp@latest", "--executable-path={browser}", "--headless"] }
+        }
+      }
+    })
+  })
+  const output = path.join(workspace, "bridges", "vibe")
+  bridgeToVibe(agents, "p", "", output, workspace)
+  const mcp = JSON.parse(fs.readFileSync(path.join(output, "mcp.json"), "utf8"))
+  assert.deepEqual(mcp.mcpServers["chrome-devtools"].args, ["-y", "chrome-devtools-mcp@latest", "--executable-path={browser}", "--headless"])
+})
+
 test("platform-gated MCP servers ship with an mcp-platforms.json sidecar", () => {
   const agents = [
     agent(

@@ -293,6 +293,18 @@ test("Codex plugin mirrors enabled MCP servers in a valid companion layer", () =
   assert.ok(result.files.some(file => file.split(path.sep).join("/").endsWith("/.mcp.json")))
 })
 
+test("Codex bridge drops {browser} arguments from MCP commands", () => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "codex-bridge-browser-"))
+  fs.writeFileSync(path.join(workspace, "opencode.json"), JSON.stringify({
+    mcp: { servers: { "chrome-devtools": { type: "local", command: ["npx", "-y", "chrome-devtools-mcp@latest", "--executable-path={browser}", "--headless"] } } }
+  }))
+  const output = path.join(workspace, "bridges", "codex")
+  const result = bridgeToCodex([agent("orchestrator.md", "any", { mode: "primary" }, "")], "browser", "", output, workspace)
+  const mcp = JSON.parse(fs.readFileSync(path.join(output, ".mcp.json"), "utf8"))
+  assert.deepEqual(mcp.mcpServers["chrome-devtools"].args, ["-y", "chrome-devtools-mcp@latest", "--headless"])
+  assert.ok(result.warnings.some(warning => warning.includes("dropped the {browser} argument")))
+})
+
 test("Codex exports MCP credentials by environment name and preserves tool denies", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-mcp-settings-"))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))

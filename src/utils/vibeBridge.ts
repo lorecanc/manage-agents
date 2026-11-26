@@ -813,6 +813,8 @@ function renderMcpSetup(config: VibeMcpConfig | null, platforms: Record<string, 
   lines.push(
     "",
     `The plugin carries these servers as-is. Authenticated remote servers (and \`{env:VAR}\` headers) cannot be expressed in a plugin's static mcp.json: install them at the Vibe config level instead, for example ${markdownCode("vibe mcp add <name> --url <url> --api-key-env <VAR>")}, or via OAuth.`,
+    "",
+    "Commands may carry the `{browser}` placeholder: the manager's installer resolves it to this machine's browser (Chromium preferred over Chrome) and drops the argument when none is installed.",
     ...(Object.keys(platforms).length > 0 ? [
       "",
       `Platform-gated servers (${Object.entries(platforms).map(([name, value]) => `\`${name}\`: ${value}`).join(", ")}) are recorded in \`mcp-platforms.json\`: the manager's installer keeps them only on matching machines, because a plugin's mcp.json cannot express conditions.`

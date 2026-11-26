@@ -12,6 +12,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { validateVibePluginName, VIBE_AGENT_PROFILE_MARKER } from "./vibeBridge.js"
+import { BROWSER_TOKEN, detectBrowserExecutable, expandBrowserToken } from "./browserDetect.js"
 
 export interface VibePluginInstallResult {
   /** Absolute path of the installed plugin directory. */
@@ -99,20 +100,23 @@ function mirrorPluginTree(source: string, target: string, warnings: string[], re
 }
 
 /**
- * Per-file mirror overrides for platform-gated MCP servers: the generated
- * mcp.json stays complete and machine-independent, `mcp-platforms.json`
- * records each server's gate, and the installed copy keeps only the servers
+ * Per-file mirror overrides for machine-local MCP adaptation: the generated
+ * mcp.json stays complete and machine-independent, `mcp-platforms.json` records
+ * each server's platform gate, and the installed copy keeps only the servers
  * built for this machine (a plugin's mcp.json cannot express conditions).
+ * `{browser}` placeholders in commands are resolved to this machine's browser
+ * on the same pass; without one, the placeholder argument is dropped so the
+ * server falls back to its own detection.
  */
-function vibeMcpPlatformOverrides(source: string, platform: string, warnings: string[]): Map<string, Buffer | null> | null {
+function vibeMcpMachineOverrides(source: string, platform: string, warnings: string[], browserExecutable?: string | null): Map<string, Buffer | null> | null {
   const mcpPath = path.join(source, "mcp.json")
   const sidecarPath = path.join(source, "mcp-platforms.json")
-  if (!fs.existsSync(mcpPath) || !fs.existsSync(sidecarPath)) return null
+  if (!fs.existsSync(mcpPath)) return null
   let document: any
-  let sidecar: any
+  let sidecar: any = {}
   try {
     document = JSON.parse(fs.readFileSync(mcpPath, "utf8"))
-    sidecar = JSON.parse(fs.readFileSync(sidecarPath, "utf8"))
+    if (fs.existsSync(sidecarPath)) sidecar = JSON.parse(fs.readFileSync(sidecarPath, "utf8"))
   } catch {
     return null
   }
@@ -124,19 +128,50 @@ function vibeMcpPlatformOverrides(source: string, platform: string, warnings: st
     const platforms = value.split(",").map(item => item.trim().toLowerCase()).filter(Boolean)
     if (platforms.length > 0) gates.set(name, platforms)
   }
-  if (gates.size === 0) return null
+  const hasToken = Object.values(document.mcpServers as Record<string, unknown>).some(server => {
+    if (!server || typeof server !== "object") return false
+    const entry = server as Record<string, unknown>
+    if (typeof entry.command === "string" && entry.command.includes(BROWSER_TOKEN)) return true
+    return Array.isArray(entry.args) && entry.args.some(arg => typeof arg === "string" && arg.includes(BROWSER_TOKEN))
+  })
+  if (gates.size === 0 && !hasToken) return null
   const kept: Record<string, unknown> = {}
-  let gated = false
+  let changed = false
   for (const [name, server] of Object.entries(document.mcpServers as Record<string, unknown>)) {
     const gate = gates.get(name)
     if (gate && !gate.includes(platform.toLowerCase())) {
       warnings.push(`skipped MCP server '${name}' (${gate.join(", ")} only) on this machine`)
-      gated = true
+      changed = true
+      continue
+    }
+    if (hasToken && server && typeof server === "object") {
+      const entry = { ...(server as Record<string, unknown>) }
+      const commandHasToken = typeof entry.command === "string" && entry.command.includes(BROWSER_TOKEN)
+      const argsHaveToken = Array.isArray(entry.args) && entry.args.some(arg => typeof arg === "string" && arg.includes(BROWSER_TOKEN))
+      if (commandHasToken || argsHaveToken) {
+        const executable = browserExecutable !== undefined ? browserExecutable : detectBrowserExecutable({ platform })
+        if (commandHasToken) {
+          const expanded = expandBrowserToken([entry.command as string], executable)
+          entry.command = expanded.elements[0] ?? ""
+          if (expanded.unresolved) {
+            warnings.push(`MCP server '${name}' uses the {browser} placeholder but no browser was detected on this machine; the command was dropped`)
+          }
+        }
+        if (argsHaveToken) {
+          const expanded = expandBrowserToken((entry.args as unknown[]).map(String), executable)
+          entry.args = expanded.elements
+          if (expanded.unresolved) {
+            warnings.push(`MCP server '${name}' uses the {browser} placeholder but no browser was detected on this machine; the argument was dropped`)
+          }
+        }
+        changed = true
+      }
+      kept[name] = entry
       continue
     }
     kept[name] = server
   }
-  if (!gated) return null
+  if (!changed) return null
   const overrides = new Map<string, Buffer | null>()
   if (Object.keys(kept).length > 0) {
     overrides.set("mcp.json", Buffer.from(`${JSON.stringify({ ...document, mcpServers: kept }, null, 2)}\n`, "utf8"))
@@ -158,7 +193,8 @@ export function installVibePlugin(
   sourceDir: string,
   pluginName: string,
   env: NodeJS.ProcessEnv = process.env,
-  platform: string = process.platform
+  platform: string = process.platform,
+  browserExecutable?: string | null
 ): VibePluginInstallResult {
   const resolvedSource = path.resolve(sourceDir)
   const stat = fs.lstatSync(resolvedSource, { throwIfNoEntry: false })
@@ -181,7 +217,7 @@ export function installVibePlugin(
     throw new Error(`plugin.json declares name "${String(manifestName)}" but the install name is "${pluginName}"; regenerate the bridge so they match`)
   }
   const warnings: string[] = []
-  const overrides = vibeMcpPlatformOverrides(resolvedSource, platform, warnings)
+  const overrides = vibeMcpMachineOverrides(resolvedSource, platform, warnings, browserExecutable)
   const target = path.join(vibePluginsRoot(env), pluginName)
   fs.mkdirSync(path.dirname(target), { recursive: true })
   const changed = mirrorPluginTree(resolvedSource, target, warnings, "", overrides)

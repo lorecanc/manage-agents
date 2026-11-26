@@ -451,7 +451,12 @@ pack copiate con il nome fissato; i comandi diventano skill invocabili con `/<no
 `$ARGUMENTS` sostituito da `$request`) e `mcp.json` (i server MCP come `stdio` o `streamable-http`, solo header
 statici: un `Authorization: Bearer {env:VAR}` non si può spedire in un plugin e va installato con `vibe mcp add`). Un server
 può dichiarare `platform` (`darwin`, `linux`, `win32`): resta nell'mcp.json committato, viene registrato nel sidecar
-`mcp-platforms.json` e l'installer lo tiene solo sulle macchine corrispondenti (per esempio cupertino solo su macOS). I permessi diventano restringimenti per tool (`[tools.bash] permission =
+`mcp-platforms.json` e l'installer lo tiene solo sulle macchine corrispondenti (per esempio cupertino solo su macOS).
+Un elemento `{browser}` nel comando del server (per esempio `--executable-path={browser}`) designa il browser della
+macchina: il reconcile del target OpenCode e l'installer del plugin Vibe lo sostituiscono con l'eseguibile rilevato,
+preferendo la famiglia Chromium a quella di Chrome e lasciando `--headless` come normale argomento del comando; i
+bridge Claude e Codex, che installano i file committati senza modificarli, lo eliminano con un avviso e il server torna
+alla propria rilevazione interna. I permessi diventano restringimenti per tool (`[tools.bash] permission =
 "never"` per i divieti, incluso il complemento del catch-all `"*": deny`), i riferimenti agli agenti vengono riscritti
 con lo scope `<plugin>:<nome>` e i nomi degli strumenti adattati a Vibe (`todo`, `ask_user_question`, `agents.spawn`,
 `read_file`, `write_file`). A fine generazione il plugin viene installato in `~/.vibe/plugins/<nome>/` (a meno di
