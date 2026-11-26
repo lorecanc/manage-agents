@@ -48,15 +48,31 @@ function makeWorkspace(files: Record<string, string>): string {
   return root
 }
 
-test("Vibe roles map planning to mistral-large-4 and execution to mistral-medium-3.5", () => {
+test("Vibe default tiers never force a model: every agent inherits the session's", () => {
+  const primary = agent("orchestrator.md", "github-copilot/claude-opus-5", { mode: "primary" }, "")
+  const luna = agent("explorer.md", "github-copilot/gpt-5.6-luna", {}, "")
+  // Role and inference still pick the tier, but the default tier model is `inherit`.
+  assert.deepEqual(resolveVibeModel(primary, [primary, luna], DEFAULT_TRANSLATION_CONFIG), { model: null })
+  assert.deepEqual(resolveVibeModel(luna, [primary, luna], DEFAULT_TRANSLATION_CONFIG), { model: null })
+})
+
+test("Vibe roles map to the configured tier models", () => {
   const primary = agent("orchestrator.md", "github-copilot/claude-opus-5", { mode: "primary" }, "")
   const opus = agent("reviewer.md", "github-copilot/claude-opus-5", {}, "")
   const luna = agent("explorer.md", "github-copilot/gpt-5.6-luna", {}, "")
-  const config = DEFAULT_TRANSLATION_CONFIG
-  assert.deepEqual(resolveVibeModel(primary, [primary, opus, luna], config), { model: "mistral-large-4" })
+  const config: TranslationConfig = {
+    ...DEFAULT_TRANSLATION_CONFIG,
+    tiers: {
+      ...DEFAULT_TRANSLATION_CONFIG.tiers,
+      planning: { ...DEFAULT_TRANSLATION_CONFIG.tiers.planning, vibe: { model: "zai-glm-5-3" } },
+      execution: { ...DEFAULT_TRANSLATION_CONFIG.tiers.execution, vibe: { model: "deepseek-v4.1-flash" } },
+      light: { ...DEFAULT_TRANSLATION_CONFIG.tiers.light, vibe: { model: "deepseek-v4.1-flash" } }
+    }
+  }
+  assert.deepEqual(resolveVibeModel(primary, [primary, opus, luna], config), { model: "zai-glm-5-3" })
   // The unmapped reviewer inherits the primary's planning tier by model inference.
-  assert.deepEqual(resolveVibeModel(opus, [primary, opus, luna], config), { model: "mistral-large-4" })
-  assert.deepEqual(resolveVibeModel(luna, [primary, opus, luna], config), { model: "mistral-medium-3.5" })
+  assert.deepEqual(resolveVibeModel(opus, [primary, opus, luna], config), { model: "zai-glm-5-3" })
+  assert.deepEqual(resolveVibeModel(luna, [primary, opus, luna], config), { model: "deepseek-v4.1-flash" })
 })
 
 test("Vibe inherit overrides omit activeModel", () => {
@@ -225,8 +241,9 @@ test("bridge emits a Vibe plugin package: manifest, subagents, skills and MCP", 
   const explorerToml = fs.readFileSync(path.join(output, "ai.mistral.vibe", "agents", "explorer.toml"), "utf8")
   // Every plugin agent is a spawnable subagent, including the primary.
   assert.match(explorerToml, /agent_type = "subagent"/)
-  assert.match(explorerToml, /active_model = "mistral-medium-3\.5"/)
-  assert.match(orchestratorToml, /active_model = "mistral-large-4"/)
+  // Default tiers are `inherit`: no agent pins a model, like OpenCode frontmatter without `model:`.
+  assert.doesNotMatch(explorerToml, /active_model/)
+  assert.doesNotMatch(orchestratorToml, /active_model/)
   assert.match(explorerToml, /display_name = "Explorer"/)
   // The read-only explorer is safe; the orchestrator is neutral.
   assert.match(explorerToml, /safety = "safe"/)
@@ -252,7 +269,7 @@ test("bridge emits a Vibe plugin package: manifest, subagents, skills and MCP", 
   assert.equal(result.plugin.profiles[0].fileName, "decent-pipeline-orchestrator.toml")
   const profileToml = fs.readFileSync(path.join(output, "agent-profiles", "decent-pipeline-orchestrator.toml"), "utf8")
   assert.match(profileToml, /display_name = "Orchestrator"/)
-  assert.match(profileToml, /active_model = "mistral-large-4"/)
+  assert.doesNotMatch(profileToml, /active_model/)
   assert.match(profileToml, /## Native Vibe delegation protocol/)
   assert.doesNotMatch(profileToml, /^agent_type =/m)
   assert.doesNotMatch(profileToml, /^safety =/m)
@@ -291,6 +308,29 @@ test("bridge emits a Vibe plugin package: manifest, subagents, skills and MCP", 
   assert.match(readme, /## Main agent profiles/)
   assert.match(readme, /vibe --agent decent-pipeline-orchestrator/)
   assert.match(readme, /Spawned subagents run with a reduced toolset/)
+})
+
+test("bridge pins active_model only when the translation config configures tier models", () => {
+  const agents = FULL_AGENTS()
+  const workspace = makeWorkspace(FULL_WORKSPACE_FILES())
+  const output = path.join(workspace, "bridges", "vibe-pinned")
+  const config: TranslationConfig = {
+    ...DEFAULT_TRANSLATION_CONFIG,
+    tiers: {
+      ...DEFAULT_TRANSLATION_CONFIG.tiers,
+      planning: { ...DEFAULT_TRANSLATION_CONFIG.tiers.planning, vibe: { model: "zai-glm-5-3" } },
+      execution: { ...DEFAULT_TRANSLATION_CONFIG.tiers.execution, vibe: { model: "deepseek-v4.1-flash" } },
+      light: { ...DEFAULT_TRANSLATION_CONFIG.tiers.light, vibe: { model: "deepseek-v4.1-flash" } }
+    }
+  }
+  const result = bridgeToVibe(agents, "Decent Pipeline", "pipeline-", output, workspace, config)
+  const orchestratorToml = fs.readFileSync(path.join(output, "ai.mistral.vibe", "agents", "orchestrator.toml"), "utf8")
+  const explorerToml = fs.readFileSync(path.join(output, "ai.mistral.vibe", "agents", "explorer.toml"), "utf8")
+  const profileToml = fs.readFileSync(path.join(output, "agent-profiles", "decent-pipeline-orchestrator.toml"), "utf8")
+  assert.match(orchestratorToml, /active_model = "zai-glm-5-3"/)
+  assert.match(explorerToml, /active_model = "deepseek-v4\.1-flash"/)
+  assert.match(profileToml, /active_model = "zai-glm-5-3"/)
+  assert.equal(result.plugin.profiles.length, 1)
 })
 
 test("catch-all deny with edit allow keeps the write tools available", () => {

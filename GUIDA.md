@@ -420,9 +420,9 @@ del ruolo, poi l'inferenza, infine `defaultTier`. Per Claude la destinazione dev
 `haiku`, `inherit` o un ID completo `claude-*`. Per Codex usa un ID modello oppure `inherit`.
 Con `inherit` il bridge omette modello e sforzo di ragionamento dal TOML del subagente.
 Codex usa così i valori del chiamante, salvo impostazioni esplicite alla delega o default personali per i subagenti.
-Per Vibe usa un alias Mistrale (`mistral-large-4`, `mistral-medium-3.5`) oppure `inherit`: Vibe accetta solo gli
-alias definiti nelle proprie voci `[[models]]`, quindi allinea i tier alla tua installazione, oppure con `inherit`
-l'agente segue il modello della sessione (nessun `active_model`).
+Per Vibe il default di ogni tier è `inherit`: nessun `active_model`, l'agente segue il modello della sessione, come un
+frontmatter OpenCode senza `model:`. Il bridge non forza mai un modello; se vuoi pinnare un alias (per tier, `modelMap`
+o override) dev'essere uno definito nelle voci `[[models]]` dell'installazione Vibe di destinazione.
 
 **Opzioni che restano.** Le mappature e i flag Claude passati da riga di comando (`--no-validate`, `--no-register`,
 `--marketplace-name`) vengono salvati nella configurazione e riusati dalle esecuzioni successive. Non esiste un flag
@@ -445,7 +445,8 @@ I server richiesti esplicitamente dagli agenti continuano a seguire la regola di
 **Plugin Vibe.** `manage-agents bridge --pack <pack> --target vibe` emette un **plugin Vibe nativo** (Agent Plugins 1.0 con
 l'estensione `ai.mistral.vibe`): `plugin.json` (manifest), `ai.mistral.vibe/agents/<nome>.toml` (ogni agente diventa un
 subagent lanciabile: `agent_type = "subagent"` anche per il `mode: primary`, con `safety` derivata dai permessi,
-`active_model` sul tier Mistral e chiavi underscores come `schema_version`, `display_name`, `active_model`;
+`active_model` solo quando la configurazione di traduzione pinnella un modello (default `inherit`: chiave omessa) e
+chiavi underscores come `schema_version`, `display_name`, `active_model`;
 le descrizioni superano al massimo 300 caratteri, troncate a confine di parola con un avviso), `skills/` (le skill del
 pack copiate con il nome fissato; i comandi diventano skill invocabili con `/<nome>` e `user-invocable: true`, con
 `$ARGUMENTS` sostituito da `$request`) e `mcp.json` (i server MCP come `stdio` o `streamable-http`, solo header

@@ -68,19 +68,20 @@ const DEFAULT_TIERS: Record<string, TranslationTier> = {
     description: "Agents that reason, plan and review",
     claude: { model: "opus" },
     codex: { model: "gpt-5.6-sol", reasoningEffort: "high" },
-    vibe: { model: "mistral-large-4" },
+    // Vibe never forces a model by default: agents follow the session's model.
+    vibe: { model: "inherit" },
   },
   execution: {
     description: "Agents that execute tasks, cheaper and faster",
     claude: { model: "sonnet" },
     codex: { model: "gpt-5.6-luna", reasoningEffort: "max" },
-    vibe: { model: "mistral-medium-3.5" },
+    vibe: { model: "inherit" },
   },
   light: {
     description: "Agents that do lightweight work (claude haiku; codex parity with execution)",
     claude: { model: "haiku" },
     codex: { model: "gpt-5.6-luna", reasoningEffort: "max" },
-    vibe: { model: "mistral-medium-3.5" },
+    vibe: { model: "inherit" }
   }
 }
 const DEFAULT_ROLES: Record<string, string> = {

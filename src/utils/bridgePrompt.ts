@@ -15,7 +15,7 @@ export type BridgeField = "name" | "pack" | "tiers" | "effort" | "agents" | "mod
 
 export const CLAUDE_TIER_MODEL_PRESETS = ["opus", "sonnet", "haiku", "inherit"] as const
 export const CODEX_EFFORT_PRESETS = ["low", "medium", "high", "xhigh", "max"] as const
-export const VIBE_TIER_MODEL_PRESETS = ["mistral-large-4", "mistral-medium-3.5", "inherit"] as const
+export const VIBE_TIER_MODEL_PRESETS = ["inherit", "mistral-large-4", "mistral-medium-3.5"] as const
 
 export interface BridgePackOption {
   pack: string

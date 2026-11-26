@@ -89,11 +89,11 @@ OpenCode packs typically reference provider-qualified models with reasoning vari
 
 | Tier | Purpose | Default Claude Target | Default Codex Target | Default Vibe Target | Default Mapped Roles |
 |---|---|---|---|---|---|
-| `planning` | Reasoning, architecture, planning, and review | `{ model: "opus" }` | `{ model: "gpt-5.6-sol", reasoningEffort: "high" }` | `{ model: "mistral-large-4" }` | `orchestrator`, `planner`, `reasoner`, `critic`, `code_reviewer` |
-| `execution` | General implementation, testing, and refactoring | `{ model: "sonnet" }` | `{ model: "gpt-5.6-luna", reasoningEffort: "max" }` | `{ model: "mistral-medium-3.5" }` | `refactorer`, `tester`, `fast_lane` (also `defaultTier`) |
-| `light` | Fast exploration and focused mechanical edits | `{ model: "haiku" }` | `{ model: "gpt-5.6-luna", reasoningEffort: "max" }` | `{ model: "mistral-medium-3.5" }` | `executor`, `explorer` |
+| `planning` | Reasoning, architecture, planning, and review | `{ model: "opus" }` | `{ model: "gpt-5.6-sol", reasoningEffort: "high" }` | `{ model: "inherit" }` | `orchestrator`, `planner`, `reasoner`, `critic`, `code_reviewer` |
+| `execution` | General implementation, testing, and refactoring | `{ model: "sonnet" }` | `{ model: "gpt-5.6-luna", reasoningEffort: "max" }` | `{ model: "inherit" }` | `refactorer`, `tester`, `fast_lane` (also `defaultTier`) |
+| `light` | Fast exploration and focused mechanical edits | `{ model: "haiku" }` | `{ model: "gpt-5.6-luna", reasoningEffort: "max" }` | `{ model: "inherit" }` | `executor`, `explorer` |
 
-Claude model strings are validated against `CLAUDE_MODEL_PATTERN`, accepting family aliases (`fable`, `sonnet`, `opus`, `haiku`, `inherit`) or full `claude-*` IDs. Vibe tier models are Mistral model aliases (`mistral-large-4`, `mistral-medium-3.5`, ...); an agent whose tier model is `inherit` gets no `active_model` and follows the session's model. Vibe only accepts aliases defined in its own `[[models]]` configuration and refuses an agent file whose alias is unknown, so align the tier models with the target installation. Legacy `version: 1` translation configs are automatically upgraded in `migrateV1` (keeping the default Vibe tier models).
+Claude model strings are validated against `CLAUDE_MODEL_PATTERN`, accepting family aliases (`fable`, `sonnet`, `opus`, `haiku`, `inherit`) or full `claude-*` IDs. Vibe never forces a model by default: every default tier model is `inherit`, so an agent follows the session's model unless a tier model, `modelMap` entry or override pins a free-form alias the target installation defines in `[[models]]`. Vibe refuses an agent file whose alias is unknown, so align any pinned tier model with the target installation. Legacy `version: 1` translation configs are automatically upgraded in `migrateV1` (Vibe tiers take the current defaults, `inherit`).
 
 ### Five-Step Resolution Precedence (`resolveModelTarget`)
 

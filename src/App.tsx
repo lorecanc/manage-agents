@@ -4647,7 +4647,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         const delta: 1 | -1 = key === "left" ? -1 : 1
         if (bridgeFocusedField === "tiers" && bridgeTarget !== "codex" && bridgeTierNames.length > 0) {
           const tierName = bridgeTierNames[bridgeTierIndex]
-          const currentModel = bridgeDraftTiers[tierName]?.[bridgeTarget]?.model ?? (bridgeTarget === "vibe" ? "mistral-medium-3.5" : "sonnet")
+          const currentModel = bridgeDraftTiers[tierName]?.[bridgeTarget]?.model ?? (bridgeTarget === "vibe" ? "inherit" : "sonnet")
           setBridgeClaudeTierTyping(false)
           updateBridgeTierModel(tierName, cyclePresetValue(bridgeTarget === "vibe" ? VIBE_TIER_MODEL_PRESETS : CLAUDE_TIER_MODEL_PRESETS, currentModel, delta))
         } else if (bridgeFocusedField === "effort" && bridgeTarget === "codex" && bridgeTierNames.length > 0) {
