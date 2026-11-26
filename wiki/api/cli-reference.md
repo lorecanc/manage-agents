@@ -374,18 +374,18 @@ Batch-updates OpenCode V2 execution frontmatter parameters across workspace agen
 
 ```bash
 manage-agents bridge [options]
-manage-agents bridge check [--pack <name>] [--target <claude|codex>]
+manage-agents bridge check [--pack <name>] [--target <claude|codex|vibe>]
 ```
 
-[Translates](../concepts/cross-harness-translation.md) a workspace pack and its transitive `requires` into a **Claude Code plugin** or a **Codex layer** (`src/index.tsx:265-513`; see [Claude Code & Codex Bridges](../modules/bridges.md)). Reusable settings are stored in [`bridges/translation-config.json`](../config/translation-and-release-config.md) by default.
+[Translates](../concepts/cross-harness-translation.md) a workspace pack and its transitive `requires` into a **Claude Code plugin**, a **Codex layer**, or a **Mistral Vibe plugin** (`src/index.tsx:265-513`; see [Claude Code, Codex & Vibe Bridges](../modules/bridges.md)). Run without `--no-install-vibe`, a `vibe` bridge also mirrors the generated package into `$VIBE_HOME/plugins/<name>/` (~/.vibe/plugins by default). Reusable settings are stored in [`bridges/translation-config.json`](../config/translation-and-release-config.md) by default.
 
 #### `bridge` Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--pack <name>` | Configured `prefix` stripped of trailing `-` | Pack to translate (with its required packs). |
-| `--target <name>`, `-t <name>` | `config.target` (`claude`) | Translation target: `claude` or `codex`. |
-| `--output <path>`, `-o <path>` | `bridges/<claude-code\|codex>/<name>` | Output directory for generated bridge files. |
+| `--target <name>`, `-t <name>` | `config.target` (`claude`) | Translation target: `claude`, `codex` or `vibe`. |
+| `--output <path>`, `-o <path>` | `bridges/<claude-code\|codex\|vibe>/<name>` | Output directory for generated bridge files. |
 | `--name <name>`, `-n <name>` | `config.pluginName` (`decent-pipeline`) | Plugin / layer name (sanitized for filesystem use). |
 | `--prefix <prefix>`, `-p <prefix>` | `<pack>-` (or `config.prefix`) | Prefix stripped from source agent names. |
 | `--config <path>` | `bridges/translation-config.json` | Path to reusable translation config JSON. |
@@ -393,18 +393,19 @@ manage-agents bridge check [--pack <name>] [--target <claude|codex>]
 | `--map-all <target>` | None | Shorthand for `--model "*=<target>"`. Persisted to config. |
 | `--no-validate` | `claude.autoValidate` (`true`) | Skip running `claude plugin validate --strict` after generating a `claude` bridge. Persisted to config. |
 | `--no-register` | `claude.autoRegister` (`true`) | Skip registering/installing the generated plugin into Claude Code. Persisted to config. |
+| `--no-install-vibe` | `vibe.autoInstall` (`true`) | Skip mirroring the generated Vibe plugin into the Vibe plugins root (`$VIBE_HOME/plugins/`). Persisted to config. |
 | `--marketplace-name <name>` | `<plugin>-local` | Local Claude marketplace identifier used during plugin registration. Persisted to config. |
 | `--wizard`, `-w` | `false` | Launch interactive wizard to configure target, plugin name, prefix, and planning/execution tier models before bridging. |
 | `--help`, `-h` | — | Print `bridge` usage and exit `0`. |
 
 #### `bridge check` Options
 
-Regenerates committed bridges (`bridges/claude-code/<plugin>` and/or `bridges/codex/<plugin>`) in memory without migrating or writing `translation-config.json`, comparing every file byte-for-byte (`missing`, `changed`, `extra`).
+Regenerates committed bridges (`bridges/claude-code/<plugin>`, `bridges/codex/<plugin>` and/or `bridges/vibe/<plugin>`) in memory without migrating or writing `translation-config.json`, comparing every file byte-for-byte (`missing`, `changed`, `extra`).
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--pack <name>` | Configured `prefix` without trailing `-` | Pack translated by the committed bridges. |
-| `--target <name>`, `-t <name>` | Both `claude` and `codex` (if present) | Check only `claude` or only `codex`. |
+| `--target <name>`, `-t <name>` | Every committed target (if present) | Check only `claude`, `codex` or `vibe`. |
 | `--help`, `-h` | — | Print `bridge check` usage and exit `0`. |
 
 - **Exit codes (`bridge` & `bridge check`)**: `0` when generation succeeds or committed bridges match cleanly; `1` when `bridge check` detects drift, `--pack` cannot be determined, `--target` is invalid, no committed bridge exists, or an unknown option is passed.

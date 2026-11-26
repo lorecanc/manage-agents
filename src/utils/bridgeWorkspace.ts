@@ -5,6 +5,7 @@ import { parseAgentFile, type AgentInfo } from "./agents.js"
 import { bridgeToClaudeCode, scanOpenCodeCompanions, type BridgeResult } from "./bridge.js"
 import { packDir, packsDir, resolvePackClosure } from "./catalog.js"
 import { bridgeToCodex, type CodexBridgeResult } from "./codexBridge.js"
+import { bridgeToVibe, type VibeBridgeResult } from "./vibeBridge.js"
 import { discoverPackDirs, hasErrors, installableFiles, MANIFEST_FILE, MAX_SCANNED_BYTES, SCRIPT_RE, parseJsonc, validatePack } from "./packs.js"
 import { validateVirtualPack } from "./virtualPacks.js"
 import { defaultTarget } from "./lock.js"
@@ -14,7 +15,7 @@ import { loadSources, sourceRoot } from "./sources.js"
 import { effectiveOverrides, loadOverrideSettings, patchedConfigSections } from "./userSettings.js"
 import type { TranslationConfig } from "./translationConfig.js"
 
-export type BridgeTarget = "claude" | "codex"
+export type BridgeTarget = "claude" | "codex" | "vibe"
 
 export interface BridgeWorkspace {
   /** Temp directory holding the merged layout of the pack and its requirements. */
@@ -182,7 +183,7 @@ export function resolveBridgeWorkspaceTrust(workspaceRoot: string, env: NodeJS.P
  */
 export function withGeneratedPackBridge<T>(
   options: BridgePackOptions,
-  use: (generatedDir: string, result: BridgeResult | CodexBridgeResult) => T
+  use: (generatedDir: string, result: BridgeResult | CodexBridgeResult | VibeBridgeResult) => T
 ): T {
   const { pack, target, outputDir, config, pluginName, prefix, env } = options
   const workspaceRoot = path.resolve(options.workspaceRoot)
@@ -204,7 +205,9 @@ export function withGeneratedPackBridge<T>(
     if (!relative || fs.existsSync(generatedDir)) throw new Error(`Bridge output '${outputDir}' overlaps the content of the bridged packs`)
     const result = target === "codex"
       ? bridgeToCodex(workspace.agents, pluginName, prefix, generatedDir, workspace.root, config)
-      : bridgeToClaudeCode(workspace.agents, pluginName, prefix, generatedDir, workspace.root, config)
+      : target === "vibe"
+        ? bridgeToVibe(workspace.agents, pluginName, prefix, generatedDir, workspace.root, config)
+        : bridgeToClaudeCode(workspace.agents, pluginName, prefix, generatedDir, workspace.root, config)
     return use(result.pluginDir, result)
   } finally {
     workspace.cleanup()
@@ -249,11 +252,12 @@ function mirrorTree(source: string, target: string): void {
   }
 }
 
-/** Bridge `pack` (with its required packs) to Claude Code or Codex and mirror the plugin into `outputDir`. */
+/** Bridge `pack` (with its required packs) to Claude Code, Codex or Vibe and mirror the plugin into `outputDir`. */
 export function bridgePack(options: BridgePackOptions & { target: "claude" }): BridgeResult
 export function bridgePack(options: BridgePackOptions & { target: "codex" }): CodexBridgeResult
-export function bridgePack(options: BridgePackOptions): BridgeResult | CodexBridgeResult
-export function bridgePack(options: BridgePackOptions): BridgeResult | CodexBridgeResult {
+export function bridgePack(options: BridgePackOptions & { target: "vibe" }): VibeBridgeResult
+export function bridgePack(options: BridgePackOptions): BridgeResult | CodexBridgeResult | VibeBridgeResult
+export function bridgePack(options: BridgePackOptions): BridgeResult | CodexBridgeResult | VibeBridgeResult {
   const workspaceRoot = path.resolve(options.workspaceRoot)
   const outputDir = path.resolve(options.outputDir)
   assertSafeOutputDir(workspaceRoot, options.pack, outputDir)

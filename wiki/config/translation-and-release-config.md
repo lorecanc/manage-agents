@@ -27,9 +27,9 @@ Where `manage-agents` reads and writes translation settings depends on whether t
 
 | Context | Read Precedence | Write Path | Bridge Output Directory |
 |---------|-----------------|------------|-------------------------|
-| Local multi-pack workspace or local multi-pack source | `--config <path>` (CLI) or `<workspace>/bridges/translation-config.json` | `--config <path>` (CLI) or `<workspace>/bridges/translation-config.json` | `--output <dir>` or `<workspace>/bridges/<claude-code\|codex>/<pluginName>` |
+| Local multi-pack workspace or local multi-pack source | `--config <path>` (CLI) or `<workspace>/bridges/translation-config.json` | `--config <path>` (CLI) or `<workspace>/bridges/translation-config.json` | `--output <dir>` or `<workspace>/bridges/<claude-code\|codex\|vibe>/<pluginName>` |
 | Standalone local pack | Local bridge settings keyed by the hash of its canonical directory, or explicit CLI `--config` | `$XDG_CONFIG_HOME/manage-agents/translations/local/<hash>/translation.json` | `$XDG_CACHE_HOME/manage-agents/bridges/local/<hash>/<target>/<pluginName>` or explicit CLI `--output` |
-| Registered Git source (TUI) | 1. `$XDG_CONFIG_HOME/manage-agents/translations/<source>/translation.json`<br>2. `<workspace>/.agent-manager/translation.json` (legacy read fallback) | `$XDG_CONFIG_HOME/manage-agents/translations/<source>/translation.json` | `$XDG_CACHE_HOME/manage-agents/bridges/<source>/<claude-code\|codex>/<pluginName>` |
+| Registered Git source (TUI) | 1. `$XDG_CONFIG_HOME/manage-agents/translations/<source>/translation.json`<br>2. `<workspace>/.agent-manager/translation.json` (legacy read fallback) | `$XDG_CONFIG_HOME/manage-agents/translations/<source>/translation.json` | `$XDG_CACHE_HOME/manage-agents/bridges/<source>/<claude-code\|codex\|vibe>/<pluginName>` |
 
 When `XDG_CONFIG_HOME` or `XDG_CACHE_HOME` is unset, `engineConfigDir()` and `engineCacheDir()` fall back to `~/.config/manage-agents` and `~/.cache/manage-agents`, respectively (see [User Settings, Target State & Environment Variables](./user-and-target-files.md)).
 
@@ -37,7 +37,7 @@ Path safety and migration rules enforced by `loadTranslationConfig()` and `saveT
 
 - **Symlink and containment checks**: Config files must not be symlinks (`lstatSync`), and their resolved real paths must stay inside the target base root (`workspaceRoot` for local workspaces, or the per-source `configRoot` under `translations/<source>` for Git sources).
 - **Missing file behavior**: If the file does not exist on disk, `loadTranslationConfig()` returns `DEFAULT_TRANSLATION_CONFIG` normalized and validated in memory without writing a file until an explicit save occurs.
-- **v1 automatic migration**: Files with `version: 1` or an omitted `version` are upgraded in memory by `migrateV1()` to `version: 2` (`claude.primaryModel` and `codex.modelMapping.primary` or `opus` map to `tiers.planning`; `claude.defaultSubagentModel` and `codex.modelMapping.default` map to `tiers.execution`; v1 wildcard `modelMap` and `exact` entries are discarded with a stderr warning). Direct calls to `loadTranslationConfig()` persist the migrated v2 file by default (`persistMigration: true`), whereas passive CLI/TUI reads pass `{ persistMigration: false }`. Any other `version !== 2` throws `unsupported config version`.
+- **v1 automatic migration**: Files with `version: 1` or an omitted `version` are upgraded in memory by `migrateV1()` to `version: 2` (`claude.primaryModel` and `codex.modelMapping.primary` or `opus` map to `tiers.planning`; `claude.defaultSubagentModel` and `codex.modelMapping.default` map to `tiers.execution`; v1 wildcard `modelMap` and `exact` entries are discarded with a stderr warning; the `vibe` tier models keep their defaults, since v1 predates the Vibe target). Direct calls to `loadTranslationConfig()` persist the migrated v2 file by default (`persistMigration: true`), whereas passive CLI/TUI reads pass `{ persistMigration: false }`. Any other `version !== 2` throws `unsupported config version`. Existing `version: 2` files without a `vibe` section or `vibe` tier models are merged with `DEFAULT_TRANSLATION_CONFIG` in `normalizeTranslationConfig()`, so no migration is required.
 
 ### Schema Reference (v2)
 
@@ -46,7 +46,7 @@ Path safety and migration rules enforced by `loadTranslationConfig()` and `saveT
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `version` | `2` | Yes | `2` | Schema version literal. Must be `2`. |
-| `target` | `"claude" \| "codex"` | Yes | `"claude"` | Default bridge target used when `--target` is omitted on the CLI. |
+| `target` | `"claude" \| "codex" \| "vibe"` | Yes | `"claude"` | Default bridge target used when `--target` is omitted on the CLI. |
 | `pluginName` | `string` | Yes | `"translated-agents"` | Generated plugin or layer name (sanitized for filesystem output). |
 | `prefix` | `string` | Yes | `""` | Prefix stripped from agent filenames (after `.md` removal) to compute normalized role/agent names. Also used by `manage-agents bridge` to infer `--pack` (`prefix.replace(/-$/, "")`) when `--pack` is omitted. |
 | `sourceDir` | `string` | Yes | `"."` | Legacy pre-pack agent directory. Validated as a workspace-relative path (`isWorkspaceRelativePath`), ignored by pack bridges. |
@@ -56,10 +56,11 @@ Path safety and migration rules enforced by `loadTranslationConfig()` and `saveT
 | `roles` | `Record<string, string>` | Yes | 10 built-in role mappings | Maps normalized agent names (`normalizeAgentName(filename, prefix)`) to keys in `tiers`. Merged shallowly with `DEFAULT_ROLES`. |
 | `claude` | `object` | Yes | See below | Claude Code target overrides, model mappings, marketplace metadata, and emission flags. |
 | `codex` | `object` | Yes | See below | Codex target overrides, model mappings, and emission flags. |
+| `vibe` | `object` | Yes | See below | Mistral Vibe target overrides, model mappings, and emission flags. |
 
 #### Tier Definitions (`tiers.<name>`)
 
-Every entry in `tiers` must define non-empty `claude.model` and `codex.model` strings:
+Every entry in `tiers` must define non-empty `claude.model`, `codex.model` and `vibe.model` strings:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -68,14 +69,15 @@ Every entry in `tiers` must define non-empty `claude.model` and `codex.model` st
 | `claude.reasoningEffort` | `string` | No | Optional reasoning effort hint on `ModelTarget`. |
 | `codex.model` | `string` | Yes | Target Codex model ID (for example, `"gpt-5.6-sol"` or `"gpt-5.6-luna"`). |
 | `codex.reasoningEffort` | `string` | No | Optional Codex reasoning effort level (for example, `"high"` or `"max"`). |
+| `vibe.model` | `string` | Yes | Target Vibe model alias (`mistral-large-4`, `mistral-medium-3.5`) or `inherit` (no `active_model`; the agent follows the session's model). |
 
 Built-in `DEFAULT_TIERS`:
 
-| Tier | `claude.model` | `codex.model` | `codex.reasoningEffort` | Description |
-|------|----------------|---------------|-------------------------|-------------|
-| `planning` | `"opus"` | `"gpt-5.6-sol"` | `"high"` | Agents that reason, plan and review |
-| `execution` | `"sonnet"` | `"gpt-5.6-luna"` | `"max"` | Agents that execute tasks, cheaper and faster |
-| `light` | `"haiku"` | `"gpt-5.6-luna"` | `"max"` | Agents that do lightweight work (claude haiku; codex parity with execution) |
+| Tier | `claude.model` | `codex.model` | `codex.reasoningEffort` | `vibe.model` | Description |
+|------|----------------|---------------|-------------------------|--------------|-------------|
+| `planning` | `"opus"` | `"gpt-5.6-sol"` | `"high"` | `"mistral-large-4"` | Agents that reason, plan and review |
+| `execution` | `"sonnet"` | `"gpt-5.6-luna"` | `"max"` | `"mistral-medium-3.5"` | Agents that execute tasks, cheaper and faster |
+| `light` | `"haiku"` | `"gpt-5.6-luna"` | `"max"` | `"mistral-medium-3.5"` | Agents that do lightweight work (claude haiku; codex parity with execution) |
 
 #### Role Mappings (`roles`) and Tier Inference (`inference`)
 
@@ -111,6 +113,17 @@ When an agent's normalized role is not present in `roles` and `inference !== fal
 | `emitSkills` | `boolean` | `true` | Generate translated skills in `.agents/skills/` for the Codex project and plugin. |
 | `emitReadme` | `boolean` | `true` | Generate a `README.md` inside the Codex output directory. |
 | `emitMcp` | `boolean` | `undefined` (enabled) | Writes `.codex/config.toml` for the Codex project and `.mcp.json` for the plugin when MCP servers are present. |
+
+#### Vibe Target Settings (`vibe`)
+
+| Field | Type | Default | Validation / Behavior |
+|-------|------|---------|-----------------------|
+| `overrides` | `Record<string, ModelTarget>` | `{}` | Per-agent `{ model, reasoningEffort? }` overrides keyed by normalized agent name. `inherit` leaves the agent on the session's model (no `activeModel`). |
+| `modelMap` | `Record<string, string>` | `{}` | Maps normalized source models (`provider/model`, bare `model`, or `"*"` catch-all) to non-empty Vibe model aliases. Vibe only accepts aliases defined in its `[[models]]` configuration; the generated README documents the alignment. |
+| `emitSkills` | `boolean` | `true` | Copy pack skills and translate commands into user-invocable `skills/<name>/SKILL.md` of the plugin package. |
+| `emitReadme` | `boolean` | `true` | Generate a `README.md` inside the Vibe output directory. |
+| `emitMcp` | `boolean` | `undefined` (enabled) | Writes the plugin `mcp.json` when MCP servers are present. |
+| `autoInstall` | `boolean` | `true` | Mirror the generated plugin into the Vibe plugins root (`$VIBE_HOME/plugins/`) after the bridge; `--no-install-vibe` sets this to `false`. |
 
 #### Model Resolution Precedence and Author Override
 

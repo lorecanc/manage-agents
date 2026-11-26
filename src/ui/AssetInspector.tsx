@@ -23,6 +23,7 @@ export interface PackInspectorProps {
   onBridgeCheck: (packName: string) => void
   onBridgeClaude: (packName: string) => void
   onBridgeCodex: (packName: string) => void
+  onBridgeVibe: (packName: string) => void
   onCodexInstall: (packName: string) => void
   onOpenDoctor: (packName: string) => void
   onOpenScaffold: (packName: string) => void
@@ -72,6 +73,7 @@ export function PackInspector({
   onBridgeCheck,
   onBridgeClaude,
   onBridgeCodex,
+  onBridgeVibe,
   onCodexInstall,
   onOpenDoctor,
   onOpenScaffold,
@@ -112,6 +114,10 @@ export function PackInspector({
   detailLines.push({
     text: `OpenAI Codex: ${pack.bridgeCompat.codex ? "✓" : "–"} ${middleEllipsis(pack.bridgeCompat.codexReason, Math.max(12, safeW - 19))}`,
     color: pack.bridgeCompat.codex ? THEME.accentCyan : THEME.fgMuted,
+  })
+  detailLines.push({
+    text: `Mistral Vibe: ${pack.bridgeCompat.vibe ? "✓" : "–"} ${middleEllipsis(pack.bridgeCompat.vibeReason, Math.max(12, safeW - 18))}`,
+    color: pack.bridgeCompat.vibe ? THEME.accentAmber : THEME.fgMuted,
   })
 
   if (reqEntries.length > 0) {
@@ -173,6 +179,7 @@ export function PackInspector({
             {renderTargetPill("OC", true, THEME.accentGreen)}
             {renderTargetPill("Claude", pack.bridgeCompat.claude, THEME.accentPurple)}
             {renderTargetPill("Codex", pack.bridgeCompat.codex, THEME.accentCyan)}
+            {renderTargetPill("Vibe", pack.bridgeCompat.vibe, THEME.accentAmber)}
           </box>
         </box>
 
@@ -216,6 +223,7 @@ export function PackInspector({
         <box flexDirection="row" gap={1} height={1} marginTop={1} overflow="hidden">
           {pack.bridgeCompat.claude && renderActionBtn("B Claude", THEME.accentPurple, false, () => onBridgeClaude(pack.name))}
           {pack.bridgeCompat.codex && renderActionBtn("⇧B Codex", THEME.accentCyan, false, () => onBridgeCodex(pack.name))}
+          {pack.bridgeCompat.vibe && renderActionBtn("⇧V Vibe", THEME.accentAmber, false, () => onBridgeVibe(pack.name))}
           {pack.bridgeCompat.codex && renderActionBtn("C +Codex", THEME.accentGreen, false, () => onCodexInstall(pack.name))}
         </box>
       </box>
@@ -231,20 +239,20 @@ export interface AssetItemInspectorProps {
   maxRows: number
 }
 
-function assetBridgeNote(kind: CatalogAssetItem["kind"]): { claude: string; codex: string; color: string } {
+function assetBridgeNote(kind: CatalogAssetItem["kind"]): { claude: string; codex: string; vibe: string; color: string } {
   switch (kind) {
     case "skill":
-      return { claude: "Native Claude skill", codex: "Native Codex skill", color: THEME.accentGreen }
+      return { claude: "Native Claude skill", codex: "Native Codex skill", vibe: "Native Vibe skill", color: THEME.accentGreen }
     case "command":
-      return { claude: "Converted to Claude skill", codex: "OpenCode/Claude only", color: THEME.accentCyan }
+      return { claude: "Converted to Claude skill", codex: "OpenCode/Claude only", vibe: "Converted to Vibe skill (user-invocable)", color: THEME.accentCyan }
     case "mcp":
-      return { claude: "Translated to .mcp.json", codex: "Translated to .mcp.json", color: THEME.accentPurple }
+      return { claude: "Translated to .mcp.json", codex: "Translated to .mcp.json", vibe: "Translated to plugin mcp.json", color: THEME.accentPurple }
     case "tool":
-      return { claude: "OpenCode-only", codex: "OpenCode-only", color: THEME.accentAmber }
+      return { claude: "OpenCode-only", codex: "OpenCode-only", vibe: "OpenCode-only (skills recommended)", color: THEME.accentAmber }
     case "plugin":
-      return { claude: "OpenCode-only", codex: "OpenCode-only", color: THEME.accentAmber }
+      return { claude: "OpenCode-only", codex: "OpenCode-only", vibe: "OpenCode-only (skills recommended)", color: THEME.accentAmber }
     case "theme":
-      return { claude: "OpenCode-only", codex: "OpenCode-only", color: THEME.accentBlue }
+      return { claude: "OpenCode-only", codex: "OpenCode-only", vibe: "OpenCode-only", color: THEME.accentBlue }
   }
 }
 
@@ -312,6 +320,9 @@ export function AssetItemInspector({
         </text>
         <text height={1} wrapMode="none" style={{ textColor: THEME.accentCyan }}>
           {middleEllipsis(`Codex:  ${notes.codex}`, safeW - 2)}
+        </text>
+        <text height={1} wrapMode="none" style={{ textColor: THEME.accentAmber }}>
+          {middleEllipsis(`Vibe:   ${notes.vibe}`, safeW - 2)}
         </text>
         {fmEntries.slice(0, 2).map(([k, v]) => (
           <text key={k} height={1} wrapMode="none" style={{ textColor: THEME.fgPrimary }}>

@@ -15,7 +15,7 @@ last_updated: "2026-11-18"
 
 # Authoring, Tuning & Bridge Modals
 
-The [OpenTUI](../dependencies/runtime-and-tooling-stack.md) modal suite in `src/ui/` provides interactive overlays for batch-editing agent frontmatter parameters, diagnosing and scaffolding [OpenCode Contract `1.1`](../api/pack-contract-reference.md) *[packs]* (see [Glossary](../glossary.md)), onboarding un-manifested local or remote Git repositories, and configuring [translation bridges](../concepts/cross-harness-translation.md) to Claude Code and Codex. Each modal computes deterministic terminal geometry from `termWidth` and `termHeight`, sanitizes rendered strings with [`terminalSafeText`](../concepts/security-and-trust-model.md), and delegates state mutations to parent handlers in [`src/App.tsx`](./tui-shell-and-catalog.md).
+The [OpenTUI](../dependencies/runtime-and-tooling-stack.md) modal suite in `src/ui/` provides interactive overlays for batch-editing agent frontmatter parameters, diagnosing and scaffolding [OpenCode Contract `1.1`](../api/pack-contract-reference.md) *[packs]* (see [Glossary](../glossary.md)), onboarding un-manifested local or remote Git repositories, and configuring [translation bridges](../concepts/cross-harness-translation.md) to Claude Code, Codex, and Mistral Vibe. Each modal computes deterministic terminal geometry from `termWidth` and `termHeight`, sanitizes rendered strings with [`terminalSafeText`](../concepts/security-and-trust-model.md), and delegates state mutations to parent handlers in [`src/App.tsx`](./tui-shell-and-catalog.md).
 
 ## Key Files
 
@@ -24,7 +24,7 @@ The [OpenTUI](../dependencies/runtime-and-tooling-stack.md) modal suite in `src/
 | `src/ui/ParameterTuningModal.tsx` | Single-agent and batch frontmatter tuning overlay (`steps`, `variant`, `mode`, `hidden`) plus deterministic pill wrapping (`chunkPillsByWidth`). |
 | `src/ui/PackDoctorModal.tsx` | Dual-tab pack maintenance dialog combining Contract `1.1` health checks, auto-fixes, Authoring Kit setup, semver bumps, and V2 resource scaffolding. |
 | `src/ui/PackOnboardingModal.tsx` | Guided Contract `1.1` pack initialization wizard supporting `root` vs. `subpack` layouts and clone-and-onboard flows for read-only Git sources. |
-| `src/ui/BridgeModal.tsx` | Adaptive two-column/compact modal for configuring Claude Code and Codex model tiers, role mappings, and bridge plugin generation. |
+| `src/ui/BridgeModal.tsx` | Adaptive two-column/compact modal for configuring Claude Code, Codex, and Vibe model tiers, role mappings, and bridge plugin generation. |
 | `src/utils/bridgePrompt.ts` | Pure state, pack filtering, field stepping, draft validation, and live per-agent model resolution preview helpers backing `BridgeModal`. |
 | `src/utils/packOnboarding.ts` | Onboarding inspection and application, remote Git clone registration, Doctor findings and fixes, authoring-kit installation, version bumps, and safe resource scaffolding. |
 
@@ -212,7 +212,7 @@ Pressing `Enter` (`onSubmit` → `submitPackOnboarding` in `src/App.tsx`) handle
 
 ## `BridgeModal` & `bridgePrompt` Utilities
 
-`BridgeModal` (`src/ui/BridgeModal.tsx`) and its companion state module `src/utils/bridgePrompt.ts` provide the interactive UI (`viewMode === "bridge-prompt"`) for [translating an OpenCode pack](../concepts/cross-harness-translation.md) into either a **Claude Code plugin** (`target === "claude"`, output under `bridges/claude-code/<plugin>/`) or a **Codex translation layer** (`target === "codex"`, output under `bridges/codex/<plugin>/`). Note that while the [headless CLI](../api/cli-reference.md) (`manage-agents bridge`) accepts `--target claude-code|codex|both`, `--prefix`, `--no-register`, and `--force`, the interactive `BridgeModal` operates on a single selected `TranslationTarget` (`"claude"` or `"codex"`), derives the stripped agent prefix automatically via `deriveBridgePrefix(selectedPack)` (`<pack>-`), and honors `claude.autoValidate` and `claude.autoRegister` from [`TranslationConfig`](../config/translation-and-release-config.md).
+`BridgeModal` (`src/ui/BridgeModal.tsx`) and its companion state module `src/utils/bridgePrompt.ts` provide the interactive UI (`viewMode === "bridge-prompt"`) for [translating an OpenCode pack](../concepts/cross-harness-translation.md) into a **Claude Code plugin** (`target === "claude"`, output under `bridges/claude-code/<plugin>/`), a **Codex translation layer** (`target === "codex"`, output under `bridges/codex/<plugin>/`), or a **Mistral Vibe plugin** (`target === "vibe"`, output under `bridges/vibe/<plugin>/`). The interactive `BridgeModal` operates on a single selected `TranslationTarget` (`"claude"`, `"codex"`, or `"vibe"`), derives the stripped agent prefix automatically via `deriveBridgePrefix(selectedPack)` (`<pack>-`), and honors `claude.autoValidate`/`claude.autoRegister` and `vibe.autoInstall` from [`TranslationConfig`](../config/translation-and-release-config.md) — the Vibe export mirrors the generated plugin into the Vibe plugins root and reports the install path on the confirmation screen.
 
 ### Adaptive Terminal Layout (`calculateBridgeModalLayout`)
 
@@ -223,12 +223,13 @@ Pressing `Enter` (`onSubmit` → `submitPackOnboarding` in `src/App.tsx`) handle
 | **Wide Two-Column Split** (`wide: true`) | `termWidth >= 96 && termHeight >= 26` | Up to `112×32` centered box. **Left column** (`48%` inner width) renders rounded bordered cards for `Plugin Name`, filterable `Pack` selector, `Tiers` editor, `Map all to` catch-all override, and source/output path footers. **Right column** (`52%` inner width) renders a full-height bordered `Pack '<pack>' Mapping` table with tier count summary badges and pagination counter (`i/N`). |
 | **Compact Single-Column Stack** (`wide: false`) | Terminals narrower than `96` cols or shorter than `26` rows (e.g., `80×24`) | Expands to `w - 4` by `h - 2` with zero vertical padding and borderless 1-row sections (`Plugin Name`, collapsible `Pack` list, `Tiers` rows, `Map all to`, and `Mapping` preview) so every control and at least `2` agent preview rows remain visible without clipping. |
 
-Border and highlight accents adapt per harness: `#FF6B35` (Claude orange) when `target === "claude"` and `THEME.accentBlue` when `target === "codex"`. Unsaved tier or role edits append `" *"` to the modal title (`tiersDirty`).
+Border and highlight accents adapt per harness: `#FF6B35` (Claude orange) when `target === "claude"`, `THEME.accentBlue` when `target === "codex"`, and `THEME.accentAmber` (Mistral) when `target === "vibe"`. Unsaved tier or role edits append `" *"` to the modal title (`tiersDirty`).
 
 ### Field Focus Cycle & Pack Filtering (`src/utils/bridgePrompt.ts`)
 
 `stepBridgeField(current, reverse, target)` governs `Tab` / `Shift+Tab` cycling across modal sections, inserting the Codex-only `"effort"` stop when `target === "codex"`:
 - **Claude Code order**: `"name"` → `"pack"` → `"tiers"` → `"agents"` → `"model"`
+- **Vibe order**: `"name"` → `"pack"` → `"tiers"` → `"agents"` → `"model"`
 - **Codex order**: `"name"` → `"pack"` → `"tiers"` → `"effort"` → `"agents"` → `"model"`
 
 Pack selection helpers in `src/utils/bridgePrompt.ts`:
@@ -242,6 +243,7 @@ Pack selection helpers in `src/utils/bridgePrompt.ts`:
 Default tiers in `DEFAULT_TRANSLATION_CONFIG` (`src/utils/translationConfig.ts`) define `"planning"` (purple), `"execution"` (cyan), and `"light"` (green), with custom tier names rendered in amber:
 
 - **Claude Code (`target === "claude"`)**: Each tier row displays `CLAUDE_TIER_MODEL_PRESETS` (`["opus", "sonnet", "haiku", "inherit"]`) as clickable pills. Pressing `←`/`→`/`Space` cycles presets via `cyclePresetValue`; typing `[a-zA-Z0-9._-]` switches into custom model entry (rendering an active `● <custom-model>` pill), validated against `validateClaudeModelName` before saving.
+- **Vibe (`target === "vibe"`)**: Same preset-cycling row as Claude with `VIBE_TIER_MODEL_PRESETS` (`["mistral-large-4", "mistral-medium-3.5", "inherit"]`), plus free-typed custom aliases.
 - **Codex (`target === "codex"`)**: Focusing `"tiers"` turns the selected tier's model column into a live `<input>` for editing the Codex model ID (e.g., `gpt-5.6-sol`, `gpt-5.6-luna`). Pressing `Tab` advances focus to `"effort"`, highlighting the right-hand `reasoningEffort` pill where `←`/`→`/`Space` (or clicking the pill) cycles `CODEX_EFFORT_PRESETS` (`["low", "medium", "high", "xhigh", "max"]`).
 - **Catch-all Override (`focusedField === "model"`)**: Entering a model in `Map all to:` sets `config[target].modelMap["*"]`, overriding tier mapping for every agent in that target harness when non-empty.
 
@@ -280,7 +282,7 @@ Focusing the `agents` panel (`↑`/`↓` to select an agent, `←`/`→`/`Space`
 
 `BridgeModal` separates translation-config tuning from full bridge emission:
 - **`Ctrl+S` (`onSaveTiers` → `saveBridgeTiersOnly`)**: Validates draft tiers with `validateDraftBridgeTiers(bridgeDraftTiers, bridgeTarget)`, merges only `tiers` and `roles` via `applyBridgeDraftToConfig`, writes `bridge.config.json` (in the workspace transaction for local repos, or `sourceTranslationConfigLocation` for read-only [Git sources](../modules/sources-and-github.md)), clears `tiersDirty`, and keeps `BridgeModal` open with a confirmation toast (`✓ Saved bridge tier configuration`).
-- **`Enter` (`onSubmit` → `generateBridge`)**: Requires a non-empty `Plugin Name` and valid `selectedPack`, validates tiers and optional `Map all to` model override, persists the complete `TranslationConfig` (including `pluginName`, `prefix: "<pack>-"`, and `modelMap["*"]`), and runs [`bridgePack`](../modules/bridges.md) to emit files under `bridges/claude-code/<plugin>/` or `bridges/codex/<plugin>/` (or the per-source bridge cache for Git sources). When bridging to Claude Code, `generateBridge` additionally runs `validatePlugin` (unless `claude.autoValidate === false`) and, if validation succeeds and a marketplace manifest was emitted, invokes `registerPlugin` (unless `claude.autoRegister === false`) before presenting the full summary in `action-result`.
+- **`Enter` (`onSubmit` → `generateBridge`)**: Requires a non-empty `Plugin Name` and valid `selectedPack`, validates tiers and optional `Map all to` model override, persists the complete `TranslationConfig` (including `pluginName`, `prefix: "<pack>-"`, and `modelMap["*"]`), and runs [`bridgePack`](../modules/bridges.md) to emit files under `bridges/claude-code/<plugin>/`, `bridges/codex/<plugin>/` or `bridges/vibe/<plugin>/` (or the per-source bridge cache for Git sources). When bridging to Claude Code, `generateBridge` additionally runs `validatePlugin` (unless `claude.autoValidate === false`) and, if validation succeeds and a marketplace manifest was emitted, invokes `registerPlugin` (unless `claude.autoRegister === false`) before presenting the full summary in `action-result`.
 
 ---
 
@@ -291,6 +293,6 @@ Focusing the `agents` panel (`↑`/`↓` to select an agent, `←`/`→`/`Space`
 - [Command Palette, Help & Markdown View](./navigation-help-and-markdown.md)
 - [Pack Onboarding, Doctor & Scaffolding](../modules/pack-onboarding-and-doctor.md)
 - [Agent Editing, V2 Compatibility & Git Transactions](../modules/agent-editing-and-v2-compat.md)
-- [Claude Code & Codex Bridges](../modules/bridges.md)
+- [Claude Code, Codex & Vibe Bridges](../modules/bridges.md)
 - [Cross-Harness Pack Translation](../concepts/cross-harness-translation.md)
 - [Bridge Translation & Release Config Reference](../config/translation-and-release-config.md)

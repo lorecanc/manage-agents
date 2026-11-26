@@ -94,8 +94,10 @@ export interface PackBridgeCompat {
   opencode: boolean
   claude: boolean
   codex: boolean
+  vibe: boolean
   claudeReason: string
   codexReason: string
+  vibeReason: string
 }
 
 export interface PackAssetCounts {
@@ -250,6 +252,12 @@ function computeBridgeCompat(counts: PackAssetCounts): PackBridgeCompat {
   if (counts.skills > 0) codexParts.push(`${counts.skills} skill${counts.skills === 1 ? "" : "s"}`)
   if (counts.mcp > 0) codexParts.push(`${counts.mcp} mcp`)
 
+  const vibeParts: string[] = []
+  if (counts.agents > 0) vibeParts.push(`${counts.agents} agent${counts.agents === 1 ? "" : "s"}`)
+  if (counts.skills > 0) vibeParts.push(`${counts.skills} skill${counts.skills === 1 ? "" : "s"}`)
+  if (counts.commands > 0) vibeParts.push(`${counts.commands} cmd→skill`)
+  if (counts.mcp > 0) vibeParts.push(`${counts.mcp} mcp`)
+
   const unbridged: string[] = []
   if (counts.plugins > 0) unbridged.push("plugins")
   if (counts.tools > 0) unbridged.push("tools")
@@ -257,17 +265,22 @@ function computeBridgeCompat(counts: PackAssetCounts): PackBridgeCompat {
 
   const claude = claudeParts.length > 0
   const codex = codexParts.length > 0
+  const vibe = vibeParts.length > 0
 
   return {
     opencode: true,
     claude,
     codex,
+    vibe,
     claudeReason: claude ? `${claudeParts.join(", ")}${unbridgedNote}` : "No agents, skills, commands, or MCP",
     codexReason: codex
       ? `${codexParts.join(", ")}${counts.commands > 0 ? " (cmds ignored)" : ""}${unbridgedNote}`
       : counts.commands > 0
         ? "Commands-only (Codex requires agents, skills, or MCP)"
         : "No agents, skills, or MCP",
+    vibeReason: vibe
+      ? `${vibeParts.join(", ")}${unbridgedNote}`
+      : "No agents, skills, commands, or MCP",
   }
 }
 
@@ -287,6 +300,7 @@ export function formatBridgeBadges(compat: PackBridgeCompat): string {
   const targets = ["OC"]
   if (compat.claude) targets.push("CC")
   if (compat.codex) targets.push("CX")
+  if (compat.vibe) targets.push("VB")
   return targets.join("·")
 }
 

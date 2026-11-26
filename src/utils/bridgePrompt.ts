@@ -15,6 +15,7 @@ export type BridgeField = "name" | "pack" | "tiers" | "effort" | "agents" | "mod
 
 export const CLAUDE_TIER_MODEL_PRESETS = ["opus", "sonnet", "haiku", "inherit"] as const
 export const CODEX_EFFORT_PRESETS = ["low", "medium", "high", "xhigh", "max"] as const
+export const VIBE_TIER_MODEL_PRESETS = ["mistral-large-4", "mistral-medium-3.5", "inherit"] as const
 
 export interface BridgePackOption {
   pack: string
@@ -176,6 +177,9 @@ export function cloneBridgeTiers(tiers: Readonly<Record<string, TranslationTier>
         model: terminalSafeText(tier.codex.model),
         ...(tier.codex.reasoningEffort !== undefined ? { reasoningEffort: terminalSafeText(tier.codex.reasoningEffort) } : {}),
       },
+      vibe: {
+        model: terminalSafeText(tier.vibe?.model ?? "inherit"),
+      },
     }
   }
   return copy
@@ -186,6 +190,7 @@ export function sanitizeDraftBridgeTiers(tiers: Readonly<Record<string, Translat
   for (const tier of Object.values(copy)) {
     tier.claude.model = tier.claude.model.trim()
     tier.codex.model = tier.codex.model.trim()
+    tier.vibe.model = tier.vibe.model.trim()
     if (tier.codex.reasoningEffort !== undefined) {
       const trimmedEffort = tier.codex.reasoningEffort.trim()
       if (trimmedEffort) tier.codex.reasoningEffort = trimmedEffort
@@ -206,11 +211,15 @@ export function validateDraftBridgeTiers(
   for (const [name, tier] of entries) {
     const claudeModel = tier.claude?.model?.trim() ?? ""
     const codexModel = tier.codex?.model?.trim() ?? ""
+    const vibeModel = tier.vibe?.model?.trim() ?? ""
     if (!claudeModel) {
       throw new Error(`Tier "${name}" is missing a Claude model.`)
     }
     if (!codexModel) {
       throw new Error(`Tier "${name}" is missing a Codex model.`)
+    }
+    if (!vibeModel) {
+      throw new Error(`Tier "${name}" is missing a Vibe model.`)
     }
     if (target === "claude") {
       validateClaudeModelName(claudeModel)
@@ -261,6 +270,11 @@ export function applyBridgeDraftToConfig(
     ...baseConfig,
     tiers: nextTiers,
     roles: nextRoles,
+    vibe: {
+      ...baseConfig.vibe,
+      overrides: { ...baseConfig.vibe.overrides },
+      modelMap: { ...(baseConfig.vibe.modelMap || {}) },
+    },
     claude: {
       ...baseConfig.claude,
       overrides: { ...baseConfig.claude.overrides },

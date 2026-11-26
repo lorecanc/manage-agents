@@ -711,7 +711,7 @@ function renderMcpSetup(
   return lines
 }
 
-interface OpenCodeCompanions {
+export interface OpenCodeCompanions {
   plugins: string[]
   tools: string[]
   commands: string[]

@@ -92,7 +92,8 @@ test("buildCatalogIndex discovers 0-agent packs and computes accurate counts and
     assert.equal(mixed.counts.mcp, 1)
     assert.equal(mixed.bridgeCompat.claude, true)
     assert.equal(mixed.bridgeCompat.codex, true)
-    assert.equal(formatBridgeBadges(mixed.bridgeCompat), "OC·CC·CX")
+    assert.equal(mixed.bridgeCompat.vibe, true)
+    assert.equal(formatBridgeBadges(mixed.bridgeCompat), "OC·CC·CX·VB")
     assert.equal(formatPackAssetBadges(mixed.counts), "[A:1 S:1 C:1 T:1 P:1 M:1]")
 
     const skillsOnly = index.byName.get("skills-only")!
@@ -100,6 +101,7 @@ test("buildCatalogIndex discovers 0-agent packs and computes accurate counts and
     assert.equal(skillsOnly.counts.skills, 1)
     assert.equal(skillsOnly.bridgeCompat.claude, true)
     assert.equal(skillsOnly.bridgeCompat.codex, true)
+    assert.equal(skillsOnly.bridgeCompat.vibe, true)
     assert.equal(skillsOnly.skills[0]?.description, "Document APIs clearly")
 
     const cmdsOnly = index.byName.get("cmds-only")!
@@ -107,7 +109,9 @@ test("buildCatalogIndex discovers 0-agent packs and computes accurate counts and
     assert.equal(cmdsOnly.counts.commands, 1)
     assert.equal(cmdsOnly.bridgeCompat.claude, true)
     assert.equal(cmdsOnly.bridgeCompat.codex, false)
-    assert.equal(formatBridgeBadges(cmdsOnly.bridgeCompat), "OC·CC")
+    // Commands translate to Vibe skills, so a commands-only pack is vibe-able.
+    assert.equal(cmdsOnly.bridgeCompat.vibe, true)
+    assert.equal(formatBridgeBadges(cmdsOnly.bridgeCompat), "OC·CC·VB")
 
     const toolsOnly = index.byName.get("tools-only")!
     assert.equal(toolsOnly.counts.tools, 1)

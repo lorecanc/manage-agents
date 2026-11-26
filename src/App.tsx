@@ -143,6 +143,7 @@ import {
   stepBridgeField,
   stepBridgePackSelection,
   validateDraftBridgeTiers,
+  VIBE_TIER_MODEL_PRESETS,
   type BridgeField,
 } from "./utils/bridgePrompt.js"
 import { changeToast, describeChangeResult } from "./utils/changeReport.js"
@@ -160,7 +161,9 @@ import {
   type TranslationTier,
 } from "./utils/translationConfig.js"
 import { claudeNextSteps } from "./utils/claudeNextSteps.js"
-import { codexNextSteps } from "./utils/codexBridge.js"
+import { codexNextSteps, type CodexBridgeResult } from "./utils/codexBridge.js"
+import { vibeNextSteps, type VibeBridgeResult } from "./utils/vibeBridge.js"
+import { installVibeAgentProfiles, installVibePlugin, type VibeAgentProfileInstallResult, type VibePluginInstallResult } from "./utils/vibePluginInstall.js"
 import { registerPlugin, validatePlugin } from "./utils/claudePluginCli.js"
 import { AUTO_COMMIT_MESSAGES, autoCommitEnabled, repositoryTransaction, type TransactionWarning } from "./utils/repositoryTransaction.js"
 import {
@@ -187,7 +190,7 @@ import { isReducedMotionPreferred, useAnimatedNumber, useFlashDecay, usePulseLoo
 import { CommandPaletteModal } from "./ui/CommandPaletteModal.js"
 import { HelpModal } from "./ui/HelpModal.js"
 import { ParameterTuningModal } from "./ui/ParameterTuningModal.js"
-import { BridgeModal, calculateBridgeModalLayout } from "./ui/BridgeModal.js"
+import { BridgeModal, bridgeTargetFolder, bridgeTargetLabel, calculateBridgeModalLayout } from "./ui/BridgeModal.js"
 import { getOnboardingFieldOrder, PackOnboardingModal, type OnboardingField } from "./ui/PackOnboardingModal.js"
 import { getDoctorMaxFindingRows, getScaffoldFieldOrder, PackDoctorModal, type PackDoctorTab, type ScaffoldField } from "./ui/PackDoctorModal.js"
 import {
@@ -550,7 +553,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
   const [bridgeSelectedPack, setBridgeSelectedPack] = useState("")
   const [bridgePackSuggested, setBridgePackSuggested] = useState("")
   const [bridgePackQuery, setBridgePackQuery] = useState("")
-  const [bridgeTarget, setBridgeTarget] = useState<"claude" | "codex">("claude")
+  const [bridgeTarget, setBridgeTarget] = useState<"claude" | "codex" | "vibe">("claude")
   const [bridgeModelTarget, setBridgeModelTarget] = useState("")
   const bridgeModelTargetDirtyRef = useRef(false)
   const [bridgeConfirmReasons, setBridgeConfirmReasons] = useState<string[]>([])
@@ -679,7 +682,14 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         .map(pack => ({ pack: pack.name, count: pack.counts.agents, assetSummary: formatPackAssetBadges(pack.counts) })),
     [catalogIndex],
   )
-  const bridgeablePacks = bridgeTarget === "codex" ? codexBridgePacks : claudeBridgePacks
+  const vibeBridgePacks = useMemo(
+    () =>
+      catalogIndex.packs
+        .filter(pack => pack.bridgeCompat.vibe)
+        .map(pack => ({ pack: pack.name, count: pack.counts.agents, assetSummary: formatPackAssetBadges(pack.counts) })),
+    [catalogIndex],
+  )
+  const bridgeablePacks = bridgeTarget === "codex" ? codexBridgePacks : bridgeTarget === "vibe" ? vibeBridgePacks : claudeBridgePacks
   const filteredBridgePacks = useMemo(
     () => filterBridgePacks(bridgeablePacks, bridgePackQuery),
     [bridgeablePacks, bridgePackQuery],
@@ -1443,18 +1453,20 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       `OpenCode v2: ✓ Ready`,
       `Claude Code: ${pack?.bridgeCompat.claude ? "✓" : "–"} ${pack?.bridgeCompat.claudeReason ?? ""}`,
       `OpenAI Codex: ${pack?.bridgeCompat.codex ? "✓" : "–"} ${pack?.bridgeCompat.codexReason ?? ""}`,
+      `Mistral Vibe: ${pack?.bridgeCompat.vibe ? "✓" : "–"} ${pack?.bridgeCompat.vibeReason ?? ""}`,
       "",
     ]
 
-    const targets: Array<"claude" | "codex"> = []
+    const targets: Array<"claude" | "codex" | "vibe"> = []
     if (pack?.bridgeCompat.claude) targets.push("claude")
     if (pack?.bridgeCompat.codex) targets.push("codex")
+    if (pack?.bridgeCompat.vibe) targets.push("vibe")
 
     if (targets.length === 0) {
-      lines.push("No Claude or Codex bridgeable assets in this pack (OpenCode v2 only).")
+      lines.push("No Claude, Codex or Vibe bridgeable assets in this pack (OpenCode v2 only).")
     } else {
       for (const target of targets) {
-        const label = target === "claude" ? "Claude Code" : "OpenAI Codex"
+        const label = target === "claude" ? "Claude Code" : target === "codex" ? "OpenAI Codex" : "Mistral Vibe"
         const bridgeKey = activeDataSource?.kind === "source"
           ? activeDataSource.source.name
           : standaloneBridgeKey(workspaceRoot)
@@ -1751,7 +1763,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         saveTranslationConfig(loc.configRoot, config, loc.configPath)
         result = bridgePack({ ...bridgeOptions, outputDir })
       } else {
-        const outputDir = path.join(workspaceRoot, "bridges", bridgeTarget === "codex" ? "codex" : "claude-code", safePluginName)
+        const outputDir = path.join(workspaceRoot, "bridges", bridgeTargetFolder(bridgeTarget), safePluginName)
         const tx = mutate([translationConfigPath(workspaceRoot), outputDir], "bridge", () => {
           saveTranslationConfig(workspaceRoot, config)
           return bridgePack({ ...bridgeOptions, outputDir })
@@ -1763,15 +1775,45 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       setBridgeClaudeTierTyping(false)
       setTranslationConfig(loadTranslationFor(activeDataSource))
        setSelectedAgentPaths(new Set())
-      setActionResultTitle(`Bridge to ${bridgeTarget === "codex" ? "Codex" : "Claude Code"} Complete`)
-      const lines = [`${bridgeTarget === "codex" ? "Translation layer" : "Plugin"} '${safePluginName}' generated successfully!`, `Output directory:`, `  ${result.pluginDir}`, ``, `Generated ${result.files.length} files:`, ...result.files.map((f) => `  * ${f}`)]
+      setActionResultTitle(`Bridge to ${bridgeTargetLabel(bridgeTarget)} Complete`)
+      const layerLabel = bridgeTarget === "claude" ? "Plugin" : bridgeTarget === "vibe" ? "Vibe plugin" : "Translation layer"
+      const lines = [`${layerLabel} '${safePluginName}' generated successfully!`, `Output directory:`, `  ${result.pluginDir}`, ``, `Generated ${result.files.length} files:`, ...result.files.map((f) => `  * ${f}`)]
       if (result.warnings.length > 0) lines.push(``, `⚠ Warnings:`, ...result.warnings.map((w) => `  * ${w}`))
       if (result.preview?.length) {
         const counts = result.preview.reduce<Record<string, number>>((acc, item) => { acc[item.source] = (acc[item.source] || 0) + 1; return acc }, {})
         lines.push(``, `Preview summary: ${Object.entries(counts).map(([source, count]) => `${count} by ${source}`).join(", ")}`, ...result.preview.map(item => `  ${item.agent} → ${item.role} → ${item.tier} → ${item.model} → ${item.source}`))
       }
+      let vibeInstall: VibePluginInstallResult | null = null
+      let vibeInstallError: string | null = null
+      let vibeProfilesInstall: VibeAgentProfileInstallResult | null = null
+      let vibeProfilesError: string | null = null
+      if (bridgeTarget === "vibe" && "plugin" in result) {
+        if (bridgeConfig.vibe.autoInstall !== false) {
+          try {
+            vibeInstall = installVibePlugin(result.pluginDir, result.plugin.pluginName)
+          } catch (error: any) {
+            vibeInstallError = error?.message || String(error)
+          }
+        }
+        if (bridgeConfig.vibe.installAgentProfiles !== false) {
+          try {
+            vibeProfilesInstall = installVibeAgentProfiles(result.pluginDir, result.plugin.pluginName)
+          } catch (error: any) {
+            vibeProfilesError = error?.message || String(error)
+          }
+        }
+      }
       lines.push("", ...("plugin" in result
-        ? ["Open the generated project in Codex:", ...codexNextSteps(result)]
+        ? bridgeTarget === "vibe"
+          ? [
+              ...(vibeInstall ? [`Installed in:`, `  ${vibeInstall.path}${vibeInstall.changed ? "" : " (already up to date)"}`, ...(vibeInstall.warnings.length ? [``, `⚠ Pruned stale entries:`, ...vibeInstall.warnings.map(w => `  * ${w}`)] : [])] : []),
+              ...(vibeInstallError ? [`⚠ Install into the Vibe plugins root failed:`, `  ${vibeInstallError}`, ``, `Copy the plugin manually to ~/.vibe/plugins/ to use it.`] : []),
+              ...(vibeProfilesInstall && vibeProfilesInstall.installed.length > 0 ? [``, `Main agent profiles installed in:`, `  ${vibeProfilesInstall.path}${vibeProfilesInstall.changed ? "" : " (already up to date)"}`, ...vibeProfilesInstall.installed.map(name => `  * ${name}`), ...(vibeProfilesInstall.warnings.length ? [``, `⚠ Profile install notes:`, ...vibeProfilesInstall.warnings.map(w => `  * ${w}`)] : [])] : []),
+              ...(vibeProfilesError ? [`⚠ Main agent profile install failed:`, `  ${vibeProfilesError}`, ``, `Copy agent-profiles/*.toml manually to ~/.vibe/agents/ to use them.`] : []),
+              `${vibeInstall ? "Start a session and use the plugin:" : "Install the generated plugin in Vibe:"}`,
+              ...vibeNextSteps(result as VibeBridgeResult, vibeInstall, vibeProfilesInstall)
+            ]
+          : ["Open the generated project in Codex:", ...codexNextSteps(result as CodexBridgeResult)]
         : ["Validate and run locally:", ...claudeNextSteps(result.pluginName, result.orchestratorName, result.pluginDir)]))
       if (bridgeTarget === "claude" && "pluginName" in result) {
         let registrationSkipped = false
@@ -1798,7 +1840,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         }
       }
        try { refreshData() } catch (error) { setMutationRefreshFailure(error, txWarning); setViewMode("action-result"); return }
-       setMutationSuccess(`Bridge to ${bridgeTarget === "codex" ? "Codex" : "Claude Code"} Complete`, lines, txWarning)
+       setMutationSuccess(`Bridge to ${bridgeTarget === "codex" ? "Codex" : bridgeTarget === "vibe" ? "Vibe" : "Claude Code"} Complete`, lines, txWarning)
       setViewMode("action-result")
     } catch (error: any) {
       setActionResultTitle("Error During Bridge")
@@ -2705,12 +2747,12 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
     }
   }
 
-  const openBridgeModalAction = (target: "claude" | "codex", explicitPack?: string) => {
+  const openBridgeModalAction = (target: "claude" | "codex" | "vibe", explicitPack?: string) => {
     if (activeDataSource) {
-      const candidates = target === "codex" ? codexBridgePacks : claudeBridgePacks
+      const candidates = target === "codex" ? codexBridgePacks : target === "vibe" ? vibeBridgePacks : claudeBridgePacks
       if (candidates.length === 0) {
         setActionResultTitle("No Pack to Bridge")
-        setActionResultLines([`No ${target === "codex" ? "Codex" : "Claude"}-compatible pack was found in the active workspace.`])
+        setActionResultLines([`No ${target === "codex" ? "Codex" : target === "vibe" ? "Vibe" : "Claude"}-compatible pack was found in the active workspace.`])
         setViewMode("action-result")
         return
       }
@@ -3203,6 +3245,9 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       case "bridge-codex":
         openBridgeModalAction("codex")
         break
+      case "bridge-vibe":
+        openBridgeModalAction("vibe")
+        break
       case "layout-adjust":
         setLayoutSnapshot(appliedShare)
         setLayoutDraft(appliedShare)
@@ -3364,9 +3409,10 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
       { id: "target-reconcile", label: "Reconcile Installed OpenCode Target Now", category: "Target & Bridges", shortcut: "R", keywords: ["sync", "drift", "opencode.json"] },
       { id: "target-reconcile-adopt", label: "Reconcile OpenCode Target with --adopt (Backup Local Edits)", category: "Target & Bridges", shortcut: "Shift+A", keywords: ["adopt", "backup", "drift"] },
       { id: "target-restore", label: "Restore Target Backup Snapshot", category: "Target & Bridges", shortcut: "Shift+R", keywords: ["rollback", "backup", "restore"], disabled: targetBackups.length === 0 },
-      { id: "bridge-check", label: "Check Claude & Codex Bridge Compatibility", category: "Target & Bridges", shortcut: "Shift+K", keywords: ["check", "validate", "claude", "codex"], disabled: catalogPacks.length === 0 },
+      { id: "bridge-check", label: "Check Claude, Codex & Vibe Bridge Compatibility", category: "Target & Bridges", shortcut: "Shift+K", keywords: ["check", "validate", "claude", "codex", "vibe"], disabled: catalogPacks.length === 0 },
       { id: "bridge-claude", label: "Generate Claude Code Plugin Bridge", category: "Target & Bridges", shortcut: "B", keywords: ["anthropic", "marketplace", "skills", "commands"], disabled: claudeBridgePacks.length === 0 },
       { id: "bridge-codex", label: "Generate OpenAI Codex Bridge", category: "Target & Bridges", shortcut: "Shift+B", keywords: ["codex", "toml", "skills", "mcp"], disabled: codexBridgePacks.length === 0 },
+      { id: "bridge-vibe", label: "Generate Mistral Vibe Bridge", category: "Target & Bridges", shortcut: "Shift+V", keywords: ["vibe", "mistral", "toml", "skills", "mcp", "subagents"], disabled: vibeBridgePacks.length === 0 },
       { id: "codex-install", label: "Install Pack Directly into Codex (--codex)", category: "Target & Bridges", shortcut: "C", keywords: ["codex", "install", "skills", "mcp"], disabled: codexBridgePacks.length === 0 },
       { id: "catalog-asset-filter", label: "Cycle Catalog Asset-Type Filter (All/Agents/Skills/Cmds/Tools/Plugins/MCP)", category: "Pack", shortcut: "F", keywords: ["filter", "skills", "commands", "tools", "plugins", "mcp"], disabled: catalogPacks.length === 0 },
       { id: "workspace-maintenance", label: "Open Workspace Maintenance (Validate, Lint, Fix-Names, Audit)", category: "Pack", shortcut: "W", keywords: ["validate", "lint", "audit", "fix-names", "security"], disabled: catalogPacks.length === 0 },
@@ -3819,6 +3865,8 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         openBridgeModalAction("claude")
       } else if (key === "b" && e.shift) {
         openBridgeModalAction("codex")
+      } else if (key === "v" && e.shift) {
+        openBridgeModalAction("vibe")
       } else if (key === "c") {
         executeActionById("codex-install")
       } else if (key === "o") {
@@ -3999,6 +4047,8 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         openBridgeModalAction("claude")
       } else if (key === "b" && e.shift) {
         openBridgeModalAction("codex")
+      } else if (key === "v" && e.shift) {
+        openBridgeModalAction("vibe")
       } else if (key === "e") {
         executeActionById("pack-install")
       } else if (key === "i" && isWorkspaceVirtualPack) {
@@ -4194,6 +4244,8 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         openBridgeModalAction("claude")
       } else if (key === "b" && e.shift) {
         openBridgeModalAction("codex")
+      } else if (key === "v" && e.shift) {
+        openBridgeModalAction("vibe")
       } else if (key === "e") {
         executeActionById("pack-install")
       } else if (key === "f" && !isUppercaseF) {
@@ -4593,11 +4645,11 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         }
       } else if (key === "left" || key === "right" || (key === "space" && !isNativeInputField)) {
         const delta: 1 | -1 = key === "left" ? -1 : 1
-        if (bridgeFocusedField === "tiers" && bridgeTarget === "claude" && bridgeTierNames.length > 0) {
+        if (bridgeFocusedField === "tiers" && bridgeTarget !== "codex" && bridgeTierNames.length > 0) {
           const tierName = bridgeTierNames[bridgeTierIndex]
-          const currentModel = bridgeDraftTiers[tierName]?.claude.model ?? "sonnet"
+          const currentModel = bridgeDraftTiers[tierName]?.[bridgeTarget]?.model ?? (bridgeTarget === "vibe" ? "mistral-medium-3.5" : "sonnet")
           setBridgeClaudeTierTyping(false)
-          updateBridgeTierModel(tierName, cyclePresetValue(CLAUDE_TIER_MODEL_PRESETS, currentModel, delta))
+          updateBridgeTierModel(tierName, cyclePresetValue(bridgeTarget === "vibe" ? VIBE_TIER_MODEL_PRESETS : CLAUDE_TIER_MODEL_PRESETS, currentModel, delta))
         } else if (bridgeFocusedField === "effort" && bridgeTarget === "codex" && bridgeTierNames.length > 0) {
           const tierName = bridgeTierNames[bridgeTierIndex]
           const currentEffort = bridgeDraftTiers[tierName]?.codex.reasoningEffort || "high"
@@ -4605,9 +4657,9 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
         } else if (bridgeFocusedField === "agents" && bridgePreview.items.length > 0) {
           cycleBridgeAgentTierAt(bridgeAgentIndex, delta)
         }
-      } else if (bridgeFocusedField === "tiers" && bridgeTarget === "claude" && bridgeTierNames.length > 0) {
+      } else if (bridgeFocusedField === "tiers" && bridgeTarget !== "codex" && bridgeTierNames.length > 0) {
         const tierName = bridgeTierNames[bridgeTierIndex]
-        const currentModel = bridgeDraftTiers[tierName]?.claude.model ?? ""
+        const currentModel = bridgeDraftTiers[tierName]?.[bridgeTarget]?.model ?? ""
         if (key === "backspace" || key === "delete") {
           setBridgeClaudeTierTyping(true)
           updateBridgeTierModel(tierName, currentModel.slice(0, -1))
@@ -5725,6 +5777,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
           onBridgeCheck={packName => runBridgeCheckAction(packName)}
           onBridgeClaude={packName => openBridgeModalAction("claude", packName)}
           onBridgeCodex={packName => openBridgeModalAction("codex", packName)}
+          onBridgeVibe={packName => openBridgeModalAction("vibe", packName)}
           onCodexInstall={packName => openCodexInstallPreviewAction(packName)}
         />
       ) : workspaceTab === "sources" ? (
@@ -6824,6 +6877,7 @@ export function App({ workspaceRoot: workspaceRootProp, initialSource, startupNo
                             onBridgeCheck={packName => runBridgeCheckAction(packName)}
                             onBridgeClaude={packName => openBridgeModalAction("claude", packName)}
                             onBridgeCodex={packName => openBridgeModalAction("codex", packName)}
+                            onBridgeVibe={packName => openBridgeModalAction("vibe", packName)}
                             onCodexInstall={packName => openCodexInstallPreviewAction(packName)}
                             onOpenDoctor={() => openPackDoctorModal("doctor")}
                             onOpenScaffold={() => openPackDoctorModal("scaffold")}

@@ -97,6 +97,7 @@ export function buildContextualShortcuts(ctx: ShortcutContext): ShortcutChip[] {
       { key: "Shift+K", label: "Bridge Check", actionId: "bridge-check" },
       { key: "B", label: "Claude", actionId: "bridge-claude" },
       { key: "Shift+B", label: "Codex", actionId: "bridge-codex" },
+      { key: "Shift+V", label: "Vibe", actionId: "bridge-vibe" },
       { key: "C", label: "Install Codex", actionId: "codex-install" },
     ]
     if (paneChip) chips.push(paneChip)
@@ -127,6 +128,9 @@ export function buildContextualShortcuts(ctx: ShortcutContext): ShortcutChip[] {
       { key: "G", label: "Delegations", actionId: "agent-delegations" },
       { key: "Enter", label: "Jump / Open", actionId: "flow-jump" },
       { key: "E", label: "Install Pack", actionId: "pack-install" },
+      { key: "B", label: "Claude", actionId: "bridge-claude" },
+      { key: "Shift+B", label: "Codex", actionId: "bridge-codex" },
+      { key: "Shift+V", label: "Vibe", actionId: "bridge-vibe" },
     ]
     if (paneChip) chips.push(paneChip)
     chips.push({ key: "Ctrl+K", label: "Palette", actionId: "palette", accent: true })

@@ -95,7 +95,7 @@ export const HELP_TABS: readonly HelpTabMeta[] = [
     index: 2,
     label: "2. Target & Bridges",
     shortLabel: "2. Target",
-    subtitle: "OpenCode v2 lifecycle (update/uninstall/restore) & Claude/Codex bridges",
+    subtitle: "OpenCode v2 lifecycle (update/uninstall/restore) & Claude/Codex/Vibe bridges",
     accent: "purple",
   },
   {
@@ -199,11 +199,12 @@ function buildGroupsForTab(
           ],
         },
         {
-          title: "Claude & Codex Bridges",
+          title: "Claude, Codex & Vibe Bridges",
           items: [
             { id: "tgt-check", keyLabel: "Shift+K", title: "Run bridge compatibility check on focused pack", scope: "Bridge", actionId: "bridge-check", disabled: noPacks },
             { id: "tgt-claude", keyLabel: "B", title: "Generate Claude Code plugin bridge (agents, skills, cmds, MCP)", scope: "Claude", actionId: "bridge-claude", disabled: noPacks },
             { id: "tgt-codex", keyLabel: "Shift+B", title: "Generate OpenAI Codex bridge (agents, skills, MCP)", scope: "Codex", actionId: "bridge-codex", disabled: noPacks },
+            { id: "tgt-vibe", keyLabel: "Shift+V", title: "Generate Mistral Vibe bridge (agents, skills, cmds, MCP)", scope: "Vibe", actionId: "bridge-vibe", disabled: noPacks },
             { id: "tgt-codex-install", keyLabel: "C", title: "Install pack directly into Codex (--codex)", scope: "Codex", actionId: "codex-install", disabled: noPacks },
           ],
         },
@@ -230,6 +231,7 @@ function buildGroupsForTab(
             { id: "flw-scaffold", keyLabel: "N", title: "Scaffold compliant agent, skill, command, tool, plugin or MCP", scope: "Author", actionId: "pack-scaffold", disabled: Boolean(ctx.isVirtualPack) || readOnly || noPacks },
             { id: "flw-claude", keyLabel: "B", title: "Generate Claude Code plugin bridge", scope: "Bridge", actionId: "bridge-claude", disabled: noPacks },
             { id: "flw-codex", keyLabel: "Shift+B", title: "Generate OpenAI Codex bridge", scope: "Bridge", actionId: "bridge-codex", disabled: noPacks },
+            { id: "flw-vibe", keyLabel: "Shift+V", title: "Generate Mistral Vibe bridge", scope: "Bridge", actionId: "bridge-vibe", disabled: noPacks },
           ],
         },
       ]

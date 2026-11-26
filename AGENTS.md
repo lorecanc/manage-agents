@@ -34,8 +34,9 @@ this engine solely through the versioned pack contract in `contract/`.
     `repositoryTransaction.ts`.
   - Archetypes, user routing and frontmatter overrides: `archetypes.ts`, `userSettings.ts`, `agents.ts`, `models.ts`,
     `catalog.ts`.
-  - Claude Code and Codex bridges: `bridge.ts`, `bridgeWorkspace.ts`, `bridgeCheck.ts`, `bridgeToolReferences.ts`,
-    `codexBridge.ts`, `translationConfig.ts`, `claudePluginCli.ts`, `claudeNextSteps.ts`.
+  - Claude Code, Codex and Mistral Vibe bridges: `bridge.ts`, `bridgeWorkspace.ts`, `bridgeCheck.ts`,
+    `bridgeToolReferences.ts`, `codexBridge.ts`, `vibeBridge.ts`, `vibePluginInstall.ts`, `translationConfig.ts`,
+    `claudePluginCli.ts`, `claudeNextSteps.ts`.
   - Terminal UI helpers: `uiConfig.ts`, `layout.ts`, `terminalText.ts`, `values.ts`.
 - `runtime/plugins/manage-agents-router/`: V2 OpenCode router plugin installed into managed targets during `reconcile`,
   with its runtime unit tests (`*.test.mjs`).

@@ -7,7 +7,7 @@
 
 Catalog-agnostic CLI and 3-workspace OpenTUI engine for validating, onboarding, resolving, editing, routing, and installing **OpenCode V2 agent packs** from local directories or Git/GitHub repositories.
 
-A **pack** mirrors an OpenCode configuration directory (`agents/`, `commands/`, `skills/`, `plugins/`, `themes/`, `tools/<pack>/`, optional `opencode.json(c)` and `AGENTS.md`) plus an `opencode-pack.json` manifest. `manage-agents` resolves requested packs and their SemVer `requires` dependencies, merges managed entries into `<target>/opencode.json` without touching your own keys, installs a runtime router plugin (`manage-agents-router`) for dynamic `IF / OR` model and policy routing, customizes read-only Git sources non-destructively via scoped user overrides, and translates packs into **Claude Code plugins** and **Codex layers**.
+A **pack** mirrors an OpenCode configuration directory (`agents/`, `commands/`, `skills/`, `plugins/`, `themes/`, `tools/<pack>/`, optional `opencode.json(c)` and `AGENTS.md`) plus an `opencode-pack.json` manifest. `manage-agents` resolves requested packs and their SemVer `requires` dependencies, merges managed entries into `<target>/opencode.json` without touching your own keys, installs a runtime router plugin (`manage-agents-router`) for dynamic `IF / OR` model and policy routing, customizes read-only Git sources non-destructively via scoped user overrides, and translates packs into **Claude Code plugins**, **Codex layers** and **Mistral Vibe plugins**.
 
 The engine and pack catalogs are strictly independent: the engine embeds zero catalog-specific pack names or rules, and pack repositories require no build step or engine dependency beyond the contract.
 
@@ -30,7 +30,7 @@ graph TD
     Installer --> Target["OpenCode Target (opencode.json + .manage-agents/)"]
     Installer --> Router["Runtime Plugin (manage-agents-router)"]
     Router --> Target
-    Translator --> Bridges["Claude Code Plugins & Codex Layers"]
+    Translator --> Bridges["Claude Code Plugins & Codex Layers & Vibe Plugins"]
 ```
 
 | Concept | Definition |
@@ -42,7 +42,7 @@ graph TD
 | **Target** | OpenCode config directory (default `$XDG_CONFIG_HOME/opencode`, i.e. `~/.config/opencode`). Tracks `desired.json`, `lock.json`, and `installed.json` inside `<target>/.manage-agents/`. |
 | **Archetype & `IF / OR` Flows** | Caller-driven routing where primary agents (`archetype.callers` or custom `$callers`) dynamically assign subagent models and narrowable `tools`, `permissions`, and `delegations` policies based on the active caller model (`*`, `provider`, or `provider/model`). |
 | **User Settings** | Scoped `routing.json` and `overrides.json` files in `$XDG_CONFIG_HOME/manage-agents/` (global `default` + per-target `targets.<realpath>`). Applied at `reconcile` without modifying pack sources. |
-| **Bridge** | Deterministic, closure-aware translation of a pack and its `requires` into a Claude Code plugin (`bridges/claude-code/<name>`) or Codex layer (`bridges/codex/<name>`). |
+| **Bridge** | Deterministic, closure-aware translation of a pack and its `requires` into a Claude Code plugin (`bridges/claude-code/<name>`), a Codex layer (`bridges/codex/<name>`), or a Mistral Vibe plugin (`bridges/vibe/<name>`, installed into the Vibe plugins root). |
 
 ---
 
@@ -127,11 +127,12 @@ manage-agents models unpin pipeline/pipeline-explorer
 manage-agents override set pipeline/pipeline-executor steps=30 hidden=true
 ```
 
-### 4. Translate Packs to Claude Code & Codex
+### 4. Translate Packs to Claude Code, Codex & Mistral Vibe
 
 ```bash
 manage-agents bridge --pack flow --target claude        # emits bridges/claude-code/<name>, validates & registers
 manage-agents bridge --pack flow --target codex         # emits bridges/codex/<name> (.codex-plugin + TOML agents)
+manage-agents bridge --pack flow --target vibe          # emits bridges/vibe/<name> plugin, installs into ~/.vibe/plugins/
 manage-agents bridge check --pack flow                  # CI byte-for-byte drift check on committed bridges
 ```
 
@@ -182,7 +183,7 @@ Switch workspaces anytime with `Tab` / `Shift+Tab`, clickable top-bar pills, or 
 | `D` / `N` | Open **Pack Doctor** (`F` fix, `A` authoring kit, `1/2/3` semver bump) / scaffold resource | Local Pack |
 | `R` / `Shift+F` | Rename agent & update references / fix `"*": "deny"` permission order (Tab 4) | Local Pack |
 | `E` | Preview the selected Catalog packs, or the focused pack when there is no selection. `Y` confirms installation into OpenCode. | Catalog / Flows |
-| `B` / `Shift+B` | Open **Claude Code** (`B`) or **Codex** (`Shift+B`) bridge modal with tier preview | Catalog / Flows |
+| `B` / `Shift+B` / `Shift+V` | Open **Claude Code** (`B`), **Codex** (`Shift+B`) or **Vibe** (`Shift+V`) bridge modal with tier preview | Catalog / Flows |
 | `P` / `G` / `T` / `X` | Pull Git source / `gh` web login / toggle source trust / remove source | Sources |
 | `R` / `Ctrl+R` | Reconcile installed OpenCode target now / refresh sources & target drift | Sources |
 | `Shift+L` / `Ctrl+E` | Adjust list/inspector split (`0.60`–`0.75` in `ui.json`) / toggle reduced motion | Global |
@@ -229,7 +230,7 @@ Every command supports `--help` (`-h`). Machine-readable commands emit control-s
 | `lint` / `fix-names [--dry-run]` | Audit workspace agent filenames against naming conventions / batch-rename files and rewrite cross-references. |
 | `audit` | Report wildcard `"*": "deny"` ordering errors and classify workspace agents into High / Medium / Low risk tiers. |
 | `tune [flags]` | Batch-update `--steps`, `--variant`/`--effort` (`--clear-variant`), `--mode`, `--hidden`/`--no-hidden` across `--pack <pack>` or `--all`. |
-| `bridge` / `bridge check` | Translate `--pack <name>` + `requires` to `--target claude\|codex` (`--output`, `--name`, `--prefix`, `--config`, `--model src=dst`, `--map-all`, `--no-validate`, `--no-register`, `--wizard`) or verify committed bridges byte-for-byte. |
+| `bridge` / `bridge check` | Translate `--pack <name>` + `requires` to `--target claude\|codex\|vibe` (`--output`, `--name`, `--prefix`, `--config`, `--model src=dst`, `--map-all`, `--no-validate`, `--no-register`, `--wizard`) or verify committed bridges byte-for-byte. |
 | `version` (`--version`, `-v`, `-V`) | Print engine version, channel, dirty state, and bundle hash (`--json`, `--engine-root`, CI `--write-manifest`). |
 | `self-update` | Check (`--check`) or install latest `v*` GitHub Release (`--yes`, `--force`, `--reconcile`/`--no-reconcile`, `--repo`, `--target`, `--json`). |
 | `release keygen\|sign` | Maintainer tooling for Ed25519 key generation (`release-signing.json`) and signed `release-metadata.json` assets. |
@@ -246,19 +247,21 @@ Agents are read in both legacy V1 and native V2 formats and always written back 
 - `steps` (from `max_steps`), `disabled` (from `disable`), `system` (from `prompt`), ordered `permissions` arrays (`[{ action, resource, effect }]`), and `provider/model#variant`.
 - Deprecated agent-level sampling keys (`temperature`, `top_p`, `top_k`) are stripped on write; configure sampling on model variants instead. Agents discovered under `mode/` or `modes/` default to `mode: primary`.
 
-### Cross-Harness Translation (`claude` & `codex`)
+### Cross-Harness Translation (`claude`, `codex` & `vibe`)
 
 Bridge settings persist in `bridges/translation-config.json` (or `$XDG_CONFIG_HOME/manage-agents/translations/<source>/translation.json` for read-only Git sources). Models resolve in five steps: per-agent override → `modelMap` (`provider/model`, bare `model`, `"*"`) → capability tier (`planning`, `execution`, `light`, plus Codex `reasoningEffort`) → role inference → `defaultTier`.
 
-| Construct | OpenCode V2 Pack | Claude Code Plugin (`bridges/claude-code/<name>`) | Codex Layer (`bridges/codex/<name>`) |
-|---|---|---|---|
-| **Manifest** | `opencode-pack.json` + `opencode.json(c)` | `.claude-plugin/plugin.json`, local `marketplace.json`, `icon.png` | `.codex-plugin/plugin.json` and local `.agents/plugins/marketplace.json` |
-| **Agents** | `agents/<id>.md` (`@pack-role` mentions) | `agents/<kebab>.md` (`maxTurns`, `tools`, `@<plugin>:<kebab>`) | `.codex/agents/<kebab>.toml` (`developer_instructions`, `sandbox_mode`) |
-| **Commands & Skills** | `commands/<id>.md` (`$ARGUMENTS`), `skills/<id>/SKILL.md` | Commands become `skills/<cmd>/SKILL.md` (`$request`); skills copied | Agent workflows emitted as `.agents/skills/<agent>/SKILL.md` wrappers |
-| **MCP & LSP** | `mcp.servers`, `lsp` in `opencode.json` | `.mcp.json` (`mcp__<server>__*` grants) and `.lsp.json` | `.codex/config.toml` for the project and `.mcp.json` for plugin installs |
-| **Plugins & Custom Tools** | `plugins/*/index.ts`, `tools/<pack>/**` | Documented in generated `README.md` with prompt fallback notes; tool names adapted (`todowrite` → `TodoWrite`, Task → `Agent`) | Prompt runtime notes document CLI/git fallbacks; tool names adapted (`update_plan`, `@subagent`) |
+| Construct | OpenCode V2 Pack | Claude Code Plugin (`bridges/claude-code/<name>`) | Codex Layer (`bridges/codex/<name>`) | Vibe Plugin (`bridges/vibe/<name>`) |
+|---|---|---|---|---|
+| **Manifest** | `opencode-pack.json` + `opencode.json(c)` | `.claude-plugin/plugin.json`, local `marketplace.json`, `icon.png` | `.codex-plugin/plugin.json` and local `.agents/plugins/marketplace.json` | `plugin.json` (Agent Plugins 1.0 with the `ai.mistral.vibe` extension) |
+| **Agents** | `agents/<id>.md` (`@pack-role` mentions) | `agents/<kebab>.md` (`maxTurns`, `tools`, `@<plugin>:<kebab>`) | `.codex/agents/<kebab>.toml` (`developer_instructions`, `sandbox_mode`) | `ai.mistral.vibe/agents/<kebab>.toml` (`instructions`, `agent_type = "subagent"`, `safety`, per-tool `permission` narrowing, `active_model`) |
+| **Commands & Skills** | `commands/<id>.md` (`$ARGUMENTS`), `skills/<id>/SKILL.md` | Commands become `skills/<cmd>/SKILL.md` (`$request`); skills copied | Agent workflows emitted as `.agents/skills/<agent>/SKILL.md` wrappers | Commands become `skills/<cmd>/SKILL.md` (`user-invocable: true`); skills copied with the frontmatter name pinned |
+| **MCP & LSP** | `mcp.servers`, `lsp` in `opencode.json` | `.mcp.json` (`mcp__<server>__*` grants) and `.lsp.json` | `.codex/config.toml` for the project and `.mcp.json` for plugin installs | `mcp.json` (`stdio` or `streamable-http`, static headers only) |
+| **Plugins & Custom Tools** | `plugins/*/index.ts`, `tools/<pack>/**` | Documented in generated `README.md` with prompt fallback notes; tool names adapted (`todowrite` → `TodoWrite`, Task → `Agent`) | Prompt runtime notes document CLI/git fallbacks; tool names adapted (`update_plan`, `@subagent`) | Prompt runtime notes document fallbacks; tool names adapted (`todo`, `ask_user_question`, `agents.spawn`) |
 
 Run Codex with `codex -C bridges/codex/<name>` using the output directory and trust the project when prompted. Ask Codex to delegate to the exported primary agent by name. The generated README gives the local marketplace commands for installing the packaged skills and MCP servers into Codex. Custom subagents load from the project's `.codex/agents/` directory.
+
+The Vibe bridge emits a native Vibe plugin package: `plugin.json`, `skills/`, `ai.mistral.vibe/agents/` and `mcp.json`. Unless `--no-install-vibe` (or `vibe.autoInstall: false`) is set, the run also mirrors it into `~/.vibe/plugins/<name>/` (`$VIBE_HOME/plugins`), pruning stale files; new sessions pick the plugin up automatically, a live session needs `/reload-plugins`. Every agent becomes a spawnable subagent named `<plugin>:<agent>` (`agent_type` is always `"subagent"`, so even the primary runs by delegation), with the agent profile keys underscore-spelled (`schema_version`, `display_name`, `active_model`; descriptions are capped at 300 characters). Run `/plugins` to confirm the load and check the `plugin.*` diagnostics for refused components; authenticated remote MCP servers cannot ship in a plugin's static `mcp.json`, so the generated README lists the `vibe mcp add` commands for installing them into the user config.
 
 Granular OpenCode permissions such as command and path globs are reported as translation warnings. Codex applies explicit MCP tool denies across the session and rejects a required server when its deny patterns cannot be represented.
 

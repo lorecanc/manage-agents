@@ -7,7 +7,7 @@ con il layout di una configurazione OpenCode (`agents/`, `commands/`, `skills/`,
 Il motore risolve i pack richiesti e quelli da cui dipendono, li copia nella directory di configurazione di OpenCode,
 unisce le loro voci di `opencode.json` alle tue e tiene traccia di ciò che possiede, così da poterlo aggiornare o
 rimuovere in seguito. Modifica anche gli agenti (modelli, permessi, skill, deleghe, parametri), genera il routing dei
-modelli dei pack archetipo e traduce i pack in plugin Claude Code e layer Codex.
+modelli dei pack archetipo e traduce i pack in plugin Claude Code, layer Codex e layer Mistral Vibe.
 
 Motore e catalogo sono indipendenti. Il motore non conosce nessun catalogo in particolare, e a un catalogo basta
 rispettare il contratto.
@@ -330,7 +330,7 @@ alterare mai la cache git.
 | `u` | skill, tool e server MCP dell'agente sotto il cursore |
 | `r` | rinomina l'agente |
 | `e` | mostra l’anteprima per i pack selezionati o, a selezione vuota, per quello sotto il cursore |
-| `b`, `Shift-B` | bridge Claude Code, bridge Codex |
+| `b`, `Shift-B`, `Shift-V` | bridge Claude Code, bridge Codex, bridge Vibe |
 | `1`-`6` | schede dell'inspector: Info, Prompt, Name, Sec, Graph, Res |
 | `F` | corregge l'ordine dei permessi (scheda 4) |
 | `Shift-L` | layout |
@@ -381,28 +381,29 @@ OpenCode V2 ignora `temperature`. Il vecchio flag `--temp` restituisce un errore
 campionamento a livello di singolo agente sono stati rimossi dal formato V2 e vanno invece definiti su un variant del
 modello tramite `opencode.jsonc` e richiamati con `--variant`.
 
-## Bridge per Claude Code e Codex
+## Bridge per Claude Code, Codex e Mistral Vibe
 
-Un bridge traduce un pack del workspace, insieme ai pack che richiede, in un plugin Claude Code o in un layer Codex:
-agenti, comandi (che diventano skill), skill, server MCP e LSP presi dagli `opencode.json` dei pack.
+Un bridge traduce un pack del workspace, insieme ai pack che richiede, in un plugin Claude Code, un layer Codex o un
+plugin Vibe: agenti, comandi (che diventano skill), skill, server MCP e LSP presi dagli `opencode.json` dei pack.
 
 ```bash
 manage-agents bridge --pack pipeline --target claude
 manage-agents bridge --pack pipeline --target codex
+manage-agents bridge --pack pipeline --target vibe
 manage-agents bridge check
 ```
 
-L'output predefinito è `bridges/claude-code/<nome>` o `bridges/codex/<nome>` nel workspace. Un `--output` diverso
-deve restare dentro il workspace. Se ometti `--pack`, il motore usa il `prefix` della configurazione senza il trattino
-finale. `bridge check` rigenera i bridge già presenti e li confronta byte per byte con quelli salvati; accetta
-`--pack` e `--target claude|codex`.
+L'output predefinito è `bridges/claude-code/<nome>`, `bridges/codex/<nome>` o `bridges/vibe/<nome>` nel workspace. Un
+`--output` diverso deve restare dentro il workspace. Se ometti `--pack`, il motore usa il `prefix` della
+configurazione senza il trattino finale. `bridge check` rigenera i bridge già presenti e li confronta byte per
+byte con quelli salvati; accetta `--pack` e `--target claude|codex|vibe`.
 
 Le opzioni stanno in `bridges/translation-config.json` del workspace: `pluginName`, `prefix`, tier e mappe dei
 modelli, impostazioni Claude. Le opzioni principali:
 
 | Opzione | Significato |
 |---|---|
-| `--target`, `-t` | `claude` (default) o `codex` |
+| `--target`, `-t` | `claude` (default), `codex` o `vibe` |
 | `--output`, `-o` | directory di output |
 | `--name`, `-n` | nome del plugin (default `translated-agents`) |
 | `--prefix`, `-p` | prefisso da togliere dai nomi degli agenti (default `<pack>-`) |
@@ -419,6 +420,9 @@ del ruolo, poi l'inferenza, infine `defaultTier`. Per Claude la destinazione dev
 `haiku`, `inherit` o un ID completo `claude-*`. Per Codex usa un ID modello oppure `inherit`.
 Con `inherit` il bridge omette modello e sforzo di ragionamento dal TOML del subagente.
 Codex usa così i valori del chiamante, salvo impostazioni esplicite alla delega o default personali per i subagenti.
+Per Vibe usa un alias Mistrale (`mistral-large-4`, `mistral-medium-3.5`) oppure `inherit`: Vibe accetta solo gli
+alias definiti nelle proprie voci `[[models]]`, quindi allinea i tier alla tua installazione, oppure con `inherit`
+l'agente segue il modello della sessione (nessun `active_model`).
 
 **Opzioni che restano.** Le mappature e i flag Claude passati da riga di comando (`--no-validate`, `--no-register`,
 `--marketplace-name`) vengono salvati nella configurazione e riusati dalle esecuzioni successive. Non esiste un flag
@@ -437,6 +441,25 @@ relativi script e riferimenti. Le risorse conservano il percorso `resources/<pac
 coincide con quello di un agente, la skill originale conserva il nome e il prompt tradotto usa il suffisso `-agent`.
 I server opzionali sono dichiarati con `enabled = false` nel progetto e con `"enabled": false` nel plugin.
 I server richiesti esplicitamente dagli agenti continuano a seguire la regola di attivazione del bridge.
+
+**Plugin Vibe.** `manage-agents bridge --pack <pack> --target vibe` emette un **plugin Vibe nativo** (Agent Plugins 1.0 con
+l'estensione `ai.mistral.vibe`): `plugin.json` (manifest), `ai.mistral.vibe/agents/<nome>.toml` (ogni agente diventa un
+subagent lanciabile: `agent_type = "subagent"` anche per il `mode: primary`, con `safety` derivata dai permessi,
+`active_model` sul tier Mistral e chiavi underscores come `schema_version`, `display_name`, `active_model`;
+le descrizioni superano al massimo 300 caratteri, troncate a confine di parola con un avviso), `skills/` (le skill del
+pack copiate con il nome fissato; i comandi diventano skill invocabili con `/<nome>` e `user-invocable: true`, con
+`$ARGUMENTS` sostituito da `$request`) e `mcp.json` (i server MCP come `stdio` o `streamable-http`, solo header
+statici: un `Authorization: Bearer {env:VAR}` non si può spedire in un plugin e va installato con `vibe mcp add`). I permessi diventano restringimenti per tool (`[tools.bash] permission =
+"never"` per i divieti, incluso il complemento del catch-all `"*": deny`), i riferimenti agli agenti vengono riscritti
+con lo scope `<plugin>:<nome>` e i nomi degli strumenti adattati a Vibe (`todo`, `ask_user_question`, `agents.spawn`,
+`read_file`, `write_file`). A fine generazione il plugin viene installato in `~/.vibe/plugins/<nome>/` (a meno di
+`--no-install-vibe` o `vibe.autoInstall: false`): le nuove sessioni lo caricano da sole, in sessione viva serve
+`/reload-plugins`, e `/plugins` conferma il caricamento. Gli agenti `mode: primary` diventano anche profili agente
+principali in `agent-profiles/<plugin>-<nome>.toml`, installati in `~/.vibe/agents/` a meno di
+`vibe.installAgentProfiles: false`: si avviano con `vibe --agent <plugin>-<nome>` (o `/agent` in sessione viva).
+Un subagent spawnato non può a sua volta delegare e non ha tool MCP né skill, quindi l'orchestratore va eseguito
+come profilo principale. I plugin e i tool OpenCode non sono traducibili (Vibe carica
+skill, agenti, hook e server MCP): il README generato li elenca e consiglia di sostituirli con skill.
 
 **Progetto Codex.** Avvia `codex -C <directory-di-output>` e autorizza il progetto quando Codex lo richiede, oppure
 apri la cartella nell’app Codex. La cartella contiene i subagent in `.codex/agents/`, le skill in `.agents/skills/` e

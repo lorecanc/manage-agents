@@ -628,9 +628,10 @@ export function sourceTranslationConfigLocation(
 
 export function sourceBridgeOutputDir(
   sourceName: string,
-  bridgeTarget: "claude" | "codex",
+  bridgeTarget: "claude" | "codex" | "vibe",
   safePluginName: string,
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  return path.join(engineCacheDir(env), "bridges", sourceName, bridgeTarget === "codex" ? "codex" : "claude-code", safePluginName)
+  const folder = bridgeTarget === "codex" ? "codex" : bridgeTarget === "vibe" ? "vibe" : "claude-code"
+  return path.join(engineCacheDir(env), "bridges", sourceName, folder, safePluginName)
 }

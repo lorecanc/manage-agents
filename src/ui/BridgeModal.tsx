@@ -2,6 +2,7 @@ import React from "react"
 import {
   CLAUDE_TIER_MODEL_PRESETS,
   CODEX_EFFORT_PRESETS,
+  VIBE_TIER_MODEL_PRESETS,
   deriveBridgePrefix,
   type BridgeAgentMappingItem,
   type BridgeField,
@@ -10,6 +11,16 @@ import {
 import type { TranslationTarget, TranslationTier } from "../utils/translationConfig.js"
 import { displayWidth, middleEllipsis, terminalSafeText } from "../utils/terminalText.js"
 import { THEME } from "../utils/uiTheme.js"
+
+/** Target metadata shared by the bridge modal and its callers. */
+export const bridgeTargetLabel = (target: TranslationTarget): string =>
+  target === "codex" ? "Codex" : target === "vibe" ? "Mistral Vibe" : "Claude Code"
+
+/** Namespace folder of a bridge target under `bridges/`. */
+export const bridgeTargetFolder = (target: TranslationTarget): string =>
+  target === "codex" ? "codex" : target === "vibe" ? "vibe" : "claude-code"
+
+export type TranslationTierModelKey = "claude" | "codex" | "vibe"
 
 export interface BridgeModalLayout {
   wide: boolean
@@ -173,7 +184,8 @@ export function BridgeModal({
     packExpanded: focusedField === "pack",
     tierCount: tierNames.length,
   })
-  const accent = target === "codex" ? THEME.accentBlue : "#FF6B35"
+  const accent = target === "codex" ? THEME.accentBlue : target === "vibe" ? THEME.accentAmber : "#FF6B35"
+  const tierModelKey: TranslationTierModelKey = target
   const selectedPackInfo = allPacks.find(item => item.pack === selectedPack)
   const previewPluginSlug = terminalSafeText(pluginName.trim()) || "..."
   const previewPackLabel = terminalSafeText(selectedPack) || "..."
@@ -195,11 +207,12 @@ export function BridgeModal({
       const tierCfg = tiers[tierName]
       const isRowSelected = globalIdx === tierIndex
       const safeTierLabel = terminalSafeText(tierName)
-      const currentModel = terminalSafeText(target === "codex" ? tierCfg.codex.model : tierCfg.claude.model)
+      const currentModel = terminalSafeText(tierCfg[tierModelKey].model)
       const currentEffort = terminalSafeText(tierCfg.codex.reasoningEffort || "high")
 
-      if (target === "claude") {
-        const isCustomClaude = Boolean(currentModel) && !(CLAUDE_TIER_MODEL_PRESETS as readonly string[]).includes(currentModel)
+      if (target !== "codex") {
+        const tierPresets: readonly string[] = target === "vibe" ? VIBE_TIER_MODEL_PRESETS : CLAUDE_TIER_MODEL_PRESETS
+        const isCustomTargetModel = Boolean(currentModel) && !tierPresets.includes(currentModel)
         return (
           <box
             key={`tier-${tierName}`}
@@ -219,7 +232,7 @@ export function BridgeModal({
               {`${isTiersActive && isRowSelected ? "▎ " : "  "}${middleEllipsis(safeTierLabel, 10).padEnd(10, " ")}`}
             </text>
             <box flexDirection="row" gap={1} height={1} overflow="hidden" flexShrink={1}>
-              {CLAUDE_TIER_MODEL_PRESETS.map(preset => {
+              {tierPresets.map(preset => {
                 const active = currentModel === preset
                 return (
                   <text
@@ -240,7 +253,7 @@ export function BridgeModal({
                   </text>
                 )
               })}
-              {isCustomClaude && (
+              {isCustomTargetModel && (
                 <text height={1} wrapMode="none" backgroundColor={THEME.bgPillActive} style={{ textColor: "#ffffff" }} b>
                   {` ● ${middleEllipsis(terminalSafeText(currentModel), Math.max(8, maxRowWidth - 36))} `}
                 </text>
@@ -431,7 +444,7 @@ export function BridgeModal({
       borderStyle="rounded"
       borderColor={accent}
       backgroundColor={THEME.bgElevated}
-      title={` Bridge to ${target === "codex" ? "Codex" : "Claude Code"}${tiersDirty ? " *" : ""} `}
+      title={` Bridge to ${bridgeTargetLabel(target)}${tiersDirty ? " *" : ""} `}
       titleColor={accent}
       paddingLeft={1}
       paddingRight={1}
@@ -446,10 +459,10 @@ export function BridgeModal({
         <box flexDirection="row" justifyContent="space-between" height={1} flexShrink={0}>
           <box flexDirection="row" height={1} overflow="hidden">
             <text height={1} wrapMode="none" style={{ textColor: THEME.fgPrimary }} b>
-              {`BRIDGE TO ${target === "codex" ? "CODEX" : "CLAUDE CODE"} `}
+              {`BRIDGE TO ${bridgeTargetLabel(target).toUpperCase()} `}
             </text>
             <text height={1} wrapMode="none" style={{ textColor: accent }} b>
-              {`OpenCode → ${target === "codex" ? "Codex Translation Layer" : "Claude Code Plugin"}`}
+              {`OpenCode → ${target === "codex" ? "Codex Translation Layer" : target === "vibe" ? "Mistral Vibe Plugin" : "Claude Code Plugin"}`}
             </text>
           </box>
           {layout.wide && (
@@ -543,8 +556,8 @@ export function BridgeModal({
                   <box flexDirection="row" justifyContent="space-between" height={1} flexShrink={0}>
                     <text height={1} wrapMode="none" style={{ textColor: isTiersActive ? accent : THEME.fgSecondary }} b>
                       {isTiersActive
-                        ? `▎ Tiers (${target === "codex" ? (focusedField === "effort" ? "Codex · effort" : "Codex · model") : "Claude"}):`
-                        : `  Tiers (${target === "codex" ? "Codex" : "Claude"}):`}
+                        ? `▎ Tiers (${target === "codex" ? (focusedField === "effort" ? "Codex · effort" : "Codex · model") : bridgeTargetLabel(target)}):`
+                        : `  Tiers (${target === "codex" ? "Codex" : bridgeTargetLabel(target)}):`}
                     </text>
                     <text height={1} wrapMode="none" style={{ textColor: THEME.fgMuted }}>
                       {target === "codex"
@@ -588,7 +601,7 @@ export function BridgeModal({
                   {middleEllipsis(`Source: pack '${previewPackLabel}' (+requires, strips '${strippedPrefix}')`, leftColWidth)}
                 </text>
                 <text height={1} wrapMode="none" overflow="hidden" style={{ textColor: THEME.fgMuted }}>
-                  {middleEllipsis(`Output: bridges/${target === "codex" ? "codex" : "claude-code"}/${previewPluginSlug}/`, leftColWidth)}
+                  {middleEllipsis(`Output: bridges/${bridgeTargetFolder(target)}/${previewPluginSlug}/`, leftColWidth)}
                 </text>
               </box>
             </box>
@@ -763,7 +776,7 @@ export function BridgeModal({
             </box>
 
             <text height={1} wrapMode="none" overflow="hidden" flexShrink={0} style={{ textColor: THEME.fgMuted }}>
-              {middleEllipsis(`Source: '${previewPackLabel}' (strips '${strippedPrefix}') → bridges/${target === "codex" ? "codex" : "claude-code"}/${previewPluginSlug}/`, layout.innerWidth)}
+              {middleEllipsis(`Source: '${previewPackLabel}' (strips '${strippedPrefix}') → bridges/${bridgeTargetFolder(target)}/${previewPluginSlug}/`, layout.innerWidth)}
             </text>
           </box>
         )}

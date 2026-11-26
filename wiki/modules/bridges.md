@@ -1,11 +1,12 @@
 ---
-title: "Claude Code & Codex Bridges"
-description: "Pack closure staging, model tier/inference mapping, prompt tool adaptation, and plugin generation for Claude Code and Codex"
+title: "Claude Code, Codex & Vibe Bridges"
+description: "Pack closure staging, model tier/inference mapping, prompt tool adaptation, and plugin/layer generation for Claude Code, Codex, and Mistral Vibe"
 category: "modules"
 source_files:
   - "src/utils/bridgeWorkspace.ts"
   - "src/utils/bridge.ts"
   - "src/utils/codexBridge.ts"
+  - "src/utils/vibeBridge.ts"
   - "src/utils/translationConfig.ts"
   - "src/utils/bridgeToolReferences.ts"
   - "src/utils/bridgeCheck.ts"
@@ -18,11 +19,11 @@ created: "2026-11-13"
 last_updated: "2026-11-18"
 ---
 
-# Claude Code & Codex Bridges
+# Claude Code, Codex & Vibe Bridges
 
 ## Purpose
 
-The *bridge* (see [Glossary](../glossary.md)) subsystem performs [cross-harness pack translation](../concepts/cross-harness-translation.md), converting canonical [OpenCode agent packs](../api/pack-contract-reference.md)—along with their transitive `requires` closure—into standalone, distributable plugins for **Claude Code** (`bridges/claude-code/<plugin>/`) and **Codex** (`bridges/codex/<plugin>/`). Source packs remain untouched: model selection, agent prefix stripping, permission adaptation, MCP/LSP translation, and tool-reference rewrites are computed in an isolated temporary workspace and mirrored deterministically to the target directory.
+The *bridge* (see [Glossary](../glossary.md)) subsystem performs [cross-harness pack translation](../concepts/cross-harness-translation.md), converting canonical [OpenCode agent packs](../api/pack-contract-reference.md)—along with their transitive `requires` closure—into standalone, distributable plugins for **Claude Code** (`bridges/claude-code/<plugin>/`), **Codex** (`bridges/codex/<plugin>/`), and project layers for **Mistral Vibe** (`bridges/vibe/<plugin>/`). Source packs remain untouched: model selection, agent prefix stripping, permission adaptation, MCP/LSP translation, and tool-reference rewrites are computed in an isolated temporary workspace and mirrored deterministically to the target directory.
 
 ## Key Files
 
@@ -34,6 +35,7 @@ The *bridge* (see [Glossary](../glossary.md)) subsystem performs [cross-harness 
 | `src/App.tsx`, `src/index.tsx` | TUI and CLI callers that apply/persist bridge drafts, invoke `bridgePack`, and optionally run Claude CLI validation and registration. |
 | `src/utils/bridge.ts` | Converts OpenCode agents, commands, skills, MCP servers, and LSP servers into a Claude Code plugin and local marketplace manifest. |
 | `src/utils/codexBridge.ts` | Converts OpenCode agents, skills, and MCP servers into a Codex plugin manifest (`.codex-plugin/plugin.json`) and project-scoped `.codex/agents/*.toml` files. |
+| `src/utils/vibeBridge.ts` | Converts OpenCode agents, commands, skills, and MCP servers into a native Mistral Vibe plugin package (`plugin.json`, `skills/`, `ai.mistral.vibe/agents/*.toml`, `mcp.json`), plus `src/utils/vibePluginInstall.ts` which mirrors it into the Vibe plugins root. |
 | `src/utils/bridgeToolReferences.ts` | Rewrites OpenCode tool names to Claude Code or Codex equivalents, prepends idempotent runtime fallback notes for OpenCode-only tools, and extracts bash allowlists for README documentation. |
 | `src/utils/bridgeCheck.ts` | Regenerates a pack bridge in memory/temp storage and compares it byte-for-byte (`compareTrees`, `checkPackBridge`) against committed bridge directories. |
 | `src/utils/claudePluginCli.ts` | Invokes the external `claude` CLI for strict validation (`claude plugin validate --strict`) and local marketplace registration (`claude plugin marketplace add` + `claude plugin install`). |
@@ -52,10 +54,13 @@ graph LR
     Workspace --> Core["Pack & Agent Core (catalog, packs, agents)"]
     Workspace --> Claude["bridge.ts (Claude Code)"]
     Workspace --> Codex["codexBridge.ts (Codex)"]
+    Workspace --> Vibe["vibeBridge.ts (Mistral Vibe)"]
     Claude --> Config
     Codex --> Config
+    Vibe --> Config
     Claude --> Tools["bridgeToolReferences.ts"]
     Codex --> Tools
+    Vibe --> Tools
 ```
 
 - **Internal**: [Agent Editing, V2 Compatibility & Git Transactions](./agent-editing-and-v2-compat.md) (`src/utils/agents.ts`: `parseAgentFile`, `extractFrontmatter`, `normalizeAgentBody`; `src/utils/v2Compat.ts`: `translatePermissionsV2ToV1`, `isKnownPermissionKey`), [Pack Validation, Catalog & Virtual Packs](./pack-validation-and-virtual-packs.md) (`src/utils/catalog.ts`: `packDir`, `packsDir`, `resolvePackClosure`; `src/utils/packs.ts`: `validatePack`, `installableFiles`, `parseJsonc`; `src/utils/pathValidation.ts`: `assertInsideRealWorkspace`, `realpathThroughExistingAncestor`, `isPathInsideWorkspace`; `src/utils/opencodeMcp.ts`: `readMcpServers`, `isServerDisabled`), and [Archetypes, Conditional Flows & User Settings](./routing-and-user-settings.md) (`src/utils/sourceCustomization.ts` for per-source bridge config and cache paths in the TUI).
@@ -75,9 +80,9 @@ Packs can declare dependencies on companion packs via `requires` in [`opencode-p
 
 `bridgePack(options)` enforces [path and symlink safety](../concepts/security-and-trust-model.md) via `assertSafeOutputDir`—rejecting output paths that contain the catalog root, sit inside `packs/` or a pack directory, or traverse symlinks—and synchronizes the generated tree into `outputDir` via `mirrorTree`, rewriting only byte-changed files and pruning stale files or symlinks.
 
-`withGeneratedPackBridge` dispatches to `bridgeToClaudeCode` or `bridgeToCodex` according to `target` and generates beneath the temporary root at the final output's relative path. `bridgePack` then mirrors that result to the requested directory, leaving unchanged files untouched and returning the final plugin directory together with generated file paths, warnings, and model-resolution preview data.
+`withGeneratedPackBridge` dispatches to `bridgeToClaudeCode`, `bridgeToCodex` or `bridgeToVibe` according to `target` and generates beneath the temporary root at the final output's relative path. `bridgePack` then mirrors that result to the requested directory, leaving unchanged files untouched and returning the final plugin directory together with generated file paths, warnings, and model-resolution preview data.
 
-When bridging a local catalog or workspace, configuration is read from [`bridges/translation-config.json`](../config/translation-and-release-config.md) and plugins default to `bridges/<claude-code|codex>/<pluginName>`. When bridging a [registered git source](./sources-and-github.md) from the [TUI](../components/tui-shell-and-catalog.md) (`src/App.tsx`), `workspaceRoot` points to the cached source checkout, and translation settings and generated plugins are stored under [per-user config and cache directories](../config/user-and-target-files.md) (`<configDir>/translations/<source>/translation.json` and `<cacheDir>/bridges/<source>/<claude-code|codex>/<pluginName>`).
+When bridging a local catalog or workspace, configuration is read from [`bridges/translation-config.json`](../config/translation-and-release-config.md) and plugins default to `bridges/<claude-code|codex|vibe>/<pluginName>`. When bridging a [registered git source](./sources-and-github.md) from the [TUI](../components/tui-shell-and-catalog.md) (`src/App.tsx`), `workspaceRoot` points to the cached source checkout, and translation settings and generated plugins are stored under [per-user config and cache directories](../config/user-and-target-files.md) (`<configDir>/translations/<source>/translation.json` and `<cacheDir>/bridges/<source>/<claude-code|codex|vibe>/<pluginName>`).
 
 ## Translation Config & Five-Step Model Resolution
 
@@ -88,7 +93,7 @@ When bridging a local catalog or workspace, configuration is read from [`bridges
 ```ts
 export interface TranslationConfig {
   version: 2
-  target: "claude" | "codex"
+  target: "claude" | "codex" | "vibe"
   pluginName: string            // Default: "decent-pipeline"
   prefix: string                // Default: "pipeline-"
   sourceDir: string             // Legacy pre-pack path; validated workspace-relative, ignored by pack bridges
@@ -98,8 +103,16 @@ export interface TranslationConfig {
     description?: string
     claude: { model: string; reasoningEffort?: string }
     codex: { model: string; reasoningEffort?: string }
+    vibe: { model: string }     // "inherit" -> no active_model (session model)
   }>
   roles: Record<string, string> // Stripped agent role -> tier name
+  vibe: {
+    overrides: Record<string, { model: string; reasoningEffort?: string }>
+    modelMap?: Record<string, string>
+    emitSkills?: boolean        // Default: true
+    emitReadme?: boolean        // Default: true
+    emitMcp?: boolean           // Default: true (when servers exist)
+  }
   claude: {
     overrides: Record<string, { model: string; reasoningEffort?: string }>
     modelMap?: Record<string, string>
@@ -122,13 +135,13 @@ export interface TranslationConfig {
 
 Default tiers (`DEFAULT_TIERS`) and roles (`DEFAULT_ROLES`):
 
-| Tier | Claude Model | Codex Model | Codex `reasoningEffort` | Default Assigned Roles |
-|------|--------------|-------------|-------------------------|------------------------|
-| `planning` | `opus` | `gpt-5.6-sol` | `high` | `orchestrator`, `planner`, `reasoner`, `critic`, `code_reviewer` |
-| `execution` | `sonnet` | `gpt-5.6-luna` | `max` | `refactorer`, `tester`, `fast_lane` |
-| `light` | `haiku` | `gpt-5.6-luna` | `max` | `executor`, `explorer` |
+| Tier | Claude Model | Codex Model | Codex `reasoningEffort` | Vibe Model | Default Assigned Roles |
+|------|--------------|-------------|-------------------------|------------|------------------------|
+| `planning` | `opus` | `gpt-5.6-sol` | `high` | `mistral-large-4` | `orchestrator`, `planner`, `reasoner`, `critic`, `code_reviewer` |
+| `execution` | `sonnet` | `gpt-5.6-luna` | `max` | `mistral-medium-3.5` | `refactorer`, `tester`, `fast_lane` |
+| `light` | `haiku` | `gpt-5.6-luna` | `max` | `mistral-medium-3.5` | `executor`, `explorer` |
 
-`validateClaudeModelName` restricts Claude models to family aliases (`fable`, `sonnet`, `opus`, `haiku`, `inherit`) or full `claude-*` IDs. `validateMarketplaceName` rejects reserved names (`claude`, `claude-code`) and reserved prefixes (`claude-`, `anthropic-`, `anthropics-`).
+`validateClaudeModelName` restricts Claude models to family aliases (`fable`, `sonnet`, `opus`, `haiku`, `inherit`) or full `claude-*` IDs. `validateMarketplaceName` rejects reserved names (`claude`, `claude-code`) and reserved prefixes (`claude-`, `anthropic-`, `anthropics-`). Vibe tier models are free-form Mistral aliases (`mistral-large-4`, `mistral-medium-3.5`, or `inherit`); validation only requires them to be non-empty, since `[[models]]` aliases are installation-specific.
 
 ### Five-Step Model Resolution Pipeline
 
@@ -142,9 +155,9 @@ For each agent, `resolveModelTarget(agent, index, config, target)` strips `confi
 
 ### Interactive TUI & CLI Draft Construction (`bridgePrompt.ts`)
 
-- **Bridge modal**: `collectBridgeablePacks` counts agents in valid packs; `filterBridgePacks`, `reconcileBridgePackQuery`, and `stepBridgePackSelection` implement query filtering and selection. `stepBridgeField` orders the draft fields as `name -> pack -> tiers -> agents -> model` for Claude and inserts `effort` before `agents` for Codex. Users cycle Claude tier-model presets (`opus`, `sonnet`, `haiku`, `inherit`), Codex reasoning-effort presets (`low`, `medium`, `high`, `xhigh`, `max`), and per-role tier assignments (`cycleAgentRoleTier`).
-- **Draft, validation, and preview**: `applyBridgeDraftToConfig` trims/sanitizes tier values, derives the pack prefix, and applies the plugin name, role tiers, and optional target-wide `modelMap["*"]` catch-all without mutating the base config. `validateDraftBridgeTiers` rejects empty tiers and missing Claude/Codex models, and validates Claude model names when Claude is the selected target. `buildPackBridgePreview` runs the draft through the same `resolveModelTarget` logic used during generation and returns per-agent role, tier, target model, mapping source, and tier counts. The TUI persists the accepted config before invoking `bridgePack`.
-- **CLI wizard and flags**: [`manage-agents bridge`](../api/cli-reference.md) supports `--pack`, `--target/-t`, `--output/-o`, `--name/-n`, `--prefix/-p`, `--config`, `--model <src=target>` (`parseKeyValueMappings`), `--map-all <target>`, `--no-validate`, `--no-register`, `--yes/-y`, `--marketplace-name`, and `--wizard/-w`. The CLI wizard prompts for target, plugin name, source prefix, and planning/execution models for both targets. Model mappings and Claude automation/marketplace options are saved to the translation config for later runs; `--yes` confirms bridging untrusted executable content.
+- **Bridge modal**: `collectBridgeablePacks` counts agents in valid packs; `filterBridgePacks`, `reconcileBridgePackQuery`, and `stepBridgePackSelection` implement query filtering and selection. `stepBridgeField` orders the draft fields as `name -> pack -> tiers -> agents -> model` for Claude and Vibe and inserts `effort` before `agents` for Codex. Users cycle Claude tier-model presets (`opus`, `sonnet`, `haiku`, `inherit`), Vibe tier-model presets (`mistral-large-4`, `mistral-medium-3.5`, `inherit`), Codex reasoning-effort presets (`low`, `medium`, `high`, `xhigh`, `max`), and per-role tier assignments (`cycleAgentRoleTier`).
+- **Draft, validation, and preview**: `applyBridgeDraftToConfig` trims/sanitizes tier values, derives the pack prefix, and applies the plugin name, role tiers, and optional target-wide `modelMap["*"]` catch-all without mutating the base config. `validateDraftBridgeTiers` rejects empty tiers and missing Claude/Codex/Vibe models, and validates Claude model names when Claude is the selected target. `buildPackBridgePreview` runs the draft through the same `resolveModelTarget` logic used during generation and returns per-agent role, tier, target model, mapping source, and tier counts. The TUI persists the accepted config before invoking `bridgePack`.
+- **CLI wizard and flags**: [`manage-agents bridge`](../api/cli-reference.md) supports `--pack`, `--target/-t` (`claude`, `codex`, `vibe`), `--output/-o`, `--name/-n`, `--prefix/-p`, `--config`, `--model <src=target>` (`parseKeyValueMappings`), `--map-all <target>`, `--no-validate`, `--no-register`, `--yes/-y`, `--marketplace-name`, and `--wizard/-w`. The CLI wizard prompts for target, plugin name, source prefix, and planning/execution models for every target. Model mappings and Claude automation/marketplace options are saved to the translation config for later runs; `--yes` confirms bridging untrusted executable content.
 
 ## Claude Code Bridge (`bridge.ts`, `claudePluginCli.ts`, `claudeNextSteps.ts`)
 
@@ -201,6 +214,25 @@ The Codex path resolves model and reasoning-effort targets, translates the reque
 - `.codex/config.toml` supplies project settings for trusted folders. For a pack with a primary agent and additional agents, it permits the primary subagent to delegate one level deeper. The project and plugin's `.mcp.json` use the same MCP entries. The bridge translates stdio environment forwarding and HTTP authentication references. Explicit tool denies become session-wide `disabled_tools`. An unrepresentable deny pattern blocks export of the server and fails the bridge if a translated agent requires it.
 - `README.md` documents project launch, plugin installation, MCP setup, translation warnings, and the name of the primary agent when present. The CLI and the TUI both print the project launch command.
 
+## Mistral Vibe Bridge (`vibeBridge.ts`, `vibePluginInstall.ts`)
+
+`bridgeToVibe()` / `writeVibePlugin()` generates a [native Vibe plugin](../concepts/cross-harness-translation.md) (Agent Plugins 1.0 with the `ai.mistral.vibe` extension) under `bridges/vibe/<pluginName>/`:
+
+- `plugin.json`: manifest with the Agent Plugins 1.0 `$schema`, the normalized plugin name, author (AGENT_AUTHOR_NAME), and the `extensions["ai.mistral.vibe"]` gate (`schemaVersion: 1` plus `displayName`) that enables plugin agents.
+- `ai.mistral.vibe/agents/<name>.toml`: Agent profiles rendered by `renderVibeAgentToml` (underscore-spelled keys — the runtime validates `schema_version`/`agent_type`/`active_model` and rejects camelCase spellings, unlike the manifest, which accepts both):
+  - `schema_version = 1` and `agent_type = "subagent"` for every agent — the plugin format has no selectable primary, so even `mode: primary` agents are spawnable subagents (reported as a warning naming `<plugin>:<name>`; each primary additionally gets a main agent profile, below).
+  - `description` (required, 1..300 characters — longer source descriptions are truncated on a word boundary with a warning; the bridge falls back to `Translated agent <name>`), `display_name` (humanized kebab name), and `instructions` (prompt body with `@agent` mentions rewritten to `<plugin>:<name>` references, adapted tool references, and appended `## Delegation targets` plus `## Native Vibe delegation protocol` sections for the `agents.spawn` tool: exact `config_name` values, spawn-then-`wait`, parallel waves, `send_message` reuse, no generic-substitute rule, and the capability contract of spawned subagents, which in the current runtime have no MCP or connector tools, no skill loading, no user questions and no nested delegation). Instructions over 65,536 characters are warned about because Vibe refuses such subagent profiles.
+  - `safety = "safe" | "neutral"`: `safe` only when the agent denies `bash`, `write_file` and `edit`, `neutral` otherwise.
+  - `active_model` from the target's tier resolution (`mistral-large-4`, `mistral-medium-3.5`, ...); omitted when the tier model is `inherit`, so the agent follows the session's model. Vibe only accepts aliases defined in its own `[[models]]` configuration — the generated README documents the alignment.
+  - `[tools.<tool>] permission = "never" | "ask"` narrowing computed by `resolveToolNarrowing`: emitted for whole-group denies and catch-all-`*`-deny allowlist agents, never widening a source grant.
+- `agent-profiles/<plugin>-<name>.toml`: main agent profiles for every `mode: primary` agent, rendered by `renderVibeAgentProfileToml` when `vibe.emitAgentProfiles !== false`: the same `display_name`, `description`, optional `active_model`, translated `instructions` and `[tools.<tool>]` narrowing as the subagent profile, without `agent_type` and without `safety` (a user agent file ignores it and reports a config issue). The plugin format ships spawnable subagents only, and a spawned subagent cannot delegate further, so the profile is the way to run a primary as the session's main agent.
+- `skills/<name>/SKILL.md`: pack skills copied recursively (frontmatter `name` pinned to the directory identity — Vibe refuses a mismatch — `description` guaranteed and warned over 1024 chars) and commands translated into user-invocable skills (`name`, `user-invocable: true`, `disable-model-invocation: true`, `$ARGUMENTS` -> `$request`, `` !`cmd` `` -> fenced `bash` blocks, delegation header pointing at the `<plugin>-<primary>` main agent profile, or at `<plugin>:<primary>` when profiles are disabled) when `vibe.emitSkills !== false`. Name collisions between a command and a skill warn with the command winning.
+- `mcp.json`: MCP servers translated from the merged `opencode.json` into `mcpServers` (`stdio` with `command`/`args`/`env` — `{env:VAR}` values become `${VAR}` with a warning, `PLUGIN_ROOT`/`PLUGIN_DATA` dropped — or `streamable-http` with `url` and static `headers` only; an `Authorization: Bearer {env:VAR}` header cannot ship in a plugin and is dropped with a warning suggesting `vibe mcp add`). Disabled servers are omitted with a warning unless an agent's permissions require them, mirroring the Claude bridge.
+- `ai.mistral.vibe/hooks.toml` and `ai.mistral.vibe/guard-spawn.js` (only with `vibe.emitHooks: true`): a fail-open `pre_tool` guard on `agents_spawn` that denies `config_name` values claiming the plugin's namespace without being registered, and identical repeated delegations to the same specialist (the `doom_loop` guard's equivalent). Guard state lives under `PLUGIN_DATA`; any script error lets the spawn through.
+- `README.md` documents the install roots (`~/.vibe/plugins/` and `<project>/.vibe/plugins/`), `/reload-plugins`, `/plugins`, per-server setup notes, model-alias alignment, and translation warnings. `vibeNextSteps(result, install?, profilesInstall?)` prints the launch hints (installed paths or manual `cp -r`, plus the `vibe --agent <plugin>-<name>` run command per profile) in the CLI and TUI, and OpenCode plugins/tools are reported as untranspiled (Vibe loads skills, agents, hooks and MCP servers only).
+
+After the repository transaction, `installVibePlugin(sourceDir, pluginName, env)` (`src/utils/vibePluginInstall.ts`) mirrors the generated directory into `$VIBE_HOME/plugins/<pluginName>/` (~/.vibe/plugins by default) unless `--no-install-vibe` or `vibe.autoInstall: false` is set: unchanged files are left untouched, stale entries from earlier generations are pruned with warnings, links in the source are rejected, and a linked or non-directory target is replaced rather than written through. The CLI prints the install path and an already-up-to-date note on no-op runs. `installVibeAgentProfiles(pluginDir, pluginName, env)` mirrors `agent-profiles/*.toml` into `$VIBE_HOME/agents/` unless `vibe.installAgentProfiles: false` is set, pruning only its own stale profiles (marker-checked, so hand-edited files survive) and never writing through a link.
+
 ## Prompt Tool Adaptation & Drift Checking
 
 ### Prompt Tool Adaptation (`bridgeToolReferences.ts`)
@@ -209,6 +241,7 @@ The Codex path resolves model and reasoning-effort targets, translates the reque
 
 - **Claude Code (`CLAUDE_TABLE`)**: Rewrites `\btodowrite\b` to `TodoWrite`, `\bTask (tool|calls?|call\(s\))` to `Agent ...`, and backticked tool identifiers so prose words remain intact: `` `question` `` -> `` `AskUserQuestion` ``, `` `task` `` -> `` `Agent` ``, `` `read` `` -> `` `Read` ``, `` `grep` `` -> `` `Grep` ``, `` `glob` `` -> `` `Glob` ``, `` `lsp` `` -> `` `LSP` ``, `` `skill` `` -> `` `Skill` ``, `` `webfetch` `` -> `` `WebFetch` ``, `` `websearch` `` -> `` `WebSearch` ``, `` `bash` `` -> `` `Bash` ``, `` `edit` `` -> `` `Edit` ``, and `` `write` `` -> `` `Write` ``.
 - **Codex (`CODEX_TABLE`)**: Rewrites `\btodowrite\b` to `update_plan` and records targeted guidance bullets when prompts mention `` `question` `` (ask directly in reply), `` `task` `` / `Task tool` (delegate to subagents under `Delegation targets`), `` `read` `` / `` `grep` `` / `` `glob` `` / `` `lsp` `` (use shell commands such as `rg` or `sed -n`), or `` `edit` `` / `` `write` `` (use `apply_patch`).
+- **Vibe (`VIBE_TABLE`)**: Rewrites `\btodowrite\b` to `todo`, `Task tool` to `agents.spawn`, and backticked `` `question` `` -> `` `ask_user_question` ``, `` `task` `` -> `` `agents.spawn` ``, `` `read` `` -> `` `read_file` ``, `` `write` `` -> `` `write_file` `` (Vibe keeps `bash`, `edit`, `skill` lowercase). Guidance bullets cover `` `grep` `` / `` `glob` `` / `` `lsp` `` (shell through `bash`) and `` `webfetch` `` / `` `websearch` `` (`web_search` connector when available). The MCP note names the configured servers with their Vibe `mcp_<server>.<tool>` lookup.
 - **OpenCode-only custom tools & runtime note**: Matches permissions and prompt text against tool modules in the pack and its dependencies. When renames, guidance, MCP servers, or unavailable tools are present, `insertNearTop` injects a single blockquote immediately after a leading `# Heading` (or at line 1) guarded by `RUNTIME_NOTE_MARKER` (`Runtime note (OpenCode bridge)`) for idempotency.
 
 ### Byte-Exact Drift Verification (`bridgeCheck.ts`)
@@ -219,7 +252,7 @@ The Codex path resolves model and reasoning-effort targets, translates the reque
 2. Reads both the freshly generated directory and `committedDir` into `TreeSnapshot` maps (`Record<posixRelativePath, Uint8Array>`).
 3. Runs `compareTrees(expected, actual)` using byte-exact comparison (`bytesEqual`) and returns `{ clean, missing, changed, extra }`.
 
-When `clean` is `false`, `manage-agents bridge check [--pack <name>] [--target claude|codex]` prints every `missing`, `changed`, and `extra` path and sets `process.exitCode = 1`.
+When `clean` is `false`, `manage-agents bridge check [--pack <name>] [--target claude|codex|vibe]` prints every `missing`, `changed`, and `extra` path and sets `process.exitCode = 1`.
 
 ## Usage Example
 

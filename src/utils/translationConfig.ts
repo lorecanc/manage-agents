@@ -3,7 +3,7 @@ import path from "node:path"
 import type { AgentInfo } from "./agents.js"
 import { isWorkspaceRelativePath, realpathThroughExistingAncestor } from "./pathValidation.js"
 
-export type TranslationTarget = "claude" | "codex"
+export type TranslationTarget = "claude" | "codex" | "vibe"
 
 export interface ModelTarget {
   model: string
@@ -14,6 +14,8 @@ export interface TranslationTier {
   description?: string
   claude: ModelTarget
   codex: ModelTarget
+  /** `inherit` leaves the Vibe agent on the session's model (no `active_model`). */
+  vibe: ModelTarget
 }
 
 export interface TranslationConfig {
@@ -27,6 +29,21 @@ export interface TranslationConfig {
   defaultTier: string
   tiers: Record<string, TranslationTier>
   roles: Record<string, string>
+  vibe: {
+    overrides: Record<string, ModelTarget>
+    modelMap?: Record<string, string>
+    emitSkills?: boolean
+    emitReadme?: boolean
+    emitMcp?: boolean
+    /** Mirror the generated plugin into the Vibe plugins root (default true). */
+    autoInstall?: boolean
+    /** Emit main agent profiles for primary agents into agent-profiles/ (default true). */
+    emitAgentProfiles?: boolean
+    /** Mirror the generated main agent profiles into the Vibe agents root (default true). */
+    installAgentProfiles?: boolean
+    /** Emit ai.mistral.vibe/hooks.toml with an agents_spawn guard (default false). */
+    emitHooks?: boolean
+  }
   claude: {
     overrides: Record<string, ModelTarget>
     modelMap?: Record<string, string>
@@ -51,16 +68,19 @@ const DEFAULT_TIERS: Record<string, TranslationTier> = {
     description: "Agents that reason, plan and review",
     claude: { model: "opus" },
     codex: { model: "gpt-5.6-sol", reasoningEffort: "high" },
+    vibe: { model: "mistral-large-4" },
   },
   execution: {
     description: "Agents that execute tasks, cheaper and faster",
     claude: { model: "sonnet" },
     codex: { model: "gpt-5.6-luna", reasoningEffort: "max" },
+    vibe: { model: "mistral-medium-3.5" },
   },
   light: {
     description: "Agents that do lightweight work (claude haiku; codex parity with execution)",
     claude: { model: "haiku" },
     codex: { model: "gpt-5.6-luna", reasoningEffort: "max" },
+    vibe: { model: "mistral-medium-3.5" },
   }
 }
 const DEFAULT_ROLES: Record<string, string> = {
@@ -79,6 +99,7 @@ export const DEFAULT_TRANSLATION_CONFIG: TranslationConfig = {
   defaultTier: "execution",
   tiers: DEFAULT_TIERS,
   roles: DEFAULT_ROLES,
+  vibe: { overrides: {}, modelMap: {}, emitSkills: true, emitReadme: true, emitMcp: true, autoInstall: true, emitAgentProfiles: true, installAgentProfiles: true, emitHooks: false },
   claude: {
     overrides: {},
     modelMap: {},
@@ -130,6 +151,7 @@ export function normalizeTranslationConfig(input: Partial<TranslationConfig> | u
     ...value,
     tiers: merge(DEFAULT_TRANSLATION_CONFIG.tiers, value.tiers),
     roles: { ...DEFAULT_TRANSLATION_CONFIG.roles, ...(value.roles || {}) },
+    vibe: merge(DEFAULT_TRANSLATION_CONFIG.vibe, value.vibe),
     claude: merge(DEFAULT_TRANSLATION_CONFIG.claude, value.claude),
     codex: merge(DEFAULT_TRANSLATION_CONFIG.codex, value.codex)
   }
@@ -275,6 +297,14 @@ export function validateTranslationConfig(config: TranslationConfig): void {
   for (const [name, tier] of Object.entries(config.tiers)) {
     if (!tier.claude?.model) throw new Error(`Translation tier "${name}" is missing claude.model`)
     if (!tier.codex?.model) throw new Error(`Translation tier "${name}" is missing codex.model`)
+    if (!tier.vibe?.model) throw new Error(`Translation tier "${name}" is missing vibe.model`)
+  }
+  for (const [source, value] of Object.entries(config.vibe.modelMap || {})) {
+    if (typeof value !== "string" || !value.trim()) throw new Error(`Translation vibe.modelMap["${source}"] must be a non-empty model name`)
+  }
+  for (const key of ["emitSkills", "emitReadme", "emitMcp", "autoInstall", "emitAgentProfiles", "installAgentProfiles", "emitHooks"] as const) {
+    const value = config.vibe[key]
+    if (value !== undefined && typeof value !== "boolean") throw new Error(`Translation vibe.${key} must be a boolean`)
   }
   for (const [source, value] of Object.entries(config.claude.modelMap || {})) {
     try {
@@ -322,13 +352,16 @@ export function migrateV1(raw: Record<string, any>): TranslationConfig {
     sourceDir: raw.sourceDir || "general",
     defaultTier: "execution",
     tiers: merge(DEFAULT_TIERS, {
+      // v1 configs predate the Vibe target: the default tier models are kept.
       planning: {
-        claude: { model: claude.primaryModel },
-        codex: planningCodex
+        ...DEFAULT_TIERS.planning,
+        claude: { model: claude.primaryModel ?? DEFAULT_TIERS.planning.claude.model },
+        codex: planningCodex ?? DEFAULT_TIERS.planning.codex
       },
       execution: {
-        claude: { model: claude.defaultSubagentModel }
-        , codex: mapping.default
+        ...DEFAULT_TIERS.execution,
+        claude: { model: claude.defaultSubagentModel ?? DEFAULT_TIERS.execution.claude.model },
+        codex: mapping.default ?? DEFAULT_TIERS.execution.codex
       }
     }),
     claude: { overrides: {} },

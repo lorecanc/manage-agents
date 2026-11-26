@@ -11,7 +11,7 @@
 
 import { translatePermissionsV2ToV1 } from "./v2Compat.js"
 
-export type BridgeTarget = "claude" | "codex"
+export type BridgeTarget = "claude" | "codex" | "vibe"
 
 /** V1 permission map of an agent frontmatter (V2 `permissions` are translated). */
 function permissionOf(frontmatter: Record<string, any> | undefined): Record<string, any> | null {
@@ -83,7 +83,26 @@ const CODEX_TABLE: TargetToolTable = {
   ]
 }
 
-const TABLES: Record<BridgeTarget, TargetToolTable> = { claude: CLAUDE_TABLE, codex: CODEX_TABLE }
+const VIBE_TABLE: TargetToolTable = {
+  label: "Mistral Vibe",
+  renames: [
+    { source: "todowrite", target: "todo", pattern: /\btodowrite\b/g, replacement: "todo" },
+    { source: "question", target: "ask_user_question", pattern: backticked("question"), replacement: "`ask_user_question`" },
+    { source: "task", target: "agents.spawn", pattern: backticked("task"), replacement: "`agents.spawn`" },
+    { source: "Task tool", target: "agents.spawn tool", pattern: taskTool, replacement: "agents.spawn $1" },
+    { source: "read", target: "read_file", pattern: backticked("read"), replacement: "`read_file`" },
+    { source: "write", target: "write_file", pattern: backticked("write"), replacement: "`write_file`" }
+  ],
+  guidance: [
+    { source: "grep", pattern: backticked("grep"), guidance: "search with shell commands such as `rg` through `bash` (there is no `grep` tool)" },
+    { source: "glob", pattern: backticked("glob"), guidance: "list and match paths with shell commands through `bash` (there is no `glob` tool)" },
+    { source: "lsp", pattern: backticked("lsp"), guidance: "use shell commands and source search instead (there is no LSP tool)" },
+    { source: "webfetch", pattern: backticked("webfetch"), guidance: "use the `web_search` connector's open_url tool when available, else fetch through `bash`" },
+    { source: "websearch", pattern: backticked("websearch"), guidance: "use the `web_search` connector's web_search tool when available, else use `bash`" }
+  ]
+}
+
+const TABLES: Record<BridgeTarget, TargetToolTable> = { claude: CLAUDE_TABLE, codex: CODEX_TABLE, vibe: VIBE_TABLE }
 
 /** Module names and their family wildcards identify tools contributed by this pack. */
 export function isOpenCodeCustomToolKey(key: string, tools: ReadonlySet<string>): boolean {
@@ -173,7 +192,9 @@ export function adaptToolReferences(
   if (mcpServers.length > 0) {
     lines.push(target === "claude"
       ? `> - MCP tools named \`<server>_<tool>\` in this prompt are exposed as \`mcp__<server>__<tool>\` (plugin-scoped: \`mcp__plugin_<plugin>_<server>__<tool>\`); servers: ${mcpServers.map(server => `\`${server}\``).join(", ")}.`
-      : `> - For MCP tools named \`<server>_<tool>\` in this prompt, look up the tool by server and name in Codex. Configured servers include ${mcpServers.map(server => `\`${server}\``).join(", ")}.`)
+      : target === "vibe"
+        ? `> - For MCP tools named \`<server>_<tool>\` in this prompt, look them up as \`mcp_<server>.<tool>\`. Configured servers include ${mcpServers.map(server => `\`${server}\``).join(", ")}.`
+        : `> - For MCP tools named \`<server>_<tool>\` in this prompt, look up the tool by server and name in Codex. Configured servers include ${mcpServers.map(server => `\`${server}\``).join(", ")}.`)
   }
   return { body: insertNearTop(rewritten, lines.join("\n")), unavailable: sortedUnavailable, renamed }
 }
@@ -212,7 +233,9 @@ export function renderBashAllowlistSection(target: BridgeTarget, allowlists: Bas
   if (allowlists.length === 0) return []
   const limitation = target === "claude"
     ? "Claude Code plugin agents only accept a `tools:` list: the bridge emits `Bash` for every agent whose OpenCode `bash` permission allows anything. Per-command allow/ask/deny rules exist only in Claude Code settings (`permissions.allow` / `permissions.deny`, for example `Bash(git diff *)`), which apply to the whole session and cannot be shipped per agent by a plugin. The source rules are listed here so they can be reviewed or copied into project settings."
-    : "Codex agent files set only `sandbox_mode`: agents whose OpenCode `bash` or `edit` permission allows anything get `workspace-write`, the others `read-only`. Codex has no per-agent command allowlist; command rules are global. The source rules are listed here for review."
+    : target === "vibe"
+      ? "Vibe agent files narrow tool use with `[tools.<name>] permission = \"ask\" | \"never\"` only; there is no per-command allowlist. The bridge emits `permission = \"never\"` for the tools an OpenCode agent denies and lets everything else follow the session's approval policy. The source rules are listed here so they can be reviewed or copied into the Vibe config `[tools.bash]` allowlist/denylist entries."
+      : "Codex agent files set only `sandbox_mode`: agents whose OpenCode `bash` or `edit` permission allows anything get `workspace-write`, the others `read-only`. Codex has no per-agent command allowlist; command rules are global. The source rules are listed here for review."
   const lines = ["## Per-agent bash allowlists (not enforced)", "", limitation, ""]
   for (const allowlist of allowlists) {
     const total = Object.values(allowlist.rules).reduce((sum, rules) => sum + rules.length, 0)

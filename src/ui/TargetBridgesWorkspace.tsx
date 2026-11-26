@@ -115,6 +115,7 @@ export interface TargetBridgesWorkspaceProps {
   onBridgeCheck: (packName: string) => void
   onBridgeClaude: (packName: string) => void
   onBridgeCodex: (packName: string) => void
+  onBridgeVibe: (packName: string) => void
   onCodexInstall: (packName: string) => void
 }
 
@@ -150,6 +151,7 @@ export function TargetBridgesWorkspace({
   onBridgeCheck,
   onBridgeClaude,
   onBridgeCodex,
+  onBridgeVibe,
   onCodexInstall,
 }: TargetBridgesWorkspaceProps) {
   const isInspectorFocused = showInspector && activePane === "inspector"
@@ -414,12 +416,16 @@ export function TargetBridgesWorkspace({
               {renderBadgePill("OpenCode v2", true, THEME.accentGreen)}
               {renderBadgePill("Claude", Boolean(cat?.bridgeCompat.claude), THEME.accentPurple)}
               {renderBadgePill("Codex", Boolean(cat?.bridgeCompat.codex), THEME.accentCyan)}
+              {renderBadgePill("Vibe", Boolean(cat?.bridgeCompat.vibe), THEME.accentAmber)}
             </box>
             <text height={1} wrapMode="none" style={{ textColor: cat?.bridgeCompat.claude ? THEME.fgPrimary : THEME.fgMuted }}>
               {middleEllipsis(`Claude: ${cat ? cat.bridgeCompat.claudeReason : "inspect in catalog"}`, rightInner - 4)}
             </text>
             <text height={1} wrapMode="none" style={{ textColor: cat?.bridgeCompat.codex ? THEME.fgPrimary : THEME.fgMuted }}>
               {middleEllipsis(`Codex:  ${cat ? cat.bridgeCompat.codexReason : "inspect in catalog"}`, rightInner - 4)}
+            </text>
+            <text height={1} wrapMode="none" style={{ textColor: cat?.bridgeCompat.vibe ? THEME.fgPrimary : THEME.fgMuted }}>
+              {middleEllipsis(`Vibe:   ${cat ? cat.bridgeCompat.vibeReason : "inspect in catalog"}`, rightInner - 4)}
             </text>
           </box>
 
@@ -473,6 +479,7 @@ export function TargetBridgesWorkspace({
             {renderActionPill("⇧K Check", THEME.accentCyan, false, () => onBridgeCheck(packName))}
             {(!cat || cat.bridgeCompat.claude) && renderActionPill("B Claude", THEME.accentPurple, false, () => onBridgeClaude(packName))}
             {(!cat || cat.bridgeCompat.codex) && renderActionPill("⇧B Codex", THEME.accentCyan, false, () => onBridgeCodex(packName))}
+            {(!cat || cat.bridgeCompat.vibe) && renderActionPill("⇧V Vibe", THEME.accentAmber, false, () => onBridgeVibe(packName))}
             {(!cat || cat.bridgeCompat.codex) && renderActionPill("C +Codex", THEME.accentGreen, false, () => onCodexInstall(packName))}
           </box>
         </box>
@@ -606,7 +613,7 @@ export function TargetBridgesWorkspace({
                   col2 = formatPackAssetBadges(row.pack.counts)
                   col3 = `${formatBridgeBadges(row.pack.bridgeCompat)}${row.isInstalled ? " ●" : ""}`
                   col1Color = isFocused ? "#ffffff" : THEME.fgPrimary
-                  col3Color = row.pack.bridgeCompat.claude || row.pack.bridgeCompat.codex ? THEME.accentPurple : THEME.fgMuted
+                  col3Color = row.pack.bridgeCompat.claude || row.pack.bridgeCompat.codex || row.pack.bridgeCompat.vibe ? THEME.accentPurple : THEME.fgMuted
                 } else {
                   col1 = `${isFocused ? "▎" : " "} ↺ ${terminalSafeText(row.backup.id)}`
                   col2 = `${row.backup.fileCount}f · ${row.backup.configCount} cfg`

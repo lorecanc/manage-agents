@@ -60,6 +60,8 @@ import {
 } from "./utils/selfUpdate.js"
 import type { BridgeResult } from "./utils/bridge.js"
 import { codexNextSteps, type CodexBridgeResult } from "./utils/codexBridge.js"
+import { vibeNextSteps, type VibeBridgeResult } from "./utils/vibeBridge.js"
+import { installVibeAgentProfiles, installVibePlugin, type VibeAgentProfileInstallResult, type VibePluginInstallResult } from "./utils/vibePluginInstall.js"
 
 function repositoryMutation<T>(workspaceRoot: string, plan: string[] | { localPaths: string[]; externalPaths?: string[] }, message: string, mutation: () => T): T {
   const result = repositoryTransaction(workspaceRoot, plan, message, mutation)
@@ -237,9 +239,9 @@ async function runTranslationWizard(
   console.log("\n🧭 Translation bridge configuration wizard")
   console.log("   This writes only a bridge config layer; source agents are not changed.\n")
 
-  const targetAnswer = (await askWithDefault("Target (claude/codex)", "claude")).toLowerCase()
-  if (targetAnswer !== "claude" && targetAnswer !== "codex") {
-    throw new Error("Target must be 'claude' or 'codex'.")
+  const targetAnswer = (await askWithDefault("Target (claude/codex/vibe)", "claude")).toLowerCase()
+  if (targetAnswer !== "claude" && targetAnswer !== "codex" && targetAnswer !== "vibe") {
+    throw new Error("Target must be 'claude', 'codex' or 'vibe'.")
   }
   const pluginName = await askWithDefault("Plugin name", current.pluginName)
   const prefix = await askWithDefault("Source prefix to strip", current.prefix)
@@ -249,10 +251,12 @@ async function runTranslationWizard(
   const executionClaude = await askWithDefault("Claude execution tier model", next.tiers.execution.claude.model)
   const planningCodex = await askWithDefault("Codex planning tier model", next.tiers.planning.codex.model)
   const executionCodex = await askWithDefault("Codex execution tier model", next.tiers.execution.codex.model)
+  const planningVibe = await askWithDefault("Vibe planning tier model (or 'inherit' for the session model)", next.tiers.planning.vibe.model)
+  const executionVibe = await askWithDefault("Vibe execution tier model (or 'inherit' for the session model)", next.tiers.execution.vibe.model)
   next.tiers = {
     ...next.tiers,
-    planning: { ...next.tiers.planning, claude: { ...next.tiers.planning.claude, model: planningClaude }, codex: { ...next.tiers.planning.codex, model: planningCodex } },
-    execution: { ...next.tiers.execution, claude: { ...next.tiers.execution.claude, model: executionClaude }, codex: { ...next.tiers.execution.codex, model: executionCodex } }
+    planning: { ...next.tiers.planning, claude: { ...next.tiers.planning.claude, model: planningClaude }, codex: { ...next.tiers.planning.codex, model: planningCodex }, vibe: { ...next.tiers.planning.vibe, model: planningVibe } },
+    execution: { ...next.tiers.execution, claude: { ...next.tiers.execution.claude, model: executionClaude }, codex: { ...next.tiers.execution.codex, model: executionCodex }, vibe: { ...next.tiers.execution.vibe, model: executionVibe } }
   }
 
   const savedPath = persist
@@ -272,12 +276,12 @@ function bridgePluginNameForPack(config: TranslationConfig, pack: string): strin
 const BRIDGE_CHECK_HELP = `
 Usage: manage-agents bridge check [options]
 
-Regenerate every committed bridge (bridges/claude-code/<plugin>, bridges/codex/<plugin>) from the packs and compare it
+Regenerate every committed bridge (bridges/claude-code/<plugin>, bridges/codex/<plugin>, bridges/vibe/<plugin>) from the packs and compare it
 byte-exact with the committed files.
 
 Options:
   --pack <name>           Pack the bridges translate (default: the configured prefix without its trailing "-")
-  --target, -t <name>     Only check claude or codex (default: both)
+  --target, -t <name>     Only check claude, codex or vibe (default: every committed bridge)
   --help, -h              Show this help
 `
 
@@ -291,7 +295,7 @@ async function runBridgeCheck(workspaceRoot: string) {
       pack = args[++i]
     } else if ((args[i] === "--target" || args[i] === "-t") && args[i + 1]) {
       const requested = args[++i].toLowerCase()
-      if (requested !== "claude" && requested !== "codex") throw new Error("--target must be claude or codex")
+      if (requested !== "claude" && requested !== "codex" && requested !== "vibe") throw new Error("--target must be claude, codex or vibe")
       targetFilter = requested
     } else if (args[i] === "--help" || args[i] === "-h") {
       console.log(BRIDGE_CHECK_HELP)
@@ -311,7 +315,8 @@ async function runBridgeCheck(workspaceRoot: string) {
   const pluginName = sanitizeFilename(bridgePluginNameForPack(config, pack))
   const checks = [
     { target: "claude" as const, folder: "claude-code" },
-    { target: "codex" as const, folder: "codex" }
+    { target: "codex" as const, folder: "codex" },
+    { target: "vibe" as const, folder: "vibe" }
   ].filter(entry => !targetFilter || entry.target === targetFilter)
     .map(entry => ({ ...entry, committedDir: storageKey ? sourceBridgeOutputDir(storageKey, entry.target, pluginName) : path.join(workspaceRoot, "bridges", entry.folder, pluginName) }))
     .filter(entry => targetFilter || fs.existsSync(entry.committedDir))
@@ -357,9 +362,11 @@ async function runBridge(workspaceRoot: string, explicitSource?: string) {
   let modelFlagsGiven = false
   let autoValidate: boolean | undefined
   let autoRegister: boolean | undefined
+  let autoInstallVibe: boolean | undefined
   let assumeYes = false
   let marketplaceName = ""
   let marketFlagsGiven = false
+  let vibeFlagsGiven = false
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--pack" && args[i + 1]) {
@@ -372,7 +379,7 @@ async function runBridge(workspaceRoot: string, explicitSource?: string) {
       prefix = args[++i]
     } else if ((args[i] === "--target" || args[i] === "-t") && args[i + 1]) {
       const requested = args[++i].toLowerCase()
-      if (requested !== "claude" && requested !== "codex") throw new Error("--target must be claude or codex")
+      if (requested !== "claude" && requested !== "codex" && requested !== "vibe") throw new Error("--target must be claude, codex or vibe")
       target = requested
       targetSpecified = true
     } else if (args[i] === "--model" && args[i + 1]) {
@@ -387,6 +394,9 @@ async function runBridge(workspaceRoot: string, explicitSource?: string) {
     } else if (args[i] === "--no-register") {
       autoRegister = false
       marketFlagsGiven = true
+    } else if (args[i] === "--no-install-vibe") {
+      autoInstallVibe = false
+      vibeFlagsGiven = true
     } else if (args[i] === "--yes" || args[i] === "-y") {
       assumeYes = true
     } else if (args[i] === "--marketplace-name" && args[i + 1]) {
@@ -402,14 +412,14 @@ async function runBridge(workspaceRoot: string, explicitSource?: string) {
 Usage: manage-agents bridge [options]
        manage-agents bridge check [options]
 
-Translate a pack of the workspace, with the packs it requires, into a Claude Code plugin or a Codex layer.
+Translate a pack of the workspace, with the packs it requires, into a Claude Code plugin, a Codex layer or a Mistral Vibe plugin.
 
 Subcommands:
   check                   Verify committed bridges match a fresh regeneration
 
 Options:
   --pack <name>           Pack to bridge (default: the configured prefix without its trailing "-")
-  --target, -t <name>     Translation target: claude (default) or codex
+  --target, -t <name>     Translation target: claude (default), codex or vibe
   --output, -o <path>     Output directory (default: workspace bridges/ for catalogs, manager cache for standalone packs)
   --name, -n <name>       Plugin name (default: translated-agents)
   --prefix, -p <prefix>   Prefix to strip from agent names (default: <pack>-)
@@ -419,6 +429,7 @@ Options:
   --map-all <target>      Shorthand for --model "*=<target>": use one model for every source
   --no-validate           Skip 'claude plugin validate' after a claude bridge
   --no-register           Skip installing the generated plugin into Claude Code
+  --no-install-vibe       Skip installing the generated plugin into the Vibe plugins root
   --yes, -y               Accept confirmation for untrusted executable content
   --marketplace-name <n>  Marketplace used when registering (default: <plugin>-local)
   --wizard, -w            Configure model mappings and save them before bridging
@@ -426,8 +437,8 @@ Options:
 
 Model mappings use source=target syntax; the source may be a "*" catch-all (e.g. "*=sonnet")
 and mappings merge with the loaded config for the selected target. Provided mappings are
-persisted to the translation config, so later runs replay them without flags. The claude
-automation flags are persisted the same way.
+persisted to the translation config, so later runs replay them without flags. The claude and
+vibe automation flags are persisted the same way.
 `)
       process.exit(0)
     } else {
@@ -452,6 +463,9 @@ automation flags are persisted the same way.
       ...(marketplaceName ? { marketplaceName } : {})
     }
   }
+  if (vibeFlagsGiven) {
+    config.vibe = { ...config.vibe, ...(autoInstallVibe !== undefined ? { autoInstall: autoInstallVibe } : {}) }
+  }
   pluginName = pluginName || bridgePluginNameForPack(config, pack)
   prefix = prefix || (pack ? `${pack}-` : config.prefix)
   if (!pack) pack = prefix.replace(/-$/, "") || manifestName(workspaceRoot) || ""
@@ -462,11 +476,12 @@ automation flags are persisted the same way.
   }
 
   const safePluginName = sanitizeFilename(pluginName)
+  const bridgeFolder = target === "codex" ? "codex" : target === "vibe" ? "vibe" : "claude-code"
   const outputDir = path.resolve(output || (storageKey ? sourceBridgeOutputDir(storageKey, target, safePluginName) :
-    path.join(workspaceRoot, "bridges", target === "codex" ? "codex" : "claude-code", safePluginName)))
+    path.join(workspaceRoot, "bridges", bridgeFolder, safePluginName)))
 
   const safe = terminalSafeText
-  console.log(`\n🔄 Bridging pack '${safe(pack)}' to ${safe(target)} layer '${safe(pluginName)}'...`)
+  console.log(`\n🔄 Bridging pack '${safe(pack)}' to ${safe(target)} ${target === "codex" ? "layer" : "plugin"} '${safe(pluginName)}'...`)
   console.log(`   Prefix to strip: '${safe(prefix)}'`)
   console.log(`   Output directory: ${safe(outputDir)}\n`)
 
@@ -483,12 +498,12 @@ automation flags are persisted the same way.
   }
   const bridgeConfigPath = configFile || loc?.configPath || translationConfigPath(workspaceRoot)
   const bridgePlan = { localPaths: [bridgeConfigPath].filter(file => isRepositoryLocalPath(workspaceRoot, file)).concat(isRepositoryLocalPath(workspaceRoot, outputDir) ? [outputDir] : []), externalPaths: [bridgeConfigPath, outputDir].filter(file => !isRepositoryLocalPath(workspaceRoot, file)) }
-  const result: BridgeResult | CodexBridgeResult = repositoryMutation(workspaceRoot, bridgePlan, AUTO_COMMIT_MESSAGES.bridge, () => {
-    if (wizard || modelFlagsGiven || marketFlagsGiven) saveTranslationConfig(configFile ? workspaceRoot : loc?.configRoot ?? workspaceRoot, { ...config, pluginName, prefix }, bridgeConfigPath)
+  const result: BridgeResult | CodexBridgeResult | VibeBridgeResult = repositoryMutation(workspaceRoot, bridgePlan, AUTO_COMMIT_MESSAGES.bridge, () => {
+    if (wizard || modelFlagsGiven || marketFlagsGiven || vibeFlagsGiven) saveTranslationConfig(configFile ? workspaceRoot : loc?.configRoot ?? workspaceRoot, { ...config, pluginName, prefix }, bridgeConfigPath)
     return bridgePack({ workspaceRoot, pack, target, outputDir, config, pluginName: safePluginName, prefix, trusted: trust.trusted, allowUntrustedExecutable: true })
   })
 
-  console.log(`✅ ${safe(target)} layer generated successfully!\n`)
+  console.log(`✅ ${safe(target)} ${target === "codex" ? "layer" : "plugin"} generated successfully!\n`)
   console.log(`   Files created:`)
   result.files.forEach(f => console.log(`     * ${safe(f)}`))
   if (result.preview?.length) {
@@ -533,8 +548,37 @@ automation flags are persisted the same way.
     }
     console.log()
   } else if ("plugin" in result) {
-    console.log("\n   Open the generated project in Codex:")
-    codexNextSteps(result).forEach(line => console.log(safe(line)))
+    if (target === "vibe") {
+      // The install mirrors the plugin into the Vibe plugins root after the
+      // repository transaction, writing user-level Vibe state.
+      let install: VibePluginInstallResult | null = null
+      if (config.vibe.autoInstall !== false) {
+        try {
+          install = installVibePlugin(result.pluginDir, result.plugin.pluginName)
+          console.log(`\n   Install: ${safe(install.path)}${install.changed ? "" : " (already up to date)"}`)
+          for (const warning of install.warnings) console.log(`     ⚠ ${safe(warning)}`)
+        } catch (error) {
+          console.log(`\n   ⚠ Install failed: ${safe((error as Error).message)}`)
+        }
+      }
+      let profilesInstall: VibeAgentProfileInstallResult | null = null
+      if (config.vibe.installAgentProfiles !== false) {
+        try {
+          profilesInstall = installVibeAgentProfiles(result.pluginDir, result.plugin.pluginName)
+          if (profilesInstall.installed.length > 0) {
+            console.log(`\n   Agent profiles: ${safe(profilesInstall.installed.join(", "))}${profilesInstall.changed ? "" : " (already up to date)"}`)
+            for (const warning of profilesInstall.warnings) console.log(`     ⚠ ${safe(warning)}`)
+          }
+        } catch (error) {
+          console.log(`\n   ⚠ Agent profile install failed: ${safe((error as Error).message)}`)
+        }
+      }
+      console.log("\n   Start a session and use the plugin:")
+      vibeNextSteps(result as VibeBridgeResult, install, profilesInstall).forEach(line => console.log(safe(line)))
+    } else {
+      console.log("\n   Open the generated project in Codex:")
+      codexNextSteps(result as CodexBridgeResult).forEach(line => console.log(safe(line)))
+    }
     console.log()
   }
 }

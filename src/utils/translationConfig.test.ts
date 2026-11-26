@@ -26,6 +26,24 @@ import {
 
 const agent = (filename: string): any => ({ filename })
 
+test("translation vibe flags default on for agent profiles and off for hooks", () => {
+  const config = normalizeTranslationConfig(undefined)
+  assert.equal(config.vibe.emitAgentProfiles, true)
+  assert.equal(config.vibe.installAgentProfiles, true)
+  assert.equal(config.vibe.emitHooks, false)
+  validateTranslationConfig(config)
+})
+
+test("translation vibe agent profile and hook flags must be booleans", () => {
+  const config = normalizeTranslationConfig(undefined)
+  for (const key of ["emitAgentProfiles", "installAgentProfiles", "emitHooks"] as const) {
+    assert.throws(
+      () => validateTranslationConfig({ ...config, vibe: { ...config.vibe, [key]: "yes" } }),
+      new RegExp(`Translation vibe\\.${key} must be a boolean`)
+    )
+  }
+})
+
 test("translation defaults define the planning, execution and light tiers", () => {
   assert.equal(DEFAULT_TRANSLATION_CONFIG.tiers.planning.claude.model, "opus")
   assert.deepEqual(DEFAULT_TRANSLATION_CONFIG.tiers.planning.codex, { model: "gpt-5.6-sol", reasoningEffort: "high" })
